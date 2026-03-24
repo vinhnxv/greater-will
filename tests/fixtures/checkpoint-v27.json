@@ -1,0 +1,39 @@
+{
+  "id": "test-arc-1742855345",
+  "schema_version": 27,
+  "plan_file": "plans/sample-plan.md",
+  "session_id": "test-session-abc123",
+  "started_at": "2026-03-25T00:00:00Z",
+  "updated_at": "2026-03-25T00:15:00Z",
+  "completed_at": null,
+  "phases": {
+    "forge": {
+      "status": "completed",
+      "artifact": "tmp/arc/test-arc/enriched-plan.md",
+      "started_at": "2026-03-25T00:00:00Z",
+      "completed_at": "2026-03-25T00:05:00Z",
+      "skip_reason": null
+    },
+    "plan_review": {
+      "status": "completed",
+      "artifact": null,
+      "started_at": "2026-03-25T00:05:00Z",
+      "completed_at": "2026-03-25T00:10:00Z",
+      "skip_reason": null
+    },
+    "work": {
+      "status": "in_progress",
+      "artifact": null,
+      "started_at": "2026-03-25T00:10:00Z",
+      "completed_at": null,
+      "skip_reason": null
+    },
+    "test": {
+      "status": "pending",
+      "artifact": null,
+      "started_at": null,
+      "completed_at": null,
+      "skip_reason": null
+    }
+  }
+}

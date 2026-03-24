@@ -1,0 +1,108 @@
+# Greater-Will Phase Configuration
+#
+# This file defines the 7 phase groups (A-G) covering all 41 Rune arc phases.
+# Each group runs in a fresh Claude Code session.
+#
+# Config loading priority:
+# 1. CLI --config-dir flag
+# 2. ./greater-will.toml (project-local override)
+# 3. config/default-phases.toml (this file)
+
+[settings]
+# Default timeout for phase groups (minutes)
+default_timeout_min = 30
+# Maximum retry attempts per phase
+max_retries_per_phase = 3
+# Clean up tmux sessions between phases
+cleanup_between_phases = true
+# Seconds before nudging an idle session
+idle_nudge_after_sec = 180
+# Seconds before killing an idle session
+idle_kill_after_sec = 300
+
+# Group A: Forge → Verification
+# Enriches and validates the plan before execution
+[[groups]]
+name = "A"
+label = "forge → verification"
+phases = ["forge", "forge_qa", "plan_review", "plan_refine", "verification"]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 30
+
+# Group B: Semantic → Task Decomposition
+# Design system extraction and task planning
+[[groups]]
+name = "B"
+label = "semantic → task_decomp"
+phases = ["semantic_verification", "design_extraction", "design_prototype", "task_decomposition"]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 30
+skip_if = "codex_disabled"
+
+# Group C: Work
+# Main implementation phase - longest running
+[[groups]]
+name = "C"
+label = "work"
+phases = ["work"]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 90
+
+# Group D: Work QA → Verify Inspect
+# Quality assurance and gap analysis
+[[groups]]
+name = "D"
+label = "work_qa → verify_inspect"
+phases = [
+    "work_qa",
+    "drift_review",
+    "storybook_verification",
+    "design_verification",
+    "design_verification_qa",
+    "ux_verification",
+    "gap_analysis",
+    "gap_analysis_qa",
+    "codex_gap_analysis",
+    "gap_remediation",
+    "inspect",
+    "inspect_fix",
+    "verify_inspect"
+]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 60
+
+# Group E: Goldmask → Verify Mend
+# Code review and finding resolution
+[[groups]]
+name = "E"
+label = "goldmask → verify_mend"
+phases = ["goldmask_verification", "code_review", "code_review_qa", "goldmask_correlation", "mend", "mend_qa", "verify_mend"]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 60
+
+# Group F: Design Iteration → Test
+# Design refinement and testing
+[[groups]]
+name = "F"
+label = "design_iter → test"
+phases = ["design_iteration", "test", "test_qa"]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 60
+
+# Group G: Coverage → Merge
+# Final validation and ship
+[[groups]]
+name = "G"
+label = "coverage → merge"
+phases = [
+    "test_coverage_critique",
+    "deploy_verify",
+    "pre_ship_validation",
+    "release_quality_check",
+    "ship",
+    "bot_review_wait",
+    "pr_comment_resolution",
+    "merge"
+]
+skill_command = "/rune:arc {plan} --resume"
+timeout_min = 30

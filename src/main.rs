@@ -1,0 +1,47 @@
+//! Greater-Will: External Arc Controller for Rune
+//!
+//! Runs each Rune arc phase group in a fresh Claude Code session.
+//!
+//! # Commands
+//!
+//! - `run`: Execute arc phases for plan files
+//! - `status`: Show status of active/recent runs
+//! - `replay`: Resume from a checkpoint
+//! - `clean`: Clean up temporary files and sessions
+
+mod commands;
+mod config;
+mod log;
+mod scanner;
+mod session;
+
+use clap::Parser;
+use color_eyre::Result;
+
+use crate::config::cli_args::Cli;
+
+fn main() -> Result<()> {
+    // 1. Install panic hooks FIRST (before any other initialization)
+    // This ensures beautiful error traces for panics during startup
+    color_eyre::install()?;
+
+    // 2. Parse CLI args (may exit on --help/--version)
+    let cli = Cli::parse();
+
+    // 3. Initialize tracing with verbosity level
+    crate::log::init(cli.verbose);
+
+    // 4. Dispatch to subcommand
+    match cli.command {
+        commands::Commands::Run {
+            plans,
+            dry_run,
+            mock,
+            group,
+            config_dir,
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir),
+        commands::Commands::Status => commands::status::execute(),
+        commands::Commands::Replay { checkpoint } => commands::replay::execute(checkpoint),
+        commands::Commands::Clean => commands::clean::execute(),
+    }
+}

@@ -1,9 +1,27 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rune workflow artifacts
 .rune/.agent-search-index.db-wal
 .rune/.agent-search-index.db-shm
 .rune/echoes
 .rune/.agent-search-index.db
+.rune/arc/*
+.rune/arc-phase-loop.local.json
+
+# Project-specific
 docs/brainstorms
 plans/
 tmp/
-.rune/arc/*
-.rune/arc-phase-loop.local.json

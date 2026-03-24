@@ -1,0 +1,7 @@
+# Codex ignore file for greater-will
+.git/
+target/
+node_modules/
+.rune/
+tmp/
+*.lock
