@@ -1,0 +1,7 @@
+.rune/.agent-search-index.db-wal
+.rune/.agent-search-index.db-shm
+.rune/echoes
+.rune/.agent-search-index.db
+docs/brainstorms
+plans/
+tmp/
