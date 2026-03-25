@@ -37,6 +37,9 @@ const MAX_CRASH_RETRIES: u32 = 3;
 /// Poll interval for monitoring the session (seconds).
 const POLL_INTERVAL_SECS: u64 = 5;
 
+/// How often to print a status line during monitoring (seconds).
+const STATUS_LOG_INTERVAL_SECS: u64 = 30;
+
 /// Idle threshold before sending a nudge (seconds).
 const IDLE_NUDGE_SECS: u64 = 300; // 5 min
 
@@ -156,6 +159,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     println!("Session: {}", session_name);
     println!("Command: {}", arc_command);
     println!("Timeout: {}h", config.pipeline_timeout.as_secs() / 3600);
+    println!("Tip: use -v for detailed monitoring logs, -vv for debug output");
     println!();
 
     // Crash-recovery loop
@@ -223,6 +227,10 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     reason = %reason,
                     "Session crashed, will restart with --resume"
                 );
+                println!(
+                    "[gw] Session crashed ({}/{}): {}. Restarting in 5s...",
+                    crash_restarts, MAX_CRASH_RETRIES, reason,
+                );
 
                 // Brief cooldown before restart
                 std::thread::sleep(Duration::from_secs(5));
@@ -251,6 +259,10 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 }
 
                 warn!(restart = crash_restarts, "Session stuck, restarting");
+                println!(
+                    "[gw] Session stuck ({}/{}). Restarting in 5s...",
+                    crash_restarts, MAX_CRASH_RETRIES,
+                );
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
@@ -307,10 +319,12 @@ fn run_session_attempt(
     };
 
     info!(session = %session_name, pid = pid, "Session spawned, waiting for Claude Code init");
+    println!("[gw] Session spawned (pid={}), waiting 12s for Claude Code init...", pid);
     std::thread::sleep(Duration::from_secs(12));
 
     // Dispatch the /rune:arc command
     info!(command = %command, "Dispatching arc command");
+    println!("[gw] Dispatching: {}", command);
     if let Err(e) = send_keys_with_workaround(session_name, command) {
         kill_session(session_name)?;
         return Ok(SessionOutcome::Crashed {
@@ -323,13 +337,20 @@ fn run_session_attempt(
     let mut last_output_hash: u64 = 0;
     let mut last_activity = Instant::now();
     let mut nudged = false;
+    let mut last_status_log = Instant::now();
+    let mut poll_count: u64 = 0;
 
     /// Minimum session duration to consider a "real" run (not an instant crash).
     /// If the session dies within this window after dispatch, it's a crash.
     const MIN_SESSION_DURATION_SECS: u64 = 30;
 
+    info!("Entering monitor loop (poll={}s, nudge={}s, kill={}s)",
+        POLL_INTERVAL_SECS, IDLE_NUDGE_SECS, IDLE_KILL_SECS);
+    println!("[gw] Monitoring session (poll every {}s)...", POLL_INTERVAL_SECS);
+
     loop {
         std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+        poll_count += 1;
 
         // Check total pipeline timeout
         if pipeline_start.elapsed() > config.pipeline_timeout {
@@ -388,11 +409,37 @@ fn run_session_attempt(
 
         // Check for completion signals in pane output
         if is_pipeline_complete(&pane_content) {
+            let elapsed = dispatch_time.elapsed();
             info!("Pipeline completion detected in pane output");
+            println!(
+                "[gw] Pipeline complete! ({}m{}s elapsed)",
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60,
+            );
             // Give it a moment to finish writing
             std::thread::sleep(Duration::from_secs(5));
             kill_session(session_name)?;
             return Ok(SessionOutcome::Completed);
+        }
+
+        // Periodic status logging
+        if last_status_log.elapsed() >= Duration::from_secs(STATUS_LOG_INTERVAL_SECS) {
+            let elapsed = dispatch_time.elapsed();
+            let idle_secs = last_activity.elapsed().as_secs();
+            let remaining = config.pipeline_timeout.saturating_sub(pipeline_start.elapsed());
+            info!(
+                elapsed_secs = elapsed.as_secs(),
+                idle_secs = idle_secs,
+                remaining_secs = remaining.as_secs(),
+                poll_count = poll_count,
+                nudged = nudged,
+                "Monitor status: running for {}m{}s, idle {}s, {}m remaining",
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60,
+                idle_secs,
+                remaining.as_secs() / 60,
+            );
+            last_status_log = Instant::now();
         }
 
         // Idle detection
@@ -403,6 +450,11 @@ fn run_session_attempt(
                 idle_secs = idle_duration.as_secs(),
                 "Session stuck (idle too long), killing"
             );
+            println!(
+                "[gw] Session stuck (idle {}s > {}s limit), killing...",
+                idle_duration.as_secs(),
+                IDLE_KILL_SECS,
+            );
             kill_session(session_name)?;
             return Ok(SessionOutcome::Stuck);
         }
@@ -411,6 +463,10 @@ fn run_session_attempt(
             info!(
                 idle_secs = idle_duration.as_secs(),
                 "Session idle, sending nudge"
+            );
+            println!(
+                "[gw] Session idle for {}s, sending nudge...",
+                idle_duration.as_secs(),
             );
             let _ = send_keys_with_workaround(session_name, "please continue");
             nudged = true;

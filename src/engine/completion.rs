@@ -248,6 +248,24 @@ impl CompletionDetector {
                     });
                 }
 
+                // Detect checkpoint changes and log them
+                if let Some(ref prev) = self.state.last_checkpoint {
+                    for phase_name in &self.group_phases {
+                        let prev_status = prev.phases.get(phase_name).map(|s| s.status.as_str());
+                        let curr_status = checkpoint.phases.get(phase_name).map(|s| s.status.as_str());
+                        if prev_status != curr_status {
+                            tracing::info!(
+                                phase = %phase_name,
+                                from = ?prev_status,
+                                to = ?curr_status,
+                                "Phase status changed: {} -> {}",
+                                prev_status.unwrap_or("none"),
+                                curr_status.unwrap_or("none"),
+                            );
+                        }
+                    }
+                }
+
                 // Update state
                 self.state.last_checkpoint = Some(checkpoint);
             }

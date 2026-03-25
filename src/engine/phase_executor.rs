@@ -514,8 +514,11 @@ impl PhaseGroupExecutor {
         );
 
         let mut nudge_sent = false;
+        let mut tick_count: u64 = 0;
+        let monitor_start = Instant::now();
 
         loop {
+            tick_count += 1;
             // Get pane content
             let pane_content = capture_pane(session_id)?;
 
@@ -597,7 +600,22 @@ impl PhaseGroupExecutor {
                     }
                 }
                 CompletionEvent::StillRunning => {
-                    // Continue monitoring
+                    // Log status every ~10 ticks (30s)
+                    if tick_count % 10 == 0 {
+                        let elapsed = monitor_start.elapsed();
+                        let current_phase = detector.current_running_phase()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        info!(
+                            group = %group.name,
+                            elapsed_secs = elapsed.as_secs(),
+                            tick = tick_count,
+                            phase = %current_phase,
+                            "Monitoring: {}m{}s elapsed, current phase: {}",
+                            elapsed.as_secs() / 60,
+                            elapsed.as_secs() % 60,
+                            current_phase,
+                        );
+                    }
                 }
             }
 
