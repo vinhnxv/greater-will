@@ -20,7 +20,7 @@
 //! | Complexity      | Low                      | High                          |
 
 use crate::cleanup::{self, startup_cleanup};
-use crate::session::detect::capture_pane;
+use crate::session::detect::{capture_pane, detect_error_pattern};
 use crate::session::spawn::{
     has_session, kill_session, send_keys_with_workaround, spawn_claude_session,
     SpawnConfig,
@@ -419,6 +419,37 @@ fn run_session_attempt(
             // Give it a moment to finish writing
             std::thread::sleep(Duration::from_secs(5));
             kill_session(session_name)?;
+            return Ok(SessionOutcome::Completed);
+        }
+
+        // Check for error patterns in pane output (billing, auth, rate limit, etc.)
+        if let Some(error_type) = detect_error_pattern(&pane_content) {
+            warn!(error_type = %error_type, "Error pattern detected in pane output");
+            println!("[gw] Error detected: {} — killing session", error_type);
+            kill_session(session_name)?;
+            return Ok(SessionOutcome::Crashed {
+                reason: format!("Error pattern detected: {}", error_type),
+            });
+        }
+
+        // Check if Claude process is still alive (tmux session may exist but process dead)
+        if !crate::cleanup::process::is_pid_alive(pid) {
+            let session_age = dispatch_time.elapsed();
+            warn!(pid = pid, age_secs = session_age.as_secs(), "Claude process died but tmux session still exists");
+            println!(
+                "[gw] Claude process (pid={}) died after {}m{}s",
+                pid,
+                session_age.as_secs() / 60,
+                session_age.as_secs() % 60,
+            );
+            kill_session(session_name)?;
+
+            if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!("Claude process died after only {}s", session_age.as_secs()),
+                });
+            }
+            // Process ran for a while then died — likely completed
             return Ok(SessionOutcome::Completed);
         }
 
