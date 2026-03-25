@@ -66,6 +66,13 @@ pub enum Commands {
         /// Overrides the default configuration lookup path.
         #[arg(long, value_name = "PATH")]
         config_dir: Option<PathBuf>,
+
+        /// Resume a previously interrupted batch run.
+        ///
+        /// Reads the batch state from `.gw/batch-state.json` and
+        /// continues from the last incomplete plan.
+        #[arg(long)]
+        resume: bool,
     },
 
     /// Show status of active or recent arc runs.
