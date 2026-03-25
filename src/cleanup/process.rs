@@ -214,10 +214,22 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
     Ok(descendants.len() + 1)
 }
 
-/// Find and kill orphaned Claude processes.
+/// Kill Claude processes owned by Greater-Will tmux sessions.
 ///
-/// Scans for processes with "claude" in their name that are not
-/// associated with an active tmux session.
+/// Only kills processes that are descendants of stale `gw-*` tmux sessions.
+/// This is safe because it never touches Claude Code processes running
+/// outside of Greater-Will (e.g., user's interactive sessions, IDE extensions,
+/// Desktop app).
+///
+/// # Safety
+///
+/// This function exclusively targets processes within `gw-*` tmux sessions
+/// that are considered stale (no active process + older than threshold).
+/// It will NOT kill:
+/// - User's interactive `claude` CLI sessions
+/// - Claude Code Desktop app processes
+/// - VS Code / JetBrains Claude extensions
+/// - Other tools that spawn Claude Code
 ///
 /// # Returns
 ///
@@ -226,38 +238,66 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
 /// # Example
 ///
 /// ```no_run
-/// use greater_will::cleanup::process::kill_orphaned_claude_processes;
+/// use greater_will::cleanup::process::kill_gw_owned_claude_processes;
 ///
-/// let killed = kill_orphaned_claude_processes()?;
-/// println!("Killed {} orphaned processes", killed.len());
+/// let killed = kill_gw_owned_claude_processes()?;
+/// println!("Killed {} owned processes", killed.len());
 /// ```
-pub fn kill_orphaned_claude_processes() -> Result<Vec<u32>> {
-    let sys = create_process_system();
+pub fn kill_gw_owned_claude_processes() -> Result<Vec<u32>> {
+    let gw_sessions = crate::cleanup::tmux_cleanup::list_gw_sessions()?;
     let mut killed_pids = Vec::new();
 
-    for (pid, proc_) in sys.processes() {
-        let name = proc_.name().to_string_lossy().to_lowercase();
+    if gw_sessions.is_empty() {
+        return Ok(killed_pids);
+    }
 
-        // Check if this is a Claude process
-        if name.contains("claude") || name.contains("node") {
-            // Check command line for claude-related content
-            let cmd = proc_
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().to_lowercase())
-                .collect::<Vec<_>>()
-                .join(" ");
+    let mut sys = create_process_system();
 
-            if cmd.contains("claude") || cmd.contains("@anthropic-ai") {
-                let pid_u32 = pid.as_u32();
+    for session in &gw_sessions {
+        // Only target stale sessions — active sessions are still doing work
+        if !crate::cleanup::tmux_cleanup::is_session_stale(&session.name, 600) {
+            tracing::debug!(session = %session.name, "Session still active, skipping");
+            continue;
+        }
 
-                // Try graceful termination first
-                unsafe {
-                    libc::kill(pid_u32 as i32, libc::SIGTERM);
-                }
+        // Get the pane PID — this is the root of the process tree we own
+        if let Some(pane_pid) = crate::cleanup::tmux_cleanup::get_session_pid(&session.name) {
+            if !is_pid_alive(pane_pid) {
+                continue;
+            }
 
-                killed_pids.push(pid_u32);
-                tracing::info!(pid = pid_u32, name = %name, "Killed orphaned Claude process");
+            // Kill the entire process tree rooted at our pane PID
+            let descendants = collect_descendants(&sys, pane_pid);
+            tracing::info!(
+                session = %session.name,
+                pane_pid = pane_pid,
+                descendants = descendants.len(),
+                "Killing stale gw-owned process tree"
+            );
+
+            // SIGTERM descendants first (children before parent)
+            for &pid in &descendants {
+                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                killed_pids.push(pid);
+            }
+            // SIGTERM the root pane process
+            unsafe { libc::kill(pane_pid as i32, libc::SIGTERM); }
+            killed_pids.push(pane_pid);
+        }
+
+        // Kill the tmux session itself
+        let _ = crate::cleanup::tmux_cleanup::kill_session(&session.name);
+    }
+
+    if !killed_pids.is_empty() {
+        // Wait for graceful termination, then force-kill stragglers
+        std::thread::sleep(Duration::from_secs(2));
+        refresh_process_system(&mut sys);
+
+        for &pid in &killed_pids {
+            if is_pid_alive(pid) {
+                tracing::warn!(pid = pid, "Force-killing straggler process");
+                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
             }
         }
     }
@@ -326,6 +366,89 @@ pub fn snapshot(sys: &System, pid: u32) -> Option<ResourceSnapshot> {
         child_count,
         start_time: root.start_time(),
     })
+}
+
+/// Registry of PIDs that Greater-Will has spawned.
+///
+/// Provides a second safety layer: even if tmux session detection fails,
+/// we only ever kill PIDs that we explicitly registered after spawning.
+/// This prevents accidental kills of user's interactive Claude sessions,
+/// IDE extensions, or Desktop app processes.
+///
+/// # Invariant
+///
+/// A PID is only added via `register()` immediately after `spawn_claude_session()`
+/// returns it. No PID scanning or pattern matching is used.
+#[derive(Debug, Default)]
+pub struct OwnedProcessRegistry {
+    /// PIDs registered by this gw instance, keyed by tmux session name.
+    pids: HashMap<String, u32>,
+}
+
+impl OwnedProcessRegistry {
+    /// Create a new empty registry.
+    pub fn new() -> Self {
+        Self { pids: HashMap::new() }
+    }
+
+    /// Register a PID as owned by this gw instance.
+    ///
+    /// Call this immediately after spawning a tmux session.
+    pub fn register(&mut self, session_name: String, pid: u32) {
+        tracing::debug!(session = %session_name, pid = pid, "Registered owned PID");
+        self.pids.insert(session_name, pid);
+    }
+
+    /// Unregister a session (after successful cleanup).
+    pub fn unregister(&mut self, session_name: &str) {
+        self.pids.remove(session_name);
+    }
+
+    /// Check if a PID is owned by this gw instance.
+    pub fn is_owned(&self, pid: u32) -> bool {
+        self.pids.values().any(|&p| p == pid)
+    }
+
+    /// Kill all owned processes and their descendants.
+    ///
+    /// Only kills PIDs that were explicitly registered via `register()`.
+    /// Returns the number of processes killed.
+    pub fn kill_all_owned(&mut self) -> Result<usize> {
+        let mut sys = create_process_system();
+        let mut total_killed = 0;
+
+        let sessions: Vec<(String, u32)> = self.pids.drain().collect();
+
+        for (session_name, root_pid) in sessions {
+            if !is_pid_alive(root_pid) {
+                tracing::debug!(session = %session_name, pid = root_pid, "Owned PID already dead");
+                continue;
+            }
+
+            tracing::info!(session = %session_name, pid = root_pid, "Killing owned process tree");
+            match kill_process_tree(&mut sys, root_pid) {
+                Ok(count) => total_killed += count,
+                Err(e) => tracing::warn!(
+                    session = %session_name,
+                    pid = root_pid,
+                    error = %e,
+                    "Failed to kill owned process tree"
+                ),
+            }
+        }
+
+        Ok(total_killed)
+    }
+
+    /// Get the number of registered PIDs.
+    pub fn len(&self) -> usize {
+        self.pids.len()
+    }
+
+    /// Check if the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pids.is_empty()
+    }
 }
 
 /// Process cleanup coordinator.

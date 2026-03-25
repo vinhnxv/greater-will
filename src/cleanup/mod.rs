@@ -14,7 +14,7 @@ pub mod process;
 pub mod tmux_cleanup;
 
 pub use health::{HealthCheck, HealthError, SystemHealth};
-pub use process::{collect_descendants, is_pid_alive, kill_process_tree, ProcessCleanup};
+pub use process::{collect_descendants, is_pid_alive, kill_gw_owned_claude_processes, kill_process_tree, OwnedProcessRegistry, ProcessCleanup};
 pub use tmux_cleanup::{cleanup_stale_sessions, list_gw_sessions, TmuxCleanupError};
 
 use color_eyre::Result;
@@ -48,12 +48,12 @@ pub fn pre_phase_cleanup(plan_hash: &str, group_letter: &str) -> Result<()> {
         tracing::info!(count = stale_count, "Cleaned up stale tmux sessions");
     }
 
-    // 2. Find and kill any orphaned Claude processes
-    let killed_pids = process::kill_orphaned_claude_processes()?;
+    // 2. Kill only Claude processes owned by gw-* tmux sessions
+    let killed_pids = process::kill_gw_owned_claude_processes()?;
     if !killed_pids.is_empty() {
         tracing::info!(
             pids = ?killed_pids,
-            "Killed orphaned Claude processes"
+            "Killed gw-owned Claude processes"
         );
     }
 
