@@ -104,18 +104,28 @@ pub enum Commands {
 
     /// Inject workspace context into Claude Code session (hook command).
     ///
-    /// Designed to be called by Claude Code's `SessionStart` hook.
-    /// Reads hook JSON from stdin, detects workspace state (batch, checkpoint),
-    /// and prints context to stdout which Claude Code injects into the model's
-    /// context window.
+    /// Without flags: called by Claude Code's `SessionStart` hook.
+    /// Reads hook JSON from stdin, prints context to stdout.
     ///
-    /// Register in `.claude/settings.json`:
-    /// ```json
-    /// { "hooks": { "SessionStart": [{ "matcher": "", "hooks": [
-    ///   { "type": "command", "command": "gw elden" }
-    /// ]}]}}
-    /// ```
-    Elden,
+    /// With `--install`: registers gw elden hooks in `.claude/settings.json`.
+    /// With `--uninstall`: removes gw elden hooks from `.claude/settings.json`.
+    /// With `--status`: shows current hook registration status.
+    Elden {
+        /// Install gw elden hooks into `.claude/settings.json`.
+        ///
+        /// Creates the file if it doesn't exist. Merges hooks if the file
+        /// already has other hooks configured. Safe to run multiple times.
+        #[arg(long)]
+        install: bool,
+
+        /// Remove gw elden hooks from `.claude/settings.json`.
+        #[arg(long)]
+        uninstall: bool,
+
+        /// Show current hook registration status.
+        #[arg(long)]
+        status: bool,
+    },
 
     /// Clean up temporary files and tmux sessions.
     ///

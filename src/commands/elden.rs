@@ -35,10 +35,12 @@
 //!
 //! `source` is one of: `startup`, `resume`, `compact`
 
+use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Hook event source — how the session was initiated.
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +91,233 @@ pub fn execute() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─── Hook Installation ───────────────────────────────────────────────
+
+/// Path to Claude Code settings file (project-local).
+const SETTINGS_PATH: &str = ".claude/settings.json";
+
+/// The hook command we register.
+const HOOK_COMMAND: &str = "gw elden";
+
+/// Marker to identify our hooks in the settings file.
+const HOOK_MARKER: &str = "gw elden";
+
+/// Install gw elden hooks into `.claude/settings.json`.
+///
+/// Creates the file if missing. Merges with existing hooks — never
+/// overwrites user's other hooks. Safe to run multiple times (idempotent).
+pub fn install() -> Result<()> {
+    let settings_path = PathBuf::from(SETTINGS_PATH);
+
+    // Ensure .claude/ directory exists
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    // Load existing settings or start fresh
+    let mut settings = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)
+            .wrap_err("Failed to read .claude/settings.json")?;
+        serde_json::from_str::<Value>(&content)
+            .wrap_err("Failed to parse .claude/settings.json")?
+    } else {
+        json!({})
+    };
+
+    // Check if already installed
+    if has_gw_hook(&settings, "SessionStart") {
+        println!("gw elden hooks already installed in {}", SETTINGS_PATH);
+        println!();
+        print_hook_summary(&settings);
+        return Ok(());
+    }
+
+    // Ensure settings is an object
+    let obj = settings
+        .as_object_mut()
+        .ok_or_else(|| eyre::eyre!("settings.json root is not an object"))?;
+
+    // Get or create "hooks" object
+    if !obj.contains_key("hooks") {
+        obj.insert("hooks".to_string(), json!({}));
+    }
+    let hooks = obj
+        .get_mut("hooks")
+        .unwrap()
+        .as_object_mut()
+        .ok_or_else(|| eyre::eyre!("\"hooks\" is not an object"))?;
+
+    // Install SessionStart hook
+    install_hook(hooks, "SessionStart", HOOK_COMMAND);
+
+    // Install PreCompact hook (brief context for compaction survival)
+    install_hook(hooks, "PreCompact", HOOK_COMMAND);
+
+    // Write back
+    let output = serde_json::to_string_pretty(&settings)
+        .wrap_err("Failed to serialize settings")?;
+    std::fs::write(&settings_path, output)
+        .wrap_err("Failed to write .claude/settings.json")?;
+
+    println!("Installed gw elden hooks into {}", SETTINGS_PATH);
+    println!();
+    print_hook_summary(&settings);
+
+    Ok(())
+}
+
+/// Remove gw elden hooks from `.claude/settings.json`.
+pub fn uninstall() -> Result<()> {
+    let settings_path = PathBuf::from(SETTINGS_PATH);
+
+    if !settings_path.exists() {
+        println!("No {} found — nothing to uninstall.", SETTINGS_PATH);
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&settings_path)
+        .wrap_err("Failed to read .claude/settings.json")?;
+    let mut settings: Value = serde_json::from_str(&content)
+        .wrap_err("Failed to parse .claude/settings.json")?;
+
+    let mut removed = false;
+
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for event in &["SessionStart", "PreCompact"] {
+            if remove_gw_hooks(hooks, event) {
+                removed = true;
+            }
+        }
+    }
+
+    if removed {
+        let output = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, output)?;
+        println!("Removed gw elden hooks from {}", SETTINGS_PATH);
+    } else {
+        println!("No gw elden hooks found in {}", SETTINGS_PATH);
+    }
+
+    Ok(())
+}
+
+/// Show current hook registration status.
+pub fn hook_status() -> Result<()> {
+    let settings_path = PathBuf::from(SETTINGS_PATH);
+
+    if !settings_path.exists() {
+        println!("No {} found.", SETTINGS_PATH);
+        println!();
+        println!("Run `gw elden --install` to register hooks.");
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&settings_path)
+        .wrap_err("Failed to read .claude/settings.json")?;
+    let settings: Value = serde_json::from_str(&content)
+        .wrap_err("Failed to parse .claude/settings.json")?;
+
+    print_hook_summary(&settings);
+
+    if !has_gw_hook(&settings, "SessionStart") {
+        println!();
+        println!("Run `gw elden --install` to register hooks.");
+    }
+
+    Ok(())
+}
+
+/// Install a single hook entry for a given event, preserving existing hooks.
+fn install_hook(hooks: &mut serde_json::Map<String, Value>, event: &str, command: &str) {
+    let new_entry = json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": command
+        }]
+    });
+
+    match hooks.get_mut(event) {
+        Some(existing) if existing.is_array() => {
+            // Append to existing array
+            existing.as_array_mut().unwrap().push(new_entry);
+        }
+        _ => {
+            // Create new array with our entry
+            hooks.insert(event.to_string(), json!([new_entry]));
+        }
+    }
+}
+
+/// Check if a gw elden hook is already registered for an event.
+fn has_gw_hook(settings: &Value, event: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|arr| arr.as_array())
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| c.contains(HOOK_MARKER))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Remove gw elden hooks from a specific event. Returns true if any were removed.
+fn remove_gw_hooks(hooks: &mut serde_json::Map<String, Value>, event: &str) -> bool {
+    let Some(entries) = hooks.get_mut(event).and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+
+    let before = entries.len();
+    entries.retain(|entry| {
+        !entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|inner| {
+                inner.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains(HOOK_MARKER))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    let removed = entries.len() < before;
+
+    // Clean up empty arrays
+    if entries.is_empty() {
+        hooks.remove(event);
+    }
+
+    removed
+}
+
+/// Print a summary of registered hooks.
+fn print_hook_summary(settings: &Value) {
+    println!("Hook Status:");
+
+    for event in &["SessionStart", "PreCompact", "UserPromptSubmit"] {
+        let installed = has_gw_hook(settings, event);
+        let icon = if installed { "OK" } else { "--" };
+        println!("  [{}] {}", icon, event);
+    }
 }
 
 /// Print full startup context (fires on fresh session start).

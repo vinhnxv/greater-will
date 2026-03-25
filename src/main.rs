@@ -48,7 +48,17 @@ fn main() -> Result<()> {
             resume,
             multi_group,
         } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group),
-        commands::Commands::Elden => commands::elden::execute(),
+        commands::Commands::Elden { install, uninstall, status } => {
+            if install {
+                commands::elden::install()
+            } else if uninstall {
+                commands::elden::uninstall()
+            } else if status {
+                commands::elden::hook_status()
+            } else {
+                commands::elden::execute()
+            }
+        }
         commands::Commands::Status => commands::status::execute(),
         commands::Commands::Replay { checkpoint } => commands::replay::execute(checkpoint),
         commands::Commands::Clean => commands::clean::execute(),
