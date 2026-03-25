@@ -319,9 +319,14 @@ fn run_session_attempt(
     }
 
     // Monitor loop
+    let dispatch_time = Instant::now();
     let mut last_output_hash: u64 = 0;
     let mut last_activity = Instant::now();
     let mut nudged = false;
+
+    /// Minimum session duration to consider a "real" run (not an instant crash).
+    /// If the session dies within this window after dispatch, it's a crash.
+    const MIN_SESSION_DURATION_SECS: u64 = 30;
 
     loop {
         std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -335,20 +340,27 @@ fn run_session_attempt(
 
         // Check if session is still alive
         if !has_session(session_name) {
-            info!("Tmux session ended");
+            let session_age = dispatch_time.elapsed();
+            info!(
+                age_secs = session_age.as_secs(),
+                "Tmux session ended"
+            );
 
-            // Session ended — check if it was a clean exit or crash.
-            // If the process is also dead, it likely completed or crashed.
+            // If session died too quickly, it's a crash (Claude failed to start,
+            // auth error, or immediate exit). Not a successful completion.
+            if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "Session exited after only {}s — Claude Code likely failed to start",
+                        session_age.as_secs()
+                    ),
+                });
+            }
+
+            // Session ran for a meaningful time — check if it completed normally
             if !crate::cleanup::process::is_pid_alive(pid) {
-                // Heuristic: recent activity suggests clean exit, not crash
-                if last_activity.elapsed() < Duration::from_secs(30) {
-                    // Session ended very recently after activity — likely clean exit
-                    info!("Session ended cleanly (recent activity detected)");
-                    return Ok(SessionOutcome::Completed);
-                } else {
-                    // Could be crash or completion — check for prompt/arc completion signals
-                    return Ok(SessionOutcome::Completed);
-                }
+                info!("Session ended, process dead — treating as completion");
+                return Ok(SessionOutcome::Completed);
             }
 
             // Session gone but process alive? Unusual — treat as crash.
