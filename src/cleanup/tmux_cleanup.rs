@@ -136,8 +136,11 @@ pub fn kill_session(name: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Session already gone is not an error
-        if stderr.contains("can't find session") || stderr.contains("no session") {
+        // Session already gone or no tmux server is not an error
+        if stderr.contains("can't find session")
+            || stderr.contains("no session")
+            || stderr.contains("no server running")
+        {
             return Ok(());
         }
         return Err(eyre!("Failed to kill session '{}': {}", name, stderr));
