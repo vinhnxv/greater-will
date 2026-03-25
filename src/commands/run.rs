@@ -1,6 +1,6 @@
 //! Run command implementation.
 //!
-//! Executes arc phases for one or more plan files using the PhaseGroupExecutor.
+//! Executes arc phases for one or more plan files, with checkpoint auto-discovery for --resume.
 
 use crate::batch::BatchRunner;
 use crate::cleanup::startup_cleanup;
@@ -92,6 +92,48 @@ fn run_single(
     }
     if resume {
         ss_config = ss_config.with_resume();
+    }
+
+    // --- Resume validation: auto-discover checkpoint and validate before resuming ---
+    if resume && plans.len() == 1 {
+        use crate::checkpoint::reader::{find_checkpoint_for_plan, validate_before_resume, read_checkpoint, next_pending_phase};
+
+        let plan_path = Path::new(&plans[0]);
+        match find_checkpoint_for_plan(plan_path, cwd)? {
+            Some(cp_path) => {
+                let cp = read_checkpoint(&cp_path)?;
+                match next_pending_phase(&cp) {
+                    Some(next_phase) => {
+                        println!("Found checkpoint: {}", cp_path.display());
+                        println!("Arc: {} | Next phase: {}", cp.id, next_phase);
+                        let arc_dir = cp_path.parent().unwrap();
+                        let validation = validate_before_resume(&cp, arc_dir)?;
+                        for w in &validation.warnings {
+                            println!("  WARN: {}", w);
+                        }
+                        if !validation.can_resume() {
+                            for e in &validation.errors {
+                                println!("  ERROR: {}", e);
+                            }
+                            eyre::bail!(
+                                "Pre-resume validation failed. {} critical artifact(s) missing. \
+                                 Re-run without --resume to start fresh.",
+                                validation.errors.len()
+                            );
+                        }
+                    }
+                    None => {
+                        eyre::bail!("Arc already completed (all phases done). Start a fresh run without --resume.");
+                    }
+                }
+            }
+            None => {
+                eyre::bail!(
+                    "No checkpoint found for plan: {}\nStart a fresh run without --resume.",
+                    plans[0]
+                );
+            }
+        }
     }
 
     if plans.len() == 1 {
