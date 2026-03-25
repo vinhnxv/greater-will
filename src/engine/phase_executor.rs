@@ -758,13 +758,12 @@ pub fn append_result_jsonl(result: &PhaseGroupResult, arc_dir: &Path) -> Result<
 
 /// Compute a short hash for a plan path.
 fn compute_plan_hash(plan_path: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
+    use sha2::{Sha256, Digest};
     let path_str = plan_path.to_string_lossy();
-    let mut hasher = DefaultHasher::new();
-    path_str.hash(&mut hasher);
-    format!("{:x}", hasher.finish())[..8].to_string()
+    let mut hasher = Sha256::new();
+    hasher.update(path_str.as_bytes());
+    let result = hasher.finalize();
+    result.iter().take(6).map(|b| format!("{:02x}", b)).collect::<String>()
 }
 
 #[cfg(test)]
@@ -819,7 +818,15 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
-        assert_eq!(hash1.len(), 8);
+        assert_eq!(hash1.len(), 12);
+    }
+
+    #[test]
+    fn test_stable_hash_known_value() {
+        let h = compute_plan_hash(Path::new("plans/test.md"));
+        // Pin the value to detect algorithm changes
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

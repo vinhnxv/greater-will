@@ -251,6 +251,55 @@ pub fn validate_all_artifacts<P: AsRef<Path>>(
     Ok(failures)
 }
 
+/// Result of pre-resume validation.
+#[derive(Debug)]
+pub struct ResumeValidation {
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub phases_to_reset: Vec<String>,
+}
+
+impl ResumeValidation {
+    pub fn can_resume(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+const CRITICAL_PHASES: &[&str] = &["work", "mend", "test", "code_review", "gap_analysis"];
+
+/// Validate checkpoint integrity before resuming.
+///
+/// Wraps `validate_all_artifacts` and classifies failures as warnings or errors
+/// based on whether the phase is critical. Critical phase failures block resume.
+pub fn validate_before_resume(
+    checkpoint: &Checkpoint,
+    arc_dir: &Path,
+) -> Result<ResumeValidation> {
+    let mut validation = ResumeValidation {
+        warnings: Vec::new(),
+        errors: Vec::new(),
+        phases_to_reset: Vec::new(),
+    };
+
+    let failures = validate_all_artifacts(checkpoint, arc_dir)?;
+
+    for (phase_name, artifact_path, issue) in failures {
+        let is_critical = CRITICAL_PHASES.contains(&phase_name.as_str());
+        let msg = format!(
+            "Phase '{}': artifact '{}' — {}",
+            phase_name, artifact_path, issue
+        );
+        if is_critical {
+            validation.errors.push(msg);
+            validation.phases_to_reset.push(phase_name);
+        } else {
+            validation.warnings.push(msg);
+        }
+    }
+
+    Ok(validation)
+}
+
 /// Mark all phases before `target_phase` as completed (or skipped if in skip_map).
 ///
 /// This is the core function greater-will uses to manipulate checkpoints
@@ -507,5 +556,39 @@ mod tests {
         // Wrong hash
         let invalid = validate_artifact_hash(&file_path, "wronghash").unwrap();
         assert!(!invalid);
+    }
+
+    #[test]
+    fn test_validate_before_resume_clean() {
+        let dir = TempDir::new().unwrap();
+        let cp = make_test_checkpoint();
+        let result = validate_before_resume(&cp, dir.path()).unwrap();
+        assert!(result.can_resume());
+        assert!(result.warnings.is_empty());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_before_resume_missing_critical() {
+        let dir = TempDir::new().unwrap();
+        let mut cp = make_test_checkpoint();
+        let mut work_phase = PhaseStatus::completed(None);
+        work_phase.artifact = Some("nonexistent.md".into());
+        cp.phases.insert("work".into(), work_phase);
+        let result = validate_before_resume(&cp, dir.path()).unwrap();
+        assert!(!result.can_resume());
+        assert!(!result.phases_to_reset.is_empty());
+    }
+
+    #[test]
+    fn test_validate_before_resume_missing_noncritical() {
+        let dir = TempDir::new().unwrap();
+        let mut cp = make_test_checkpoint();
+        let mut forge_phase = PhaseStatus::completed(None);
+        forge_phase.artifact = Some("nonexistent.md".into());
+        cp.phases.insert("forge".into(), forge_phase);
+        let result = validate_before_resume(&cp, dir.path()).unwrap();
+        assert!(result.can_resume());
+        assert!(!result.warnings.is_empty());
     }
 }
