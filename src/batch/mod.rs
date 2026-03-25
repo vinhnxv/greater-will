@@ -13,6 +13,4 @@ pub mod lock;
 pub mod queue;
 pub mod state;
 
-pub use lock::InstanceLock;
-pub use queue::{BatchRunner, BatchSummary};
-pub use state::BatchState;
+pub use queue::BatchRunner;

@@ -4,35 +4,10 @@
 //! `.gw/batch-state.json` and displaying progress, machine health,
 //! and pass/fail/remaining counts.
 
+use crate::batch::state::{BatchState, PlanOutcome};
 use crate::output::tags::tag;
 use color_eyre::Result;
-use serde::Deserialize;
 use std::path::Path;
-
-/// Batch state as written by the run command.
-#[derive(Debug, Deserialize)]
-struct BatchState {
-    batch_id: String,
-    #[serde(default)]
-    plans: Vec<PlanEntry>,
-    #[serde(default)]
-    started_at: Option<String>,
-    #[serde(default)]
-    current_plan_index: usize,
-    #[serde(default)]
-    current_group: Option<String>,
-}
-
-/// A single plan entry in the batch state.
-#[derive(Debug, Deserialize)]
-struct PlanEntry {
-    path: String,
-    status: String,
-    #[serde(default)]
-    groups_completed: u32,
-    #[serde(default)]
-    groups_total: u32,
-}
 
 /// Execute the status command.
 ///
@@ -52,8 +27,7 @@ pub fn execute() -> Result<()> {
     }
 
     // Read atomically (read entire file then parse)
-    let content = std::fs::read_to_string(state_path)?;
-    let state: BatchState = serde_json::from_str(&content)?;
+    let state = BatchState::load(state_path)?;
 
     print_header(&state);
     print_plan_progress(&state);
@@ -65,16 +39,13 @@ pub fn execute() -> Result<()> {
 fn print_header(state: &BatchState) {
     println!();
     println!("  Batch: {}", state.batch_id);
-    if let Some(ref started) = state.started_at {
-        // Calculate elapsed time
-        if let Ok(start) = chrono::DateTime::parse_from_rfc3339(started) {
-            let elapsed = chrono::Utc::now().signed_duration_since(start);
-            let hours = elapsed.num_hours();
-            let mins = elapsed.num_minutes() % 60;
-            let secs = elapsed.num_seconds() % 60;
-            println!("  Elapsed: {:02}:{:02}:{:02}", hours, mins, secs);
-        }
-    }
+
+    // Calculate elapsed time from started_at
+    let elapsed = chrono::Utc::now().signed_duration_since(state.started_at);
+    let hours = elapsed.num_hours();
+    let mins = elapsed.num_minutes() % 60;
+    let secs = elapsed.num_seconds() % 60;
+    println!("  Elapsed: {:02}:{:02}:{:02}", hours, mins, secs);
     println!();
 }
 
@@ -85,43 +56,39 @@ fn print_plan_progress(state: &BatchState) {
     }
 
     let total = state.plans.len();
-    let passed = state.plans.iter().filter(|p| p.status == "completed").count();
-    let failed = state.plans.iter().filter(|p| p.status == "failed").count();
-    let remaining = total - passed - failed;
+    let passed = state.results.iter().filter(|r| r.outcome == PlanOutcome::Passed).count();
+    let failed = state.results.iter().filter(|r| r.outcome == PlanOutcome::Failed).count();
+    let skipped = state.results.iter().filter(|r| r.outcome == PlanOutcome::Skipped).count();
+    let remaining = total - state.results.len();
 
     println!(
-        "  Plans: {}/{} {} passed  {} failed  {} remaining",
-        state.current_plan_index + 1,
+        "  Plans: {}/{} completed",
+        state.current_index,
         total,
-        tag("OK"),
-        tag("FAIL"),
-        remaining,
     );
     println!(
-        "    {} {}  {} {}  remaining {}",
+        "    {} {}  {} {}  {} {}  remaining {}",
         tag("OK"), passed,
         tag("FAIL"), failed,
+        tag("SKIP"), skipped,
         remaining,
     );
 
-    // Show current plan details
-    if let Some(current) = state.plans.get(state.current_plan_index) {
+    // Show current plan if still running
+    if let Some(current) = state.next_plan() {
         println!();
         println!(
             "  {} {}",
             tag("RUN"),
-            current.path,
+            current,
         );
-        if current.groups_total > 0 {
-            println!(
-                "    Groups: {}/{}",
-                current.groups_completed, current.groups_total,
-            );
-        }
     }
 
-    if let Some(ref group) = state.current_group {
-        println!("    Current group: {}", group);
+    if state.circuit_breaker.tripped {
+        println!("  {} Circuit breaker tripped ({} consecutive failures)",
+            tag("WARN"),
+            state.circuit_breaker.consecutive_failures,
+        );
     }
     println!();
 }

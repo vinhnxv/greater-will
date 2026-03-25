@@ -101,12 +101,12 @@ fn test_replay_missing_file() {
 }
 
 #[test]
-fn test_status_stub() {
+fn test_status_no_active_batch() {
     gw()
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("not implemented"));
+        .stdout(predicate::str::contains("No active batch found"));
 }
 
 #[test]

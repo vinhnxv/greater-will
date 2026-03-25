@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Mock script that always succeeds after a brief pause.
 # Usage: mock-success.sh <plan_file>
 #
