@@ -392,7 +392,7 @@ pub fn kill_session(session_id: &str) -> Result<()> {
 /// Shell-escape a string for safe command-line use.
 ///
 /// Wraps in single quotes and escapes internal single quotes.
-fn shell_escape(s: &str) -> String {
+pub fn shell_escape(s: &str) -> String {
     if s.contains('\'') {
         // Replace ' with '\''
         format!("'{}'", s.replace('\'', "'\\''"))

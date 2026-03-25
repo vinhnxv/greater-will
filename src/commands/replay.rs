@@ -2,34 +2,10 @@
 //!
 //! Displays checkpoint status and allows resuming from a checkpoint.
 
+use crate::checkpoint::Checkpoint;
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
-use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
-
-/// Checkpoint file structure (v27 schema).
-#[derive(Debug, Deserialize)]
-pub struct Checkpoint {
-    pub id: String,
-    pub schema_version: u32,
-    pub plan_file: String,
-    pub session_id: String,
-    pub phases: HashMap<String, PhaseState>,
-    pub started_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub completed_at: Option<String>,
-}
-
-/// State of a single phase in the checkpoint.
-#[derive(Debug, Deserialize)]
-pub struct PhaseState {
-    pub status: String,
-    pub artifact: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub skip_reason: Option<String>,
-}
 
 /// Execute the replay command.
 ///
@@ -49,6 +25,12 @@ pub fn execute(checkpoint: PathBuf) -> Result<()> {
     let cp: Checkpoint = serde_json::from_str(&contents)
         .wrap_err_with(|| "Failed to parse checkpoint JSON. Invalid schema?")?;
 
+    // Check schema compatibility and warn if needed
+    let compat = cp.schema_compat();
+    if let Some(warning) = compat.warning() {
+        tracing::warn!("{}", warning);
+    }
+
     // Display checkpoint info
     print_checkpoint_table(&cp);
 
@@ -61,7 +43,7 @@ fn print_checkpoint_table(cp: &Checkpoint) {
     println!("║                      CHECKPOINT STATUS                         ║");
     println!("╠════════════════════════════════════════════════════════════════╣");
     println!("║ ID:      {:54} ║", cp.id);
-    println!("║ Schema:  {:54} ║", format!("v{}", cp.schema_version));
+    println!("║ Schema:  {:54} ║", format!("v{}", cp.schema_version.unwrap_or(0)));
     println!("║ Plan:    {:54} ║", truncate(&cp.plan_file, 54));
     println!("║ Session: {:54} ║", truncate(&cp.session_id, 54));
     println!("╠════════════════════════════════════════════════════════════════╣");
@@ -119,7 +101,10 @@ fn print_checkpoint_table(cp: &Checkpoint) {
         let artifact_display = phase.artifact.as_ref()
             .map(|a| truncate(a, 28))
             .unwrap_or_else(|| {
-                phase.skip_reason.as_ref()
+                // Check skip_map for skip reason
+                cp.skip_map
+                    .as_ref()
+                    .and_then(|m| m.get(name.as_str()))
                     .map(|r| format!("skip: {}", truncate(r, 22)))
                     .unwrap_or_default()
             });
@@ -135,11 +120,8 @@ fn print_checkpoint_table(cp: &Checkpoint) {
     println!("╚════════════════════════════════════════════════════════════════╝");
 
     // Timestamp info
-    if let Some(started) = &cp.started_at {
-        println!("Started:  {}", started);
-    }
-    if let Some(updated) = &cp.updated_at {
-        println!("Updated:  {}", updated);
+    if !cp.started_at.is_empty() {
+        println!("Started:  {}", cp.started_at);
     }
     if let Some(completed) = &cp.completed_at {
         println!("Completed: {}", completed);
@@ -147,12 +129,14 @@ fn print_checkpoint_table(cp: &Checkpoint) {
 }
 
 /// Truncate a string to max length, adding "..." if truncated.
+/// Uses char boundaries to avoid panics on multi-byte UTF-8.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len <= 3 {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let truncated: String = s.chars().take(max_len - 3).collect();
+        format!("{}...", truncated)
     }
 }

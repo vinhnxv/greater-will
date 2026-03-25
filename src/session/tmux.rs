@@ -26,11 +26,23 @@ impl Tmux {
     ///
     /// # Arguments
     ///
-    /// * `name` - Unique session name
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
+    /// * `name` - Unique session name (alphanumeric, hyphens, underscores only, max 64 chars)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session name contains invalid characters.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.len() > 64 {
+            color_eyre::eyre::bail!("Session name too long: {} (max 64 chars)", name.len());
         }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            color_eyre::eyre::bail!(
+                "Session name contains invalid characters: '{}'. Only alphanumeric, hyphens, and underscores allowed.",
+                name
+            );
+        }
+        Ok(Self { name })
     }
 
     /// Get the session name.
@@ -71,7 +83,11 @@ impl Tmux {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::error!("Failed to create tmux session '{}': {}", self.name, stderr);
+            color_eyre::eyre::bail!(
+                "Failed to create tmux session '{}': {}",
+                self.name,
+                stderr.trim()
+            );
         }
 
         Ok(())
@@ -126,8 +142,21 @@ mod tests {
 
     #[test]
     fn test_tmux_new() {
-        let tmux = Tmux::new("test-session");
+        let tmux = Tmux::new("test-session").unwrap();
         assert_eq!(tmux.name(), "test-session");
+    }
+
+    #[test]
+    fn test_tmux_new_rejects_invalid_chars() {
+        assert!(Tmux::new("test;injection").is_err());
+        assert!(Tmux::new("test session").is_err());
+        assert!(Tmux::new("test'quote").is_err());
+    }
+
+    #[test]
+    fn test_tmux_new_rejects_long_name() {
+        let long_name = "a".repeat(65);
+        assert!(Tmux::new(long_name).is_err());
     }
 
     #[test]

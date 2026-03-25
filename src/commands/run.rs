@@ -3,7 +3,7 @@
 //! Executes arc phases for one or more plan files.
 
 use crate::config::phase_config::{resolve_config, PhaseConfig};
-use crate::session::Tmux;
+use crate::session::{shell_escape, Tmux};
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use std::env;
@@ -29,7 +29,7 @@ pub fn execute(
 ) -> Result<()> {
     // Resolve config path
     let cwd = env::current_dir()?;
-    let config_path = resolve_config(config_dir.as_deref(), &cwd);
+    let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
 
     // Load phase config
     let config = PhaseConfig::from_file(&config_path)
@@ -38,13 +38,14 @@ pub fn execute(
     // Validate config
     config.validate()?;
 
-    // Validate group if specified
+    // Validate group if specified (derived from loaded config, not hardcoded)
     if let Some(ref g) = group {
-        let valid_groups = ["A", "B", "C", "D", "E", "F", "G"];
+        let valid_groups: Vec<&str> = config.groups.iter().map(|grp| grp.name.as_str()).collect();
         if !valid_groups.contains(&g.as_str()) {
             eyre::bail!(
-                "Unknown group '{}'. Valid groups: A, B, C, D, E, F, G",
-                g
+                "Unknown group '{}'. Valid groups: {}",
+                g,
+                valid_groups.join(", ")
             );
         }
     }
@@ -100,7 +101,7 @@ fn expand_plan_globs(plans: &[String]) -> Result<Vec<String>> {
                         }
                     }
                     if !found_any {
-                        tracing::warn!("No files matched pattern: {}", pattern);
+                        eyre::bail!("No plan files matched pattern: {}", pattern);
                     }
                 }
                 Err(e) => {
@@ -211,19 +212,19 @@ fn run_mock(
 
             println!("[MOCK] Starting group {} in session: {}", g.name, session_name);
 
-            let tmux = Tmux::new(&session_name);
+            let tmux = Tmux::new(&session_name)?;
 
             // Create session
             tmux.create_session()
                 .wrap_err_with(|| format!("Failed to create tmux session: {}", session_name))?;
 
-            // Set environment variables for the mock script
-            tmux.send_command(&format!("export GW_GROUP_NAME={}", g.name))?;
-            tmux.send_command(&format!("export GW_GROUP_LABEL=\"{}\"", g.label))?;
-            tmux.send_command(&format!("export GW_PLAN={}", plan))?;
+            // Set environment variables for the mock script (shell-escaped for safety)
+            tmux.send_command(&format!("export GW_GROUP_NAME={}", shell_escape(&g.name)))?;
+            tmux.send_command(&format!("export GW_GROUP_LABEL={}", shell_escape(&g.label)))?;
+            tmux.send_command(&format!("export GW_PLAN={}", shell_escape(plan)))?;
 
             // Run mock script followed by exit to close session when done
-            let cmd = format!("{} '{}' && exit || exit", mock_script.display(), plan);
+            let cmd = format!("{} {} && exit || exit", shell_escape(&mock_script.display().to_string()), shell_escape(plan));
             tmux.send_command(&cmd)?;
 
             // Wait for completion (simple polling)
@@ -306,8 +307,12 @@ fn wait_for_session_completion(tmux: &Tmux, timeout_min: u32) -> Result<()> {
 
         // Check for timeout
         if start.elapsed() > timeout {
-            tracing::warn!("Session {} timed out after {}m", tmux.name(), timeout_min);
-            return Ok(());
+            tracing::error!("Session {} timed out after {}m", tmux.name(), timeout_min);
+            eyre::bail!(
+                "Session '{}' timed out after {} minutes. The mock script may be stuck.",
+                tmux.name(),
+                timeout_min
+            );
         }
 
         // Wait before next check

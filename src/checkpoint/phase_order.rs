@@ -71,9 +71,20 @@ pub const PHASE_ORDER: &[&str] = &[
 /// Total number of phases in the arc pipeline.
 pub const PHASE_COUNT: usize = PHASE_ORDER.len();
 
-/// Phase group boundaries for determining which phases belong to each session.
+/// Fine-grained phase group boundaries for checkpoint manipulation.
 ///
-/// Greater-will runs phase groups in separate Claude Code sessions.
+/// **Important:** These 13 internal groups are used by the checkpoint system
+/// (e.g., `mark_phases_completed_before()`) for precise phase status tracking.
+/// They are intentionally more granular than the 7 TOML config groups (A-G)
+/// which control session-level execution boundaries.
+///
+/// The two grouping levels serve different purposes:
+/// - **PHASE_GROUPS (13):** Checkpoint progress tracking & phase completion logic
+/// - **Config groups A-G (7):** Session boundaries — which phases run in one Claude session
+///
+/// All phases in PHASE_GROUPS must be a subset of PHASE_ORDER, and together
+/// must cover all 41 phases exactly once.
+///
 /// Each tuple is (start_index, end_index_exclusive, group_name).
 pub const PHASE_GROUPS: &[(usize, usize, &str)] = &[
     (0, 2, "forge"),           // forge, forge_qa
@@ -197,5 +208,62 @@ mod tests {
             }
         }
         assert!(covered.iter().all(|&c| c), "Not all phases are covered by groups");
+    }
+
+    #[test]
+    fn test_phase_groups_compatible_with_config_groups() {
+        // Verify that every phase in PHASE_GROUPS comes from PHASE_ORDER
+        // and that PHASE_GROUPS indices are valid and non-overlapping.
+        let mut last_end = 0;
+        let mut total_phases = 0;
+        for (start, end, name) in PHASE_GROUPS {
+            assert!(
+                *start == last_end,
+                "Gap between PHASE_GROUPS: group '{}' starts at {} but previous ended at {}",
+                name, start, last_end
+            );
+            assert!(
+                *end > *start,
+                "Empty PHASE_GROUP: '{}' has start={} end={}",
+                name, start, end
+            );
+            assert!(
+                *end <= PHASE_COUNT,
+                "PHASE_GROUP '{}' end ({}) exceeds PHASE_COUNT ({})",
+                name, end, PHASE_COUNT
+            );
+            total_phases += end - start;
+            last_end = *end;
+        }
+        assert_eq!(
+            total_phases, PHASE_COUNT,
+            "PHASE_GROUPS cover {} phases but PHASE_COUNT is {}",
+            total_phases, PHASE_COUNT
+        );
+    }
+
+    #[test]
+    fn test_phase_order_matches_known_phases() {
+        // Verify PHASE_ORDER and KNOWN_PHASES (config module) contain the same phases.
+        // This catches drift between the checkpoint system and config validation.
+        use crate::config::phase_config::KNOWN_PHASES;
+        use std::collections::HashSet;
+
+        let order_set: HashSet<&str> = PHASE_ORDER.iter().copied().collect();
+        let known_set: HashSet<&str> = KNOWN_PHASES.iter().copied().collect();
+
+        let in_order_not_known: Vec<&&str> = order_set.difference(&known_set).collect();
+        let in_known_not_order: Vec<&&str> = known_set.difference(&order_set).collect();
+
+        assert!(
+            in_order_not_known.is_empty(),
+            "Phases in PHASE_ORDER but not KNOWN_PHASES: {:?}",
+            in_order_not_known
+        );
+        assert!(
+            in_known_not_order.is_empty(),
+            "Phases in KNOWN_PHASES but not PHASE_ORDER: {:?}",
+            in_known_not_order
+        );
     }
 }

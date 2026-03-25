@@ -13,5 +13,5 @@ pub mod spawn;
 mod tmux;
 
 pub use detect::{PromptDetector, OutputVelocity, OutputUpdate, PaneSnapshot, capture_pane};
-pub use spawn::{spawn_claude_session, kill_session, wait_for_prompt, send_keys_with_workaround, SpawnConfig};
+pub use spawn::{spawn_claude_session, kill_session, wait_for_prompt, send_keys_with_workaround, shell_escape, SpawnConfig};
 pub use tmux::Tmux;

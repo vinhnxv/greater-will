@@ -122,6 +122,12 @@ impl PhaseConfig {
     pub fn from_file(path: &Path) -> color_eyre::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&contents)?;
+        tracing::info!(
+            path = %path.display(),
+            groups = config.groups.len(),
+            phases = config.total_phases(),
+            "Config loaded"
+        );
         Ok(config)
     }
 
@@ -220,20 +226,38 @@ impl PhaseConfig {
 /// 1. Explicit CLI path (`--config-dir`)
 /// 2. Project-local override (`./greater-will.toml`)
 /// 3. Default shipped config (`config/default-phases.toml`)
-pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> PathBuf {
+///
+/// # Errors
+///
+/// Returns an error if no config file is found at any fallback location.
+pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> color_eyre::Result<PathBuf> {
     // 1. Explicit CLI path takes precedence
     if let Some(p) = cli_path {
-        return p.to_path_buf();
+        if !p.exists() {
+            color_eyre::eyre::bail!(
+                "Config file not found at specified path: {}",
+                p.display()
+            );
+        }
+        return Ok(p.to_path_buf());
     }
 
     // 2. Check for project-local override
     let local = cwd.join("greater-will.toml");
     if local.exists() {
-        return local;
+        return Ok(local);
     }
 
     // 3. Fall back to default shipped config
-    cwd.join("config").join("default-phases.toml")
+    let default = cwd.join("config").join("default-phases.toml");
+    if default.exists() {
+        return Ok(default);
+    }
+
+    color_eyre::eyre::bail!(
+        "No config file found. Searched:\n  1. ./greater-will.toml\n  2. ./config/default-phases.toml\n\
+         Specify one with --config-dir or create config/default-phases.toml"
+    )
 }
 
 #[cfg(test)]
@@ -335,17 +359,35 @@ timeout_min = 30
     }
 
     #[test]
-    fn test_resolve_config_fallback() {
+    fn test_resolve_config_cli_path_takes_precedence() {
+        // Use a path that exists for the test
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let config_path = PathBuf::from(&manifest_dir)
+            .join("config")
+            .join("default-phases.toml");
+
         let cwd = Path::new("/tmp/test");
+        let resolved = resolve_config(Some(config_path.as_path()), cwd).unwrap();
+        assert_eq!(resolved, config_path);
+    }
 
-        // No CLI path, no local file -> default
-        let resolved = resolve_config(None, cwd);
-        assert_eq!(resolved, cwd.join("config/default-phases.toml"));
+    #[test]
+    fn test_resolve_config_errors_when_no_config_found() {
+        let cwd = Path::new("/tmp/nonexistent-dir-for-gw-test");
+        let result = resolve_config(None, cwd);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No config file found"));
+    }
 
-        // CLI path takes precedence
-        let cli_path = Path::new("/custom/config.toml");
-        let resolved = resolve_config(Some(cli_path), cwd);
-        assert_eq!(resolved, cli_path);
+    #[test]
+    fn test_resolve_config_errors_on_missing_cli_path() {
+        let cwd = Path::new("/tmp/test");
+        let cli_path = Path::new("/nonexistent/config.toml");
+        let result = resolve_config(Some(cli_path), cwd);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found at specified path"));
     }
 
     #[test]
