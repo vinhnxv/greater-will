@@ -252,7 +252,9 @@ fn start_claude(
     }
 
     // Add claude command with skip permissions
-    cmd.push_str(&format!("{} --dangerously-skip-permissions", shell_escape(claude_path)));
+    // Note: don't shell_escape the claude path — it's sent via tmux send-keys
+    // which interprets literally. Escaping wraps it in quotes that break execution.
+    cmd.push_str(&format!("{} --dangerously-skip-permissions", claude_path));
 
     debug!(
         session_id = %session_id,
