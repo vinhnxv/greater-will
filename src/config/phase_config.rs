@@ -18,14 +18,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Top-level phase configuration, loaded from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PhaseConfig {
     pub settings: Settings,
     pub groups: Vec<PhaseGroup>,
 }
 
 /// Global settings for phase execution.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
     /// Default timeout for phase groups (minutes).
     pub default_timeout_min: u32,

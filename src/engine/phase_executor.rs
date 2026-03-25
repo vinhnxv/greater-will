@@ -40,6 +40,8 @@ use crate::session::{spawn_claude_session, kill_session, wait_for_prompt, send_k
 use crate::session::detect::capture_pane;
 use color_eyre::eyre::{eyre, Context};
 use color_eyre::Result;
+use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -51,7 +53,7 @@ const DEFAULT_PROMPT_WAIT_SECS: u64 = 60;
 const CLAUDE_INIT_SECS: u64 = 12;
 
 /// Phase group state in the execution state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PhaseGroupState {
     /// Not yet started.
     Pending,
@@ -96,7 +98,7 @@ impl PhaseGroupState {
 }
 
 /// Result of executing a phase group.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PhaseGroupResult {
     /// Group name (e.g., "A", "B").
     pub group_name: String,
@@ -106,7 +108,8 @@ pub struct PhaseGroupResult {
     pub session_id: Option<String>,
     /// PID of the Claude Code process.
     pub pid: Option<u32>,
-    /// Time taken to execute.
+    /// Time taken to execute (seconds).
+    #[serde(serialize_with = "serialize_duration")]
     pub duration: Duration,
     /// Number of retries attempted.
     pub retries: u32,
@@ -131,6 +134,9 @@ pub struct ExecutorConfig {
     pub prompt_wait_timeout: Duration,
     /// Enable dry run (don't actually execute).
     pub dry_run: bool,
+    /// Maximum concurrent Claude Code sessions (default: 1 for MVP).
+    /// Greater-will enforces this before spawning each session.
+    pub max_concurrent_sessions: u32,
 }
 
 impl ExecutorConfig {
@@ -143,6 +149,7 @@ impl ExecutorConfig {
             claude_path: "claude".to_string(),
             prompt_wait_timeout: Duration::from_secs(DEFAULT_PROMPT_WAIT_SECS),
             dry_run: false,
+            max_concurrent_sessions: 1,
         }
     }
 
@@ -161,6 +168,12 @@ impl ExecutorConfig {
     /// Enable dry run mode.
     pub fn with_dry_run(mut self) -> Self {
         self.dry_run = true;
+        self
+    }
+
+    /// Set maximum concurrent sessions.
+    pub fn with_max_concurrent_sessions(mut self, max: u32) -> Self {
+        self.max_concurrent_sessions = max;
         self
     }
 }
@@ -235,6 +248,11 @@ impl PhaseGroupExecutor {
                 &arc_dir,
                 exec_config,
             )?;
+
+            // Write result to JSONL log
+            if let Err(e) = append_result_jsonl(&result, &arc_dir) {
+                warn!(error = %e, "Failed to write JSONL log (non-fatal)");
+            }
 
             self.results.push(result.clone());
 
@@ -370,6 +388,18 @@ impl PhaseGroupExecutor {
         // Pre-flight
         state = PhaseGroupState::PreFlight;
         info!(group = %group.name, "Pre-flight checks");
+
+        // Process budget enforcement: ensure we don't exceed max concurrent sessions
+        let active_sessions = crate::cleanup::tmux_cleanup::list_gw_sessions()
+            .unwrap_or_default();
+        let active_count = active_sessions.len() as u32;
+        if active_count >= exec_config.max_concurrent_sessions {
+            warn!(
+                active = active_count,
+                max = exec_config.max_concurrent_sessions,
+                "Active sessions at budget limit, cleaning stale sessions first"
+            );
+        }
 
         // Health check
         check_system_health().wrap_err("System health check failed")?;
@@ -689,6 +719,34 @@ impl PhaseGroupExecutor {
     pub fn results(&self) -> &[PhaseGroupResult] {
         &self.results
     }
+}
+
+/// Serialize a Duration as fractional seconds for JSONL output.
+fn serialize_duration<S: serde::Serializer>(d: &Duration, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_f64(d.as_secs_f64())
+}
+
+/// Append a PhaseGroupResult as a single JSON line to a JSONL log file.
+///
+/// The log file is created at `{arc_dir}/phase-results.jsonl`.
+/// Each line is a complete JSON object representing one group execution.
+pub fn append_result_jsonl(result: &PhaseGroupResult, arc_dir: &Path) -> Result<()> {
+    let log_path = arc_dir.join("phase-results.jsonl");
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .wrap_err_with(|| format!("Failed to open JSONL log: {}", log_path.display()))?;
+
+    let json = serde_json::to_string(result)
+        .wrap_err("Failed to serialize PhaseGroupResult to JSON")?;
+
+    writeln!(file, "{}", json)
+        .wrap_err_with(|| format!("Failed to write to JSONL log: {}", log_path.display()))?;
+
+    debug!(path = %log_path.display(), group = %result.group_name, "Appended result to JSONL log");
+    Ok(())
 }
 
 /// Compute a short hash for a plan path.

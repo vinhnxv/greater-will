@@ -76,8 +76,8 @@ impl Tmux {
                 "new-session",
                 "-d",           // Detached
                 "-s", &self.name, // Session name
-                "-x", "120",    // Width
-                "-y", "40",     // Height
+                "-x", "200",    // Width (stable output, matches spawn.rs)
+                "-y", "50",     // Height
             ])
             .output()?;
 

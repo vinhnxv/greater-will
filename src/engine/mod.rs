@@ -45,5 +45,5 @@ pub mod phase_executor;
 pub mod retry;
 
 pub use completion::{CompletionDetector, CompletionEvent, CompletionState};
-pub use phase_executor::{PhaseGroupExecutor, PhaseGroupResult, PhaseGroupState};
+pub use phase_executor::{PhaseGroupExecutor, PhaseGroupResult, PhaseGroupState, ExecutorConfig, append_result_jsonl};
 pub use retry::{BackoffStrategy, ErrorClass, RetryCoordinator, RetryDecision};

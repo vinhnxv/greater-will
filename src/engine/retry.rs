@@ -35,12 +35,13 @@
 //! }
 //! ```
 
+use serde::Serialize;
 use std::time::Duration;
 
 /// Classification of errors that can occur during phase execution.
 ///
 /// Each variant maps to specific retry behavior defined by `RetryStrategy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ErrorClass {
     /// Claude Code process crashed or died unexpectedly.
     /// → Retry with 30s backoff, max 3 retries.

@@ -1,13 +1,15 @@
 //! Run command implementation.
 //!
-//! Executes arc phases for one or more plan files.
+//! Executes arc phases for one or more plan files using the PhaseGroupExecutor.
 
+use crate::cleanup::startup_cleanup;
 use crate::config::phase_config::{resolve_config, PhaseConfig};
+use crate::engine::phase_executor::{ExecutorConfig, PhaseGroupExecutor, PhaseGroupState};
 use crate::session::{shell_escape, Tmux};
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -63,15 +65,126 @@ pub fn execute(
         return run_mock(&expanded_plans, &mock_script, &config, group.as_ref());
     }
 
-    // Real execution not yet implemented
-    tracing::info!("Plans to execute: {:?}", expanded_plans);
-    if let Some(g) = group {
-        tracing::info!("Running group: {}", g);
+    // Real execution via PhaseGroupExecutor
+    run_real(&expanded_plans, config, group, config_dir.clone(), &cwd)
+}
+
+/// Run real execution using the PhaseGroupExecutor.
+fn run_real(
+    plans: &[String],
+    mut config: PhaseConfig,
+    group: Option<String>,
+    config_dir: Option<PathBuf>,
+    cwd: &Path,
+) -> Result<()> {
+    // Pre-flight: tmux availability check
+    preflight_tmux()?;
+
+    // Startup cleanup: kill stale sessions from previous crashed runs
+    startup_cleanup()?;
+
+    // Filter config groups if --group specified
+    if let Some(ref g) = group {
+        config.groups.retain(|grp| grp.name == *g);
+        if config.groups.is_empty() {
+            eyre::bail!("No groups remaining after filter");
+        }
     }
 
-    println!("run: real execution not yet implemented");
-    println!("Use --dry-run to validate or --mock <script> for testing");
+    println!("=== Greater-Will Arc Executor ===");
+    println!(
+        "Plans: {} | Groups: {} | Phases: {}",
+        plans.len(),
+        config.groups.len(),
+        config.total_phases()
+    );
+    println!();
+
+    let mut all_succeeded = true;
+
+    for plan in plans {
+        let plan_path = Path::new(plan);
+
+        // Validate plan exists
+        if !plan_path.exists() {
+            eyre::bail!("Plan file not found: {}", plan);
+        }
+
+        println!("--- Executing plan: {} ---", plan);
+
+        // Build executor config
+        let mut exec_config = ExecutorConfig::new(cwd);
+        if let Some(ref dir) = config_dir {
+            exec_config = exec_config.with_config_dir(dir.clone());
+        }
+
+        // Create executor and run
+        let mut executor = PhaseGroupExecutor::new(config.clone());
+        let results = executor.execute_plan(plan_path, &exec_config)?;
+
+        // Print results summary
+        println!();
+        println!("=== Results for {} ===", plan);
+        for result in &results {
+            let status_icon = match result.state {
+                PhaseGroupState::Succeeded => "✓",
+                PhaseGroupState::Skipped => "⊘",
+                PhaseGroupState::Failed { .. } => "✗",
+                _ => "?",
+            };
+            println!(
+                "  {} Group {}: {:?} ({:.1}s, {} retries)",
+                status_icon,
+                result.group_name,
+                result.state,
+                result.duration.as_secs_f64(),
+                result.retries,
+            );
+            if let Some(ref err) = result.error_message {
+                println!("    Error: {}", err);
+            }
+        }
+
+        // Check for failures
+        let failed = results.iter().any(|r| matches!(r.state, PhaseGroupState::Failed { .. }));
+        if failed {
+            all_succeeded = false;
+            println!();
+            println!("Plan {} had failures. Stopping.", plan);
+            break;
+        }
+
+        println!("Plan {} completed successfully.", plan);
+        println!();
+    }
+
+    if all_succeeded {
+        println!("=== All plans completed successfully ===");
+    } else {
+        eyre::bail!("One or more plans failed");
+    }
+
     Ok(())
+}
+
+/// Check that tmux is available.
+fn preflight_tmux() -> Result<()> {
+    let tmux_check = Command::new("tmux").arg("-V").output();
+    match tmux_check {
+        Err(_) => {
+            eyre::bail!(
+                "tmux is required but not found. Install with: brew install tmux (macOS) or apt install tmux (Linux)"
+            );
+        }
+        Ok(out) if !out.status.success() => {
+            eyre::bail!("tmux check failed. Please verify tmux is installed correctly.");
+        }
+        Ok(out) => {
+            let version = String::from_utf8_lossy(&out.stdout);
+            tracing::info!("tmux version: {}", version.trim());
+            Ok(())
+        }
+    }
 }
 
 /// Expand glob patterns in plan file paths.
