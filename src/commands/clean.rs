@@ -1,17 +1,49 @@
 //! Clean command implementation.
 //!
-//! Cleans up temporary files and tmux sessions.
+//! Cleans up temporary files and tmux sessions from Greater-Will runs.
 
 use color_eyre::Result;
+
+use crate::cleanup;
 
 /// Execute the clean command.
 ///
 /// Removes:
-/// - Orphaned tmux sessions from interrupted runs
+/// - All `gw-*` tmux sessions
+/// - Orphaned Claude processes
 /// - Temporary checkpoint files
-/// - Log files from previous runs
 pub fn execute() -> Result<()> {
-    // Stub: not implemented yet
-    println!("clean: not implemented yet");
+    tracing::info!("Starting cleanup");
+
+    // 1. Kill all gw-* tmux sessions
+    let sessions_killed = cleanup::tmux_cleanup::kill_all_gw_sessions()?;
+    if sessions_killed > 0 {
+        println!("Killed {} tmux session(s)", sessions_killed);
+    } else {
+        println!("No active Greater-Will sessions found");
+    }
+
+    // 2. Kill any orphaned Claude processes
+    let processes_killed = cleanup::process::kill_orphaned_claude_processes()?;
+    if !processes_killed.is_empty() {
+        println!("Killed {} orphaned Claude process(es)", processes_killed.len());
+        for pid in &processes_killed {
+            tracing::info!(pid = pid, "Killed orphaned process");
+        }
+    }
+
+    // 3. Report final status
+    let status = cleanup::tmux_cleanup::get_sessions_status()?;
+    if status.is_empty() {
+        println!("All Greater-Will resources cleaned up");
+    } else {
+        println!("Warning: {} session(s) could not be cleaned:", status.len());
+        for (name, has_process) in &status {
+            let status_str = if *has_process { "active" } else { "idle" };
+            println!("  - {} ({})", name, status_str);
+        }
+    }
+
+    tracing::info!("Cleanup completed");
     Ok(())
 }

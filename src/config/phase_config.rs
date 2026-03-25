@@ -41,7 +41,7 @@ pub struct Settings {
 }
 
 /// A group of related phases that run together.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PhaseGroup {
     /// Group identifier (A-G).
     pub name: String,

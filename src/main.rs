@@ -9,9 +9,13 @@
 //! - `replay`: Resume from a checkpoint
 //! - `clean`: Clean up temporary files and sessions
 
+mod checkpoint;
+mod cleanup;
 mod commands;
 mod config;
+mod engine;
 mod log;
+mod monitor;
 mod scanner;
 mod session;
 
