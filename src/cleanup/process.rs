@@ -188,7 +188,7 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
 
     // Check which processes are still alive
     refresh_process_system(sys);
-    let mut still_alive: Vec<u32> = descendants
+    let still_alive: Vec<u32> = descendants
         .iter()
         .chain(std::iter::once(&root_pid))
         .filter(|&&pid| is_pid_alive(pid))

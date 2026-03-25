@@ -13,9 +13,6 @@ pub mod health;
 pub mod process;
 pub mod tmux_cleanup;
 
-pub use health::{HealthCheck, HealthError, SystemHealth};
-pub use process::{collect_descendants, is_pid_alive, kill_gw_owned_claude_processes, kill_process_tree, OwnedProcessRegistry, ProcessCleanup};
-pub use tmux_cleanup::{cleanup_stale_sessions, list_gw_sessions, TmuxCleanupError};
 
 use color_eyre::Result;
 
@@ -101,7 +98,7 @@ pub fn post_phase_cleanup(session_id: &str, pane_pid: u32) -> Result<bool> {
 
     // Refresh and check for remaining processes
     process::refresh_process_system(&mut sys);
-    let remaining = collect_descendants(&sys, pane_pid);
+    let remaining = process::collect_descendants(&sys, pane_pid);
 
     if remaining.is_empty() {
         tracing::info!("All child processes terminated cleanly");
@@ -123,7 +120,7 @@ pub fn post_phase_cleanup(session_id: &str, pane_pid: u32) -> Result<bool> {
     // Wait 1s and verify
     std::thread::sleep(Duration::from_secs(1));
     process::refresh_process_system(&mut sys);
-    let final_remaining = collect_descendants(&sys, pane_pid);
+    let final_remaining = process::collect_descendants(&sys, pane_pid);
 
     if final_remaining.is_empty() {
         tracing::info!("All child processes terminated after force-kill");

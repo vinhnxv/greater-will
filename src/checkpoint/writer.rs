@@ -23,7 +23,7 @@
 //! ```
 
 use crate::checkpoint::schema::Checkpoint;
-use color_eyre::eyre::{self, Context};
+use color_eyre::eyre::Context;
 use color_eyre::Result;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -154,7 +154,6 @@ fn fsync_file<P: AsRef<Path>>(path: P) -> Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::AsRawFd;
 
         // Use fsync on Unix

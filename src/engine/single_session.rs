@@ -22,10 +22,10 @@
 use crate::cleanup::{self, startup_cleanup};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
-    has_session, kill_session, send_keys_with_workaround, shell_escape, spawn_claude_session,
+    has_session, kill_session, send_keys_with_workaround, spawn_claude_session,
     SpawnConfig,
 };
-use color_eyre::eyre::{self, Context};
+use color_eyre::eyre::{self};
 use color_eyre::Result;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -340,9 +340,7 @@ fn run_session_attempt(
             // Session ended — check if it was a clean exit or crash.
             // If the process is also dead, it likely completed or crashed.
             if !crate::cleanup::process::is_pid_alive(pid) {
-                // Heuristic: if we ran for at least a few minutes, assume completion.
-                // A crash within the first 30s is likely a startup failure.
-                let session_duration = Instant::now() - (pipeline_start + (pipeline_start.elapsed() - last_activity.elapsed()));
+                // Heuristic: recent activity suggests clean exit, not crash
                 if last_activity.elapsed() < Duration::from_secs(30) {
                     // Session ended very recently after activity — likely clean exit
                     info!("Session ended cleanly (recent activity detected)");

@@ -41,7 +41,7 @@ pub fn execute(
 
     // Resolve config path (needed for dry-run, mock, and multi-group)
     let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
-    let mut config = PhaseConfig::from_file(&config_path)
+    let config = PhaseConfig::from_file(&config_path)
         .wrap_err_with(|| format!("Failed to load config from {}", config_path.display()))?;
     config.validate()?;
 

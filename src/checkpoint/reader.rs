@@ -4,11 +4,10 @@
 //! Includes SHA256 hash validation for artifacts.
 
 use crate::checkpoint::phase_order::{phase_index, PHASE_ORDER};
-use crate::checkpoint::schema::{Checkpoint, PhaseStatus, SchemaCompat};
-use color_eyre::eyre::{self, Context, eyre};
+use crate::checkpoint::schema::{Checkpoint, PhaseStatus};
+use color_eyre::eyre::{Context, eyre};
 use color_eyre::Result;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

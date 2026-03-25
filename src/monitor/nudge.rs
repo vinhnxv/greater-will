@@ -52,7 +52,7 @@
 //! }
 //! ```
 
-use crate::session::detect::{compute_content_hash, has_prompt_in_content};
+use crate::session::detect::compute_content_hash;
 use color_eyre::Result;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -303,7 +303,7 @@ fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 pub fn is_session_idle(
     session_id: &str,
     previous_hash: Option<u64>,
-    threshold: Duration,
+    _threshold: Duration,
 ) -> Result<(bool, u64)> {
     let output = Command::new("tmux")
         .args(["capture-pane", "-t", session_id, "-p"])

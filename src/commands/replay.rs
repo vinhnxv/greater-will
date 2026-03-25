@@ -2,7 +2,7 @@
 //!
 //! Displays checkpoint status and allows resuming from a checkpoint.
 
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::schema::Checkpoint;
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use std::path::PathBuf;

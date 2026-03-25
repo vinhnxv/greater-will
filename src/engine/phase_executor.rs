@@ -27,7 +27,6 @@
 //! }
 //! ```
 
-use crate::checkpoint::phase_order::{phase_index, PHASE_ORDER, PHASE_GROUPS};
 use crate::checkpoint::reader::{mark_phases_completed_before, read_checkpoint};
 use crate::checkpoint::writer::write_checkpoint;
 use crate::checkpoint::schema::Checkpoint;
@@ -308,7 +307,7 @@ impl PhaseGroupExecutor {
         }
 
         // Execute with retry
-        let mut retries = 0;
+        let mut retries;
         loop {
             let result = self.execute_group_once(
                 group,
@@ -377,16 +376,14 @@ impl PhaseGroupExecutor {
         group: &PhaseGroup,
         plan_hash: &str,
         checkpoint_path: &Path,
-        arc_dir: &Path,
+        _arc_dir: &Path,
         exec_config: &ExecutorConfig,
         session_id: &str,
     ) -> Result<PhaseGroupResult> {
         let start = Instant::now();
-        let mut state = PhaseGroupState::Pending;
-        let mut pid: Option<u32> = None;
+        let pid: Option<u32>;
 
         // Pre-flight
-        state = PhaseGroupState::PreFlight;
         info!(group = %group.name, "Pre-flight checks");
 
         // Process budget enforcement: ensure we don't exceed max concurrent sessions
@@ -429,7 +426,6 @@ impl PhaseGroupExecutor {
         write_checkpoint(&checkpoint, checkpoint_path)?;
 
         // Spawn session
-        state = PhaseGroupState::Spawning;
         info!(group = %group.name, session_id = %session_id, "Spawning session");
 
         let spawn_config = SpawnConfig::new(
@@ -465,7 +461,6 @@ impl PhaseGroupExecutor {
         }
 
         // Wait for prompt
-        state = PhaseGroupState::WaitingReady;
         info!(group = %group.name, "Waiting for Claude Code prompt");
 
         let prompt_timeout = exec_config.prompt_wait_timeout;
@@ -493,7 +488,6 @@ impl PhaseGroupExecutor {
         }
 
         // Send skill command
-        state = PhaseGroupState::Dispatching;
         info!(
             group = %group.name,
             command = %group.skill_command,
@@ -505,7 +499,6 @@ impl PhaseGroupExecutor {
         }
 
         // Monitor completion
-        state = PhaseGroupState::Running;
         info!(group = %group.name, "Monitoring completion");
 
         let completion_config = CompletionConfig::for_group(
@@ -530,7 +523,6 @@ impl PhaseGroupExecutor {
             match detector.tick(&pane_content)? {
                 CompletionEvent::Completed => {
                     info!(group = %group.name, "Group completed");
-                    state = PhaseGroupState::Completing;
                     break;
                 }
                 CompletionEvent::Failed { phase } => {
@@ -587,7 +579,7 @@ impl PhaseGroupExecutor {
                 CompletionEvent::Nudge => {
                     if !nudge_sent {
                         info!(group = %group.name, "Sending nudge");
-                        let nudge_mgr = crate::monitor::nudge::NudgeManager::with_defaults(session_id);
+                        let _nudge_mgr = crate::monitor::nudge::NudgeManager::with_defaults(session_id);
                         // Note: We'd need mutable access to send the nudge
                         // For now, just log it
                         nudge_sent = true;
@@ -600,7 +592,6 @@ impl PhaseGroupExecutor {
                     if let Ok(cp) = read_checkpoint(checkpoint_path) {
                         if self.is_group_complete_in_checkpoint(&group, &cp) {
                             info!(group = %group.name, "Group completed (detected via prompt return)");
-                            state = PhaseGroupState::Completing;
                             break;
                         }
                     }
@@ -622,11 +613,9 @@ impl PhaseGroupExecutor {
             post_phase_cleanup(session_id, p)?;
         }
 
-        state = PhaseGroupState::Succeeded;
-
         Ok(PhaseGroupResult {
             group_name: group.name.clone(),
-            state,
+            state: PhaseGroupState::Succeeded,
             session_id: Some(session_id.to_string()),
             pid,
             duration: start.elapsed(),

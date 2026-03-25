@@ -39,5 +39,3 @@
 pub mod checkpoint_poll;
 pub mod nudge;
 
-pub use checkpoint_poll::{CheckpointWatcher, CheckpointDiff};
-pub use nudge::{NudgeManager, NudgeState};

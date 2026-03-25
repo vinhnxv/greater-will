@@ -39,11 +39,9 @@
 //! }
 //! ```
 
-use crate::checkpoint::phase_order::{phase_index, PHASE_ORDER};
 use crate::checkpoint::reader::read_checkpoint;
-use crate::checkpoint::schema::{Checkpoint, PhaseStatus};
+use crate::checkpoint::schema::Checkpoint;
 use color_eyre::Result;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{debug, info, warn};

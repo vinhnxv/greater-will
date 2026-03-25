@@ -442,7 +442,7 @@ fn print_brief_context(session_id: &str, source: &HookSource) -> Result<()> {
 
 /// Read hook input from stdin (Claude Code sends JSON).
 fn read_hook_input() -> Option<HookInput> {
-    let mut input = String::new();
+    let input;
 
     // Read with a size limit to avoid hanging on empty stdin
     let stdin = std::io::stdin();
