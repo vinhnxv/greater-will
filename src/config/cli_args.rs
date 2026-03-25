@@ -78,6 +78,14 @@ pub enum Commands {
         #[arg(long)]
         resume: bool,
 
+        /// Allow running with uncommitted git changes.
+        ///
+        /// By default, gw refuses to run when the git working tree has
+        /// uncommitted changes (staged or unstaged) to prevent accidental
+        /// data loss. Use this flag to bypass the check.
+        #[arg(long)]
+        allow_dirty: bool,
+
         /// Use multi-group execution mode (legacy).
         ///
         /// Splits arc phases into 7 groups (A-G), each running in a

@@ -49,7 +49,8 @@ fn main() -> Result<()> {
             config_dir,
             resume,
             multi_group,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group),
+            allow_dirty,
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty),
         commands::Commands::Elden { install, uninstall, status } => {
             if install {
                 commands::elden::install()

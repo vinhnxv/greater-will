@@ -33,8 +33,15 @@ pub fn execute(
     config_dir: Option<PathBuf>,
     resume: bool,
     multi_group: bool,
+    allow_dirty: bool,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
+
+    // Pre-flight: check for uncommitted git changes
+    // Skip for dry-run, mock, and --allow-dirty
+    if !dry_run && mock.is_none() && !allow_dirty {
+        preflight_git_clean(&cwd)?;
+    }
 
     // Expand glob patterns in plans
     let expanded_plans = expand_plan_globs(&plans)?;
@@ -309,6 +316,63 @@ fn run_real(
     }
 
     Ok(())
+}
+
+/// Check that the git working tree is clean (no uncommitted changes).
+///
+/// The arc pipeline creates commits and modifies files. Running with
+/// uncommitted changes risks:
+/// - Unintended changes getting swept into arc-generated commits
+/// - Merge conflicts when Rune tries to commit
+/// - Lost work if a crash triggers cleanup
+///
+/// Users can bypass with `--allow-dirty`.
+fn preflight_git_clean(cwd: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output();
+
+    match output {
+        Err(_) => {
+            // git not available or not a git repo — skip the check
+            tracing::debug!("git not available, skipping dirty check");
+            Ok(())
+        }
+        Ok(out) if !out.status.success() => {
+            // Not a git repo or other git error — skip silently
+            tracing::debug!("git status failed, skipping dirty check");
+            Ok(())
+        }
+        Ok(out) => {
+            let status = String::from_utf8_lossy(&out.stdout);
+            let dirty_files: Vec<&str> = status
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+
+            if dirty_files.is_empty() {
+                tracing::info!("Git working tree is clean");
+                return Ok(());
+            }
+
+            // Show what's dirty
+            let preview_count = dirty_files.len().min(10);
+            let mut msg = format!(
+                "Git working tree has {} uncommitted change(s):\n",
+                dirty_files.len()
+            );
+            for line in &dirty_files[..preview_count] {
+                msg.push_str(&format!("  {}\n", line));
+            }
+            if dirty_files.len() > preview_count {
+                msg.push_str(&format!("  ... and {} more\n", dirty_files.len() - preview_count));
+            }
+            msg.push_str("\nCommit or stash your changes before running, or use --allow-dirty to bypass.");
+
+            eyre::bail!("{}", msg);
+        }
+    }
 }
 
 /// Check that tmux is available.
