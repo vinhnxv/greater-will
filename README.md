@@ -1,4 +1,4 @@
-# Greater-Will
+# Greater Will
 
 External arc controller for [Rune](https://github.com/anthropics/claude-code) workflows. Runs `/rune:arc` pipelines in managed tmux sessions with crash recovery, stuck detection, and context injection.
 
