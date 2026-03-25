@@ -23,12 +23,12 @@ pub fn execute() -> Result<()> {
         println!("No active Greater-Will sessions found");
     }
 
-    // 2. Kill any orphaned Claude processes
-    let processes_killed = cleanup::process::kill_orphaned_claude_processes()?;
+    // 2. Kill only Claude processes owned by gw-* tmux sessions
+    let processes_killed = cleanup::process::kill_gw_owned_claude_processes()?;
     if !processes_killed.is_empty() {
-        println!("Killed {} orphaned Claude process(es)", processes_killed.len());
+        println!("Killed {} gw-owned Claude process(es)", processes_killed.len());
         for pid in &processes_killed {
-            tracing::info!(pid = pid, "Killed orphaned process");
+            tracing::info!(pid = pid, "Killed gw-owned process");
         }
     }
 

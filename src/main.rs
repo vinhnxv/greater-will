@@ -9,6 +9,7 @@
 //! - `replay`: Resume from a checkpoint
 //! - `clean`: Clean up temporary files and sessions
 
+mod batch;
 mod checkpoint;
 mod cleanup;
 mod commands;
@@ -16,6 +17,7 @@ mod config;
 mod engine;
 mod log;
 mod monitor;
+mod output;
 mod scanner;
 mod session;
 
@@ -43,7 +45,8 @@ fn main() -> Result<()> {
             mock,
             group,
             config_dir,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir),
+            resume,
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume),
         commands::Commands::Status => commands::status::execute(),
         commands::Commands::Replay { checkpoint } => commands::replay::execute(checkpoint),
         commands::Commands::Clean => commands::clean::execute(),

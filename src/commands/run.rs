@@ -2,6 +2,7 @@
 //!
 //! Executes arc phases for one or more plan files using the PhaseGroupExecutor.
 
+use crate::batch::BatchRunner;
 use crate::cleanup::startup_cleanup;
 use crate::config::phase_config::{resolve_config, PhaseConfig};
 use crate::engine::phase_executor::{ExecutorConfig, PhaseGroupExecutor, PhaseGroupState};
@@ -22,19 +23,21 @@ use std::time::Duration;
 /// * `mock` - Optional mock script for testing
 /// * `group` - Optional phase group filter (A-G)
 /// * `config_dir` - Optional custom configuration directory
+/// * `resume` - If true, resume a previously interrupted batch
 pub fn execute(
     plans: Vec<String>,
     dry_run: bool,
     mock: Option<PathBuf>,
     group: Option<String>,
     config_dir: Option<PathBuf>,
+    resume: bool,
 ) -> Result<()> {
     // Resolve config path
     let cwd = env::current_dir()?;
     let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
 
     // Load phase config
-    let config = PhaseConfig::from_file(&config_path)
+    let mut config = PhaseConfig::from_file(&config_path)
         .wrap_err_with(|| format!("Failed to load config from {}", config_path.display()))?;
 
     // Validate config
@@ -52,6 +55,19 @@ pub fn execute(
         }
     }
 
+    // Filter config groups if --group specified
+    if let Some(ref g) = group {
+        config.groups.retain(|grp| grp.name == *g);
+        if config.groups.is_empty() {
+            eyre::bail!("No groups remaining after filter");
+        }
+    }
+
+    // Resume mode: reload batch state and continue
+    if resume {
+        return run_batch_resume(&config, config_dir.as_deref(), &cwd);
+    }
+
     // Expand glob patterns in plans
     let expanded_plans = expand_plan_globs(&plans)?;
 
@@ -65,8 +81,69 @@ pub fn execute(
         return run_mock(&expanded_plans, &mock_script, &config, group.as_ref());
     }
 
-    // Real execution via PhaseGroupExecutor
-    run_real(&expanded_plans, config, group, config_dir.clone(), &cwd)
+    // Use batch runner for multiple plans, single executor for one
+    if expanded_plans.len() > 1 {
+        run_batch(&expanded_plans, &config, config_dir.as_deref(), &cwd)
+    } else {
+        run_real(&expanded_plans, config, group, config_dir.clone(), &cwd)
+    }
+}
+
+/// Run multiple plans using the batch queue manager.
+fn run_batch(
+    plans: &[String],
+    config: &PhaseConfig,
+    config_dir: Option<&Path>,
+    cwd: &Path,
+) -> Result<()> {
+    preflight_tmux()?;
+
+    let mut exec_config = ExecutorConfig::new(cwd);
+    if let Some(dir) = config_dir {
+        exec_config = exec_config.with_config_dir(dir.to_path_buf());
+    }
+
+    let mut runner = BatchRunner::new(plans.to_vec())
+        .wrap_err("Failed to initialize batch runner")?;
+
+    let summary = runner.run(config, &exec_config)?;
+
+    println!();
+    println!("{}", summary);
+
+    if summary.failed > 0 {
+        eyre::bail!("{} plan(s) failed in batch", summary.failed);
+    }
+
+    Ok(())
+}
+
+/// Resume a previously interrupted batch run.
+fn run_batch_resume(
+    config: &PhaseConfig,
+    config_dir: Option<&Path>,
+    cwd: &Path,
+) -> Result<()> {
+    preflight_tmux()?;
+
+    let mut exec_config = ExecutorConfig::new(cwd);
+    if let Some(dir) = config_dir {
+        exec_config = exec_config.with_config_dir(dir.to_path_buf());
+    }
+
+    let mut runner = BatchRunner::resume()
+        .wrap_err("Failed to resume batch")?;
+
+    let summary = runner.run(config, &exec_config)?;
+
+    println!();
+    println!("{}", summary);
+
+    if summary.failed > 0 {
+        eyre::bail!("{} plan(s) failed in resumed batch", summary.failed);
+    }
+
+    Ok(())
 }
 
 /// Run real execution using the PhaseGroupExecutor.

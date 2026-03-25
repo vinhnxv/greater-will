@@ -101,12 +101,12 @@ fn test_replay_missing_file() {
 }
 
 #[test]
-fn test_status_stub() {
+fn test_status_no_active_batch() {
     gw()
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("not implemented"));
+        .stdout(predicate::str::contains("No active batch found"));
 }
 
 #[test]
@@ -125,4 +125,93 @@ fn test_run_nonexistent_plan_glob() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("No plan files matched"));
+}
+
+// === Batch-related CLI tests ===
+
+#[test]
+fn test_run_multiple_plans_dry_run() {
+    gw()
+        .args([
+            "run",
+            "--dry-run",
+            "tests/fixtures/sample-plan.md",
+            "tests/fixtures/fast-plan.md",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY]"))
+        .stdout(predicate::str::contains("sample-plan.md"))
+        .stdout(predicate::str::contains("fast-plan.md"));
+}
+
+#[test]
+fn test_run_plan_glob_expansion() {
+    gw()
+        .args(["run", "--dry-run", "tests/fixtures/*-plan.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY]"));
+}
+
+#[test]
+fn test_run_dry_run_with_fast_plan() {
+    gw()
+        .args(["run", "--dry-run", "tests/fixtures/fast-plan.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY]"))
+        .stdout(predicate::str::contains("Group A"));
+}
+
+#[test]
+fn test_run_dry_run_with_failing_plan() {
+    gw()
+        .args(["run", "--dry-run", "tests/fixtures/failing-plan.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY]"));
+}
+
+#[test]
+fn test_run_mock_with_nonexecutable_script() {
+    // Create a temp file that is not executable
+    let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+    std::fs::write(tmp.path(), "#!/bin/bash\nexit 0").expect("write temp");
+
+    // Remove execute permission
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(tmp.path(), perms).expect("set perms");
+    }
+
+    gw()
+        .args([
+            "run",
+            "--mock",
+            tmp.path().to_str().unwrap(),
+            "tests/fixtures/sample-plan.md",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not executable"));
+}
+
+#[test]
+fn test_replay_help_shows_checkpoint_arg() {
+    gw()
+        .args(["replay", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checkpoint"));
+}
+
+#[test]
+fn test_clean_runs_successfully() {
+    gw()
+        .arg("clean")
+        .assert()
+        .success();
 }

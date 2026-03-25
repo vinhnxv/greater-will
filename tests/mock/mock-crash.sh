@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Mock script that simulates a crash.
 # Used for testing error handling.
 
