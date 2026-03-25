@@ -43,7 +43,9 @@
 pub mod completion;
 pub mod phase_executor;
 pub mod retry;
+pub mod single_session;
 
 pub use completion::{CompletionDetector, CompletionEvent, CompletionState};
 pub use phase_executor::{PhaseGroupExecutor, PhaseGroupResult, PhaseGroupState, ExecutorConfig, append_result_jsonl};
 pub use retry::{BackoffStrategy, ErrorClass, RetryCoordinator, RetryDecision};
+pub use single_session::{run_single_session, run_single_session_batch, PipelineResult, SingleSessionConfig};

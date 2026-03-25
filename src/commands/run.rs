@@ -21,9 +21,10 @@ use std::time::Duration;
 /// * `plans` - Plan files to execute
 /// * `dry_run` - If true, validate but don't execute
 /// * `mock` - Optional mock script for testing
-/// * `group` - Optional phase group filter (A-G)
+/// * `group` - Optional phase group filter (A-G), only for multi-group mode
 /// * `config_dir` - Optional custom configuration directory
-/// * `resume` - If true, resume a previously interrupted batch
+/// * `resume` - If true, resume a previously interrupted run
+/// * `multi_group` - If true, use legacy multi-group mode (7 sessions)
 pub fn execute(
     plans: Vec<String>,
     dry_run: bool,
@@ -31,19 +32,95 @@ pub fn execute(
     group: Option<String>,
     config_dir: Option<PathBuf>,
     resume: bool,
+    multi_group: bool,
 ) -> Result<()> {
-    // Resolve config path
     let cwd = env::current_dir()?;
-    let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
 
-    // Load phase config
+    // Expand glob patterns in plans
+    let expanded_plans = expand_plan_globs(&plans)?;
+
+    // Resolve config path (needed for dry-run, mock, and multi-group)
+    let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
     let mut config = PhaseConfig::from_file(&config_path)
         .wrap_err_with(|| format!("Failed to load config from {}", config_path.display()))?;
-
-    // Validate config
     config.validate()?;
 
-    // Validate group if specified (derived from loaded config, not hardcoded)
+    // Dry-run mode: print execution plan and exit (works for both modes)
+    if dry_run {
+        return print_dry_run(&expanded_plans, &config, group.as_ref());
+    }
+
+    // Mock mode: always uses multi-group style (spawns per-group tmux sessions)
+    if let Some(mock_script) = mock {
+        return run_mock(&expanded_plans, &mock_script, &config, group.as_ref());
+    }
+
+    // === Route to execution mode ===
+    if multi_group {
+        // Legacy multi-group mode: 7 sessions (A-G)
+        run_multi_group(expanded_plans, config, group, config_dir, resume, &cwd)
+    } else {
+        // Default: single-session mode
+        run_single(expanded_plans, config_dir, resume, &cwd)
+    }
+}
+
+/// Single-session mode (default): one tmux session per plan, Rune drives phases.
+fn run_single(
+    plans: Vec<String>,
+    config_dir: Option<PathBuf>,
+    resume: bool,
+    cwd: &Path,
+) -> Result<()> {
+    use crate::engine::single_session::{run_single_session, run_single_session_batch, SingleSessionConfig};
+
+    preflight_tmux()?;
+
+    let mut ss_config = SingleSessionConfig::new(cwd);
+    if let Some(dir) = config_dir {
+        ss_config = ss_config.with_config_dir(dir);
+    }
+    if resume {
+        ss_config = ss_config.with_resume();
+    }
+
+    if plans.len() == 1 {
+        let plan_path = Path::new(&plans[0]);
+        let result = run_single_session(plan_path, &ss_config)?;
+
+        println!();
+        if result.success {
+            println!("=== Pipeline completed ({:.1}s, {} restarts) ===", result.duration.as_secs_f64(), result.crash_restarts);
+        } else {
+            println!("=== Pipeline failed: {} ===", result.message);
+            eyre::bail!("{}", result.message);
+        }
+    } else {
+        let results = run_single_session_batch(&plans, &ss_config)?;
+
+        println!();
+        let passed = results.iter().filter(|r| r.success).count();
+        let failed = results.len() - passed;
+        println!("=== Batch: {}/{} passed ===", passed, results.len());
+
+        if failed > 0 {
+            eyre::bail!("{} plan(s) failed", failed);
+        }
+    }
+
+    Ok(())
+}
+
+/// Legacy multi-group mode: 7 sessions (A-G), one per phase group.
+fn run_multi_group(
+    plans: Vec<String>,
+    mut config: PhaseConfig,
+    group: Option<String>,
+    config_dir: Option<PathBuf>,
+    resume: bool,
+    cwd: &Path,
+) -> Result<()> {
+    // Validate group if specified
     if let Some(ref g) = group {
         let valid_groups: Vec<&str> = config.groups.iter().map(|grp| grp.name.as_str()).collect();
         if !valid_groups.contains(&g.as_str()) {
@@ -65,27 +142,14 @@ pub fn execute(
 
     // Resume mode: reload batch state and continue
     if resume {
-        return run_batch_resume(&config, config_dir.as_deref(), &cwd);
-    }
-
-    // Expand glob patterns in plans
-    let expanded_plans = expand_plan_globs(&plans)?;
-
-    // Dry-run mode: print execution plan and exit
-    if dry_run {
-        return print_dry_run(&expanded_plans, &config, group.as_ref());
-    }
-
-    // Mock mode: run mock script in tmux sessions
-    if let Some(mock_script) = mock {
-        return run_mock(&expanded_plans, &mock_script, &config, group.as_ref());
+        return run_batch_resume(&config, config_dir.as_deref(), cwd);
     }
 
     // Use batch runner for multiple plans, single executor for one
-    if expanded_plans.len() > 1 {
-        run_batch(&expanded_plans, &config, config_dir.as_deref(), &cwd)
+    if plans.len() > 1 {
+        run_batch(&plans, &config, config_dir.as_deref(), cwd)
     } else {
-        run_real(&expanded_plans, config, group, config_dir.clone(), &cwd)
+        run_real(&plans, config, group, config_dir.clone(), cwd)
     }
 }
 

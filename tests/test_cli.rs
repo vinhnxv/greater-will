@@ -76,7 +76,7 @@ fn test_run_dry_run_with_group_filter() {
 #[test]
 fn test_run_invalid_group_error() {
     gw()
-        .args(["run", "--dry-run", "--group", "Z", "tests/fixtures/sample-plan.md"])
+        .args(["run", "--multi-group", "--group", "Z", "tests/fixtures/sample-plan.md"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("Unknown group 'Z'"));
