@@ -251,6 +251,59 @@ pub fn validate_all_artifacts<P: AsRef<Path>>(
     Ok(failures)
 }
 
+/// Check if two plan file references match.
+/// Uses Path::ends_with() for component-aware matching (avoids false positives).
+fn plan_matches(checkpoint_plan: &str, target_plan: &str) -> bool {
+    let cp = Path::new(checkpoint_plan.trim_start_matches("./"));
+    let target = Path::new(target_plan.trim_start_matches("./"));
+    cp == target || cp.ends_with(target) || target.ends_with(cp)
+}
+
+/// Find the most recent checkpoint for a given plan file.
+/// Scans `.rune/arc/arc-*/checkpoint.json` and matches by plan_file metadata.
+pub fn find_checkpoint_for_plan(plan_path: &Path, cwd: &Path) -> Result<Option<std::path::PathBuf>> {
+    let arc_base = cwd.join(".rune").join("arc");
+    if !arc_base.exists() {
+        return Ok(None);
+    }
+
+    let plan_str = plan_path.to_string_lossy();
+    let mut best: Option<(std::path::PathBuf, String)> = None;
+
+    let entries = std::fs::read_dir(&arc_base)
+        .wrap_err_with(|| format!("Failed to read arc directory: {}", arc_base.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let dir_name = entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
+        if !dir_name_str.starts_with("arc-") || !entry.path().is_dir() {
+            continue;
+        }
+        let cp_path = entry.path().join("checkpoint.json");
+        if !cp_path.exists() {
+            continue;
+        }
+        // IMPORTANT: Use .ok().flatten() — NOT ? — to skip corrupted checkpoints gracefully
+        match try_read_checkpoint(&cp_path).ok().flatten() {
+            Some(cp) if plan_matches(&cp.plan_file, &plan_str) => {
+                let started = cp.started_at.clone();
+                if started.is_empty() { continue; }  // Skip checkpoints without started_at
+                match &best {
+                    None => best = Some((cp_path, started)),
+                    Some((_, prev_started)) if started > *prev_started => {
+                        best = Some((cp_path, started));
+                    }
+                    _ => {}
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    Ok(best.map(|(path, _)| path))
+}
+
 /// Result of pre-resume validation.
 #[derive(Debug)]
 pub struct ResumeValidation {
@@ -590,5 +643,36 @@ mod tests {
         let result = validate_before_resume(&cp, dir.path()).unwrap();
         assert!(result.can_resume());
         assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_plan_matches_exact() {
+        assert!(plan_matches("plans/test.md", "plans/test.md"));
+    }
+
+    #[test]
+    fn test_plan_matches_dot_prefix() {
+        assert!(plan_matches("./plans/test.md", "plans/test.md"));
+        assert!(plan_matches("plans/test.md", "./plans/test.md"));
+    }
+
+    #[test]
+    fn test_plan_matches_suffix() {
+        // Path::ends_with is component-aware
+        assert!(plan_matches("/abs/path/plans/test.md", "plans/test.md"));
+    }
+
+    #[test]
+    fn test_plan_matches_no_false_positive() {
+        assert!(!plan_matches("plans/other.md", "plans/test.md"));
+    }
+
+    #[test]
+    fn test_find_checkpoint_no_arc_dir() {
+        let dir = TempDir::new().unwrap();
+        let result = find_checkpoint_for_plan(
+            Path::new("plans/test.md"), dir.path()
+        ).unwrap();
+        assert!(result.is_none());
     }
 }
