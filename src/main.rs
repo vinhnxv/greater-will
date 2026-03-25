@@ -48,6 +48,7 @@ fn main() -> Result<()> {
             resume,
             multi_group,
         } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group),
+        commands::Commands::Elden => commands::elden::execute(),
         commands::Commands::Status => commands::status::execute(),
         commands::Commands::Replay { checkpoint } => commands::replay::execute(checkpoint),
         commands::Commands::Clean => commands::clean::execute(),

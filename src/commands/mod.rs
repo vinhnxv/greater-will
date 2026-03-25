@@ -4,6 +4,7 @@
 //! The `Commands` enum is re-exported from `config::cli_args`.
 
 pub mod clean;
+pub mod elden;
 pub mod replay;
 pub mod run;
 pub mod status;

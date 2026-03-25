@@ -102,6 +102,21 @@ pub enum Commands {
         checkpoint: PathBuf,
     },
 
+    /// Inject workspace context into Claude Code session (hook command).
+    ///
+    /// Designed to be called by Claude Code's `SessionStart` hook.
+    /// Reads hook JSON from stdin, detects workspace state (batch, checkpoint),
+    /// and prints context to stdout which Claude Code injects into the model's
+    /// context window.
+    ///
+    /// Register in `.claude/settings.json`:
+    /// ```json
+    /// { "hooks": { "SessionStart": [{ "matcher": "", "hooks": [
+    ///   { "type": "command", "command": "gw elden" }
+    /// ]}]}}
+    /// ```
+    Elden,
+
     /// Clean up temporary files and tmux sessions.
     ///
     /// Removes:
