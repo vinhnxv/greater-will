@@ -17,6 +17,10 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Embedded default config — compiled into the binary so `gw` works
+/// from any directory without needing `config/default-phases.toml` on disk.
+const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../../config/default-phases.toml");
+
 /// Top-level phase configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PhaseConfig {
@@ -131,6 +135,20 @@ impl PhaseConfig {
         Ok(config)
     }
 
+    /// Load the embedded default config (compiled into the binary).
+    ///
+    /// Used as fallback when no config file is found on disk. This allows
+    /// `gw` to work from any directory without requiring a local config file.
+    pub fn from_embedded() -> color_eyre::Result<Self> {
+        let config: Self = toml::from_str(EMBEDDED_DEFAULT_CONFIG)?;
+        tracing::info!(
+            groups = config.groups.len(),
+            phases = config.total_phases(),
+            "Config loaded from embedded defaults"
+        );
+        Ok(config)
+    }
+
     /// Validate the configuration.
     ///
     /// Checks:
@@ -229,8 +247,12 @@ impl PhaseConfig {
 ///
 /// # Errors
 ///
-/// Returns an error if no config file is found at any fallback location.
-pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> color_eyre::Result<PathBuf> {
+/// Returns `None` if no config file is found (caller should use embedded defaults).
+///
+/// # Errors
+///
+/// Returns an error only if an explicit CLI path was given but doesn't exist.
+pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> color_eyre::Result<Option<PathBuf>> {
     // 1. Explicit CLI path takes precedence
     if let Some(p) = cli_path {
         if !p.exists() {
@@ -239,25 +261,23 @@ pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> color_eyre::Result
                 p.display()
             );
         }
-        return Ok(p.to_path_buf());
+        return Ok(Some(p.to_path_buf()));
     }
 
     // 2. Check for project-local override
     let local = cwd.join("greater-will.toml");
     if local.exists() {
-        return Ok(local);
+        return Ok(Some(local));
     }
 
     // 3. Fall back to default shipped config
     let default = cwd.join("config").join("default-phases.toml");
     if default.exists() {
-        return Ok(default);
+        return Ok(Some(default));
     }
 
-    color_eyre::eyre::bail!(
-        "No config file found. Searched:\n  1. ./greater-will.toml\n  2. ./config/default-phases.toml\n\
-         Specify one with --config-dir or create config/default-phases.toml"
-    )
+    // No config file on disk — caller should use embedded defaults
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -368,16 +388,14 @@ timeout_min = 30
 
         let cwd = Path::new("/tmp/test");
         let resolved = resolve_config(Some(config_path.as_path()), cwd).unwrap();
-        assert_eq!(resolved, config_path);
+        assert_eq!(resolved, Some(config_path));
     }
 
     #[test]
-    fn test_resolve_config_errors_when_no_config_found() {
+    fn test_resolve_config_returns_none_when_no_config_found() {
         let cwd = Path::new("/tmp/nonexistent-dir-for-gw-test");
-        let result = resolve_config(None, cwd);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("No config file found"));
+        let result = resolve_config(None, cwd).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

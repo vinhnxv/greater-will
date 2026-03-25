@@ -39,10 +39,13 @@ pub fn execute(
     // Expand glob patterns in plans
     let expanded_plans = expand_plan_globs(&plans)?;
 
-    // Resolve config path (needed for dry-run, mock, and multi-group)
-    let config_path = resolve_config(config_dir.as_deref(), &cwd)?;
-    let config = PhaseConfig::from_file(&config_path)
-        .wrap_err_with(|| format!("Failed to load config from {}", config_path.display()))?;
+    // Resolve config: file on disk → embedded defaults
+    let config = match resolve_config(config_dir.as_deref(), &cwd)? {
+        Some(path) => PhaseConfig::from_file(&path)
+            .wrap_err_with(|| format!("Failed to load config from {}", path.display()))?,
+        None => PhaseConfig::from_embedded()
+            .wrap_err("Failed to load embedded default config")?,
+    };
     config.validate()?;
 
     // Dry-run mode: print execution plan and exit (works for both modes)
