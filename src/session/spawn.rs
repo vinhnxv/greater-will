@@ -262,8 +262,10 @@ fn start_claude(
         "Starting Claude Code"
     );
 
-    // Send command with Ink workaround
-    send_keys_with_workaround(session_id, &cmd)?;
+    // Send command directly — this is a shell command, not Claude Code Ink UI.
+    // The Ink workaround (Escape before Enter) is only needed INSIDE Claude Code.
+    // For starting Claude itself, plain send-keys + Enter works.
+    send_simple_command(session_id, &cmd)?;
 
     // Wait for initialization
     info!("Waiting {}s for Claude Code initialization...", CLAUDE_INIT_SECS);
