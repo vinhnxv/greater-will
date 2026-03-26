@@ -19,6 +19,8 @@
 //! | Crash recovery  | gw restarts + `--resume` | gw retries the group          |
 //! | Complexity      | Low                      | High                          |
 
+use crate::checkpoint::reader::find_checkpoint_for_plan;
+use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
 use crate::engine::retry::ErrorClass;
 use crate::session::detect::capture_pane;
@@ -30,7 +32,7 @@ use color_eyre::eyre::{self};
 use color_eyre::Result;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum number of crash-recovery restarts before giving up.
 const MAX_CRASH_RETRIES: u32 = 3;
@@ -193,6 +195,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             &command,
             config,
             start,
+            plan_path,
         )?;
 
         match attempt_result {
@@ -342,6 +345,7 @@ fn run_session_attempt(
     command: &str,
     config: &SingleSessionConfig,
     pipeline_start: Instant,
+    plan_path: &Path,
 ) -> Result<SessionOutcome> {
     // Kill any existing session with the same name
     if has_session(session_name) {
@@ -352,6 +356,9 @@ fn run_session_attempt(
 
     // Pre-phase cleanup (only gw-owned processes)
     cleanup::pre_phase_cleanup("single", "0")?;
+
+    // Clear signal files from previous session
+    crate::commands::elden::clear_signals();
 
     // Spawn session
     info!(session = %session_name, "Spawning Claude Code session");
@@ -393,10 +400,15 @@ fn run_session_attempt(
     let mut nudged = false;
     let mut last_status_log = Instant::now();
     let mut poll_count: u64 = 0;
+    let mut last_checkpoint_poll = Instant::now();
 
     /// Minimum session duration to consider a "real" run (not an instant crash).
     /// If the session dies within this window after dispatch, it's a crash.
     const MIN_SESSION_DURATION_SECS: u64 = 30;
+
+    /// How often to check the checkpoint file (seconds).
+    /// Less frequent than pane polling since file I/O is heavier.
+    const CHECKPOINT_POLL_INTERVAL_SECS: u64 = 10;
 
     info!("Entering monitor loop (poll={}s, nudge={}s, kill={}s)",
         POLL_INTERVAL_SECS, IDLE_NUDGE_SECS, IDLE_KILL_SECS);
@@ -405,6 +417,58 @@ fn run_session_attempt(
     loop {
         std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
         poll_count += 1;
+
+        // SIGNAL CHECK: Stop/SessionEnd signal from gw elden hook.
+        // This is the most reliable completion signal — written by Claude Code's
+        // own hook system, not inferred from text or process state.
+        if let Some(signal) = crate::commands::elden::read_stop_signal()
+            .or_else(crate::commands::elden::read_session_end_signal)
+        {
+            let is_complete = signal.get("is_complete").and_then(|v| v.as_bool()).unwrap_or(false);
+            let event = signal.get("event").and_then(|v| v.as_str()).unwrap_or("unknown");
+            info!(event = event, is_complete = is_complete, "Stop signal detected from hook");
+
+            if is_complete {
+                let elapsed = dispatch_time.elapsed();
+                println!(
+                    "[gw] Session ended cleanly (signal: {}, {}m{}s elapsed)",
+                    event,
+                    elapsed.as_secs() / 60,
+                    elapsed.as_secs() % 60,
+                );
+                // Give a moment for final writes
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = kill_session(session_name);
+                return Ok(SessionOutcome::Completed);
+            }
+            // Signal says not complete — let other checks determine what happened
+            // (could be a stop mid-pipeline, will be caught by session-alive check)
+        }
+
+        // SIGNAL CHECK: StopFailure — API error reported by Claude Code itself.
+        // This is far more reliable than pane text matching because Claude Code
+        // explicitly tells us the turn failed via the StopFailure hook.
+        if let Some(_signal) = crate::commands::elden::read_stop_failure_signal() {
+            info!("StopFailure signal detected — API error reported by Claude Code");
+            println!("[gw] API error detected via StopFailure hook — killing session");
+            // Clear the signal so we don't re-detect on restart
+            crate::commands::elden::clear_signals();
+            kill_session(session_name)?;
+            // Classify as ApiOverload — the most common StopFailure cause.
+            // The outer loop will apply exponential backoff (15→30→60→120 min).
+            return Ok(SessionOutcome::ErrorDetected {
+                error_class: ErrorClass::ApiOverload,
+                reason: "API error reported via StopFailure hook".to_string(),
+            });
+        }
+
+        // SIGNAL CHECK: Permission pending — reset idle timer.
+        // When Claude is waiting for user permission, pane output stops changing.
+        // Without this check, the idle detector would kill the session.
+        if crate::commands::elden::is_permission_pending() {
+            debug!("Permission request pending — resetting idle timer");
+            last_activity = Instant::now();
+        }
 
         // Check total pipeline timeout
         if pipeline_start.elapsed() > config.pipeline_timeout {
@@ -432,9 +496,24 @@ fn run_session_attempt(
                 });
             }
 
-            // Session ran for a meaningful time — check if it completed normally
+            // Session ran for a meaningful time — verify via checkpoint
             if !crate::cleanup::process::is_pid_alive(pid) {
-                info!("Session ended, process dead — treating as completion");
+                if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+                    if checkpoint.is_complete() {
+                        info!("Session ended, checkpoint confirms completion");
+                        return Ok(SessionOutcome::Completed);
+                    }
+                    let current = checkpoint.current_phase().unwrap_or("unknown");
+                    warn!(current_phase = current, "Session ended with incomplete checkpoint");
+                    return Ok(SessionOutcome::Crashed {
+                        reason: format!(
+                            "Session ended during phase '{}' after {}s",
+                            current, session_age.as_secs(),
+                        ),
+                    });
+                }
+                // No checkpoint — fall back to old heuristic
+                info!("Session ended, process dead, no checkpoint — assuming completion");
                 return Ok(SessionOutcome::Completed);
             }
 
@@ -461,7 +540,30 @@ fn run_session_attempt(
             nudged = false; // Reset nudge on new activity
         }
 
-        // Check for completion signals in pane output
+        // PRIMARY: Check checkpoint.json for arc completion.
+        // This is the most reliable signal — Rune writes structured state here.
+        // Only poll every CHECKPOINT_POLL_INTERVAL_SECS to avoid excessive file I/O.
+        if last_checkpoint_poll.elapsed() >= Duration::from_secs(CHECKPOINT_POLL_INTERVAL_SECS) {
+            last_checkpoint_poll = Instant::now();
+            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+                if checkpoint.is_complete() {
+                    let elapsed = dispatch_time.elapsed();
+                    info!("Pipeline completion detected via checkpoint.json");
+                    println!(
+                        "[gw] Pipeline complete (checkpoint confirmed)! ({}m{}s elapsed)",
+                        elapsed.as_secs() / 60,
+                        elapsed.as_secs() % 60,
+                    );
+                    // Give it a moment to finish writing artifacts
+                    std::thread::sleep(Duration::from_secs(5));
+                    kill_session(session_name)?;
+                    return Ok(SessionOutcome::Completed);
+                }
+            }
+        }
+
+        // SECONDARY: Check for completion signals in pane output (text matching).
+        // Fallback for when checkpoint hasn't been written yet or is stale.
         if is_pipeline_complete(&pane_content) {
             let elapsed = dispatch_time.elapsed();
             info!("Pipeline completion detected in pane output");
@@ -505,7 +607,28 @@ fn run_session_attempt(
                     reason: format!("Claude process died after only {}s", session_age.as_secs()),
                 });
             }
-            // Process ran for a while then died — likely completed
+
+            // Process ran for a while then died — verify via checkpoint before
+            // assuming success. If checkpoint says incomplete, it's a crash.
+            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+                if checkpoint.is_complete() {
+                    info!("Process died but checkpoint confirms completion");
+                    return Ok(SessionOutcome::Completed);
+                }
+                // Checkpoint exists but not complete — this is a crash mid-pipeline
+                let current = checkpoint.current_phase().unwrap_or("unknown");
+                warn!(current_phase = current, "Process died with incomplete checkpoint");
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "Claude process died during phase '{}' after {}s",
+                        current, session_age.as_secs(),
+                    ),
+                });
+            }
+
+            // No checkpoint found — fall back to assuming completion
+            // (old behavior, for cases where checkpoint wasn't created yet)
+            info!("Process died, no checkpoint found — assuming completion");
             return Ok(SessionOutcome::Completed);
         }
 
@@ -578,6 +701,30 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         // Rune-specific completion markers
         || tail.contains("the tarnished rests")
         || tail.contains("arc result: success")
+}
+
+/// Try to read the checkpoint for a given plan.
+///
+/// Returns `None` if no checkpoint exists yet or if it can't be read.
+/// This is a non-fatal operation — the monitor loop should continue
+/// even if the checkpoint is temporarily unreadable.
+fn try_read_plan_checkpoint(plan_path: &Path, working_dir: &Path) -> Option<Checkpoint> {
+    match find_checkpoint_for_plan(plan_path, working_dir) {
+        Ok(Some(cp_path)) => {
+            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+                Ok(cp) => Some(cp),
+                Err(e) => {
+                    debug!(error = %e, "Could not read checkpoint (transient)");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            debug!(error = %e, "Could not find checkpoint for plan");
+            None
+        }
+    }
 }
 
 /// Build the `/rune:arc` command string for initial run.

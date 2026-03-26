@@ -51,13 +51,15 @@ fn main() -> Result<()> {
             multi_group,
             allow_dirty,
         } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty),
-        commands::Commands::Elden { install, uninstall, status } => {
+        commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
                 commands::elden::install()
             } else if uninstall {
                 commands::elden::uninstall()
             } else if status {
                 commands::elden::hook_status()
+            } else if let Some(event_name) = event {
+                commands::elden::execute_event(&event_name)
             } else {
                 commands::elden::execute()
             }

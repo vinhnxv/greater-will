@@ -35,6 +35,7 @@
 //!
 //! `source` is one of: `startup`, `resume`, `compact`
 
+use chrono::Utc;
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use serde::Deserialize;
@@ -93,6 +94,216 @@ pub fn execute() -> Result<()> {
     Ok(())
 }
 
+// ─── Event-Specific Handlers ─────────────────────────────────────────
+
+/// Directory for gw signal files.
+/// Monitor loop watches these for reliable event detection.
+const SIGNAL_DIR: &str = ".gw/signals";
+
+/// Execute a specific hook event handler.
+///
+/// Called via `gw elden --event <name>`.
+pub fn execute_event(event: &str) -> Result<()> {
+    // Ensure signal directory exists
+    std::fs::create_dir_all(SIGNAL_DIR)
+        .wrap_err_with(|| format!("Failed to create {}", SIGNAL_DIR))?;
+
+    match event {
+        "stop" => handle_stop_event(),
+        "stop-failure" => handle_stop_failure_event(),
+        "session-end" => handle_session_end_event(),
+        "permission" => handle_permission_event(),
+        _ => {
+            eprintln!("[gw elden] Unknown event: {}", event);
+            Ok(())
+        }
+    }
+}
+
+/// Handle the `Stop` hook — Claude Code is stopping (normal or error).
+///
+/// Writes a signal file that the monitor loop can detect instantly,
+/// instead of waiting for process death or text pattern matching.
+fn handle_stop_event() -> Result<()> {
+    let hook_input = read_hook_input();
+    let session_id = hook_input
+        .as_ref()
+        .and_then(|h| h.session_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Read checkpoint to include final state
+    let checkpoint_info = detect_arc_checkpoint();
+
+    let signal = json!({
+        "event": "stop",
+        "session_id": session_id,
+        "timestamp": Utc::now().to_rfc3339(),
+        "checkpoint": checkpoint_info.as_ref().map(|ci| json!({
+            "plan_file": ci.plan_file,
+            "current_phase": ci.current_phase,
+            "completed": ci.completed,
+            "total": ci.total,
+        })),
+    });
+
+    let signal_path = PathBuf::from(SIGNAL_DIR).join("session-stop.json");
+    std::fs::write(&signal_path, serde_json::to_string_pretty(&signal)?)
+        .wrap_err("Failed to write stop signal")?;
+
+    Ok(())
+}
+
+/// Handle the `StopFailure` hook — turn ended due to an API error.
+///
+/// This is the most direct way to detect API errors (rate limit, auth,
+/// overload). Much more reliable than pane text matching because Claude Code
+/// itself tells us the turn failed. The monitor loop can immediately apply
+/// the correct retry strategy without guessing from output text.
+///
+/// Note: Claude Code ignores stdout and exit code for this hook.
+fn handle_stop_failure_event() -> Result<()> {
+    let hook_input = read_hook_input();
+    let session_id = hook_input
+        .as_ref()
+        .and_then(|h| h.session_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let checkpoint_info = detect_arc_checkpoint();
+
+    let signal = json!({
+        "event": "stop_failure",
+        "session_id": session_id,
+        "timestamp": Utc::now().to_rfc3339(),
+        "checkpoint": checkpoint_info.as_ref().map(|ci| json!({
+            "plan_file": ci.plan_file,
+            "current_phase": ci.current_phase,
+            "completed": ci.completed,
+            "total": ci.total,
+        })),
+    });
+
+    let signal_path = PathBuf::from(SIGNAL_DIR).join("stop-failure.json");
+    std::fs::write(&signal_path, serde_json::to_string_pretty(&signal)?)
+        .wrap_err("Failed to write stop-failure signal")?;
+
+    Ok(())
+}
+
+/// Handle the `SessionEnd` hook — session is closing.
+///
+/// Similar to Stop but fires specifically on session teardown.
+/// Writes a distinct signal file so monitor can differentiate
+/// clean exit from crash.
+fn handle_session_end_event() -> Result<()> {
+    let hook_input = read_hook_input();
+    let session_id = hook_input
+        .as_ref()
+        .and_then(|h| h.session_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let checkpoint_info = detect_arc_checkpoint();
+    let is_complete = checkpoint_info
+        .as_ref()
+        .map(|ci| ci.completed >= ci.total && ci.total > 0)
+        .unwrap_or(false);
+
+    let signal = json!({
+        "event": "session_end",
+        "session_id": session_id,
+        "timestamp": Utc::now().to_rfc3339(),
+        "is_complete": is_complete,
+        "checkpoint": checkpoint_info.as_ref().map(|ci| json!({
+            "plan_file": ci.plan_file,
+            "current_phase": ci.current_phase,
+            "completed": ci.completed,
+            "total": ci.total,
+        })),
+    });
+
+    let signal_path = PathBuf::from(SIGNAL_DIR).join("session-end.json");
+    std::fs::write(&signal_path, serde_json::to_string_pretty(&signal)?)
+        .wrap_err("Failed to write session-end signal")?;
+
+    Ok(())
+}
+
+/// Handle the `PermissionRequest` hook — Claude is waiting for user permission.
+///
+/// Writes a heartbeat file that the monitor loop checks to avoid
+/// misclassifying permission waits as "stuck" sessions.
+/// The monitor should reset its idle timer when this file is fresh.
+fn handle_permission_event() -> Result<()> {
+    let signal = json!({
+        "event": "permission_request",
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+
+    let signal_path = PathBuf::from(SIGNAL_DIR).join("permission-pending.json");
+    std::fs::write(&signal_path, serde_json::to_string_pretty(&signal)?)
+        .wrap_err("Failed to write permission signal")?;
+
+    Ok(())
+}
+
+// ─── Signal File Reader (for monitor loop) ──────────────────────────
+
+/// Check if a stop signal file exists and is recent (within threshold).
+///
+/// Used by the monitor loop to detect clean session exit.
+pub fn read_stop_signal() -> Option<Value> {
+    read_signal_file("session-stop.json")
+}
+
+/// Check if a session-end signal file exists.
+pub fn read_session_end_signal() -> Option<Value> {
+    read_signal_file("session-end.json")
+}
+
+/// Check if an API error signal exists (from StopFailure hook).
+///
+/// This is the most reliable way to detect API errors — Claude Code itself
+/// reports the failure via hook, no text matching needed.
+pub fn read_stop_failure_signal() -> Option<Value> {
+    read_signal_file("stop-failure.json")
+}
+
+/// Check if a permission-pending signal exists and is recent.
+///
+/// Returns true if Claude is waiting for permission (within last 60s).
+/// Monitor should NOT count this as idle time.
+pub fn is_permission_pending() -> bool {
+    let signal_path = PathBuf::from(SIGNAL_DIR).join("permission-pending.json");
+    match std::fs::metadata(&signal_path) {
+        Ok(meta) => {
+            // Check if file was written in the last 60 seconds
+            meta.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age.as_secs() < 60)
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Clean up signal files (called before starting a new session).
+pub fn clear_signals() {
+    let signal_dir = PathBuf::from(SIGNAL_DIR);
+    if signal_dir.exists() {
+        let _ = std::fs::remove_file(signal_dir.join("session-stop.json"));
+        let _ = std::fs::remove_file(signal_dir.join("stop-failure.json"));
+        let _ = std::fs::remove_file(signal_dir.join("session-end.json"));
+        let _ = std::fs::remove_file(signal_dir.join("permission-pending.json"));
+    }
+}
+
+/// Read and parse a signal file.
+fn read_signal_file(filename: &str) -> Option<Value> {
+    let signal_path = PathBuf::from(SIGNAL_DIR).join(filename);
+    let content = std::fs::read_to_string(&signal_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 // ─── Hook Installation ───────────────────────────────────────────────
 
 /// Path to Claude Code settings file (project-local).
@@ -127,20 +338,35 @@ pub fn install() -> Result<()> {
         json!({})
     };
 
-    // Check if already installed
-    if has_gw_hook(&settings, "SessionStart") {
-        println!("gw elden hooks already installed in {}", SETTINGS_PATH);
+    // All hooks gw needs, with their commands
+    let required_hooks: &[(&str, &str)] = &[
+        ("SessionStart", HOOK_COMMAND),
+        ("PreCompact", HOOK_COMMAND),
+        ("Stop", "gw elden --event stop"),
+        ("StopFailure", "gw elden --event stop-failure"),
+        ("SessionEnd", "gw elden --event session-end"),
+        ("PermissionRequest", "gw elden --event permission"),
+    ];
+
+    // Pre-compute which hooks are missing (before taking mutable borrow)
+    let missing: Vec<(String, String)> = required_hooks
+        .iter()
+        .filter(|(event, _)| !has_gw_hook(&settings, event))
+        .map(|(e, c)| (e.to_string(), c.to_string()))
+        .collect();
+
+    if missing.is_empty() {
+        println!("All gw elden hooks already installed in {}", SETTINGS_PATH);
         println!();
         print_hook_summary(&settings);
         return Ok(());
     }
 
-    // Ensure settings is an object
+    // Now take mutable borrow for installation
     let obj = settings
         .as_object_mut()
         .ok_or_else(|| eyre::eyre!("settings.json root is not an object"))?;
 
-    // Get or create "hooks" object
     if !obj.contains_key("hooks") {
         obj.insert("hooks".to_string(), json!({}));
     }
@@ -150,11 +376,9 @@ pub fn install() -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| eyre::eyre!("\"hooks\" is not an object"))?;
 
-    // Install SessionStart hook
-    install_hook(hooks, "SessionStart", HOOK_COMMAND);
-
-    // Install PreCompact hook (brief context for compaction survival)
-    install_hook(hooks, "PreCompact", HOOK_COMMAND);
+    for (event, command) in &missing {
+        install_hook(hooks, event, command);
+    }
 
     // Write back
     let output = serde_json::to_string_pretty(&settings)
@@ -186,7 +410,7 @@ pub fn uninstall() -> Result<()> {
     let mut removed = false;
 
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in &["SessionStart", "PreCompact"] {
+        for event in &["SessionStart", "PreCompact", "Stop", "StopFailure", "SessionEnd", "PermissionRequest"] {
             if remove_gw_hooks(hooks, event) {
                 removed = true;
             }
@@ -313,7 +537,7 @@ fn remove_gw_hooks(hooks: &mut serde_json::Map<String, Value>, event: &str) -> b
 fn print_hook_summary(settings: &Value) {
     println!("Hook Status:");
 
-    for event in &["SessionStart", "PreCompact", "UserPromptSubmit"] {
+    for event in &["SessionStart", "PreCompact", "Stop", "StopFailure", "SessionEnd", "PermissionRequest"] {
         let installed = has_gw_hook(settings, event);
         let icon = if installed { "OK" } else { "--" };
         println!("  [{}] {}", icon, event);

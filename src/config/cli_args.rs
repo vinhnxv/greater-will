@@ -141,6 +141,16 @@ pub enum Commands {
         /// Show current hook registration status.
         #[arg(long)]
         status: bool,
+
+        /// Hook event type override. When set, routes to the specific event
+        /// handler instead of auto-detecting from stdin JSON.
+        ///
+        /// Used when registering separate hooks per event:
+        ///   Stop → `gw elden --event stop`
+        ///   SessionEnd → `gw elden --event session-end`
+        ///   PermissionRequest → `gw elden --event permission`
+        #[arg(long)]
+        event: Option<String>,
     },
 
     /// Clean up temporary files and tmux sessions.
