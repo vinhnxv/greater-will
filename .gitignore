@@ -27,3 +27,4 @@ plans/
 tmp/
 .rune/arc-phase-loop.local.md
 .rune/talisman.yml
+.rune/talisman.integrations.yml
