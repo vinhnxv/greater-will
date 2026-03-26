@@ -106,7 +106,8 @@ fn run_single(
                     Some(next_phase) => {
                         println!("Found checkpoint: {}", cp_path.display());
                         println!("Arc: {} | Next phase: {}", cp.id, next_phase);
-                        let arc_dir = cp_path.parent().unwrap();
+                        let arc_dir = cp_path.parent()
+                            .ok_or_else(|| eyre::eyre!("Cannot determine parent of checkpoint path: {}", cp_path.display()))?;
                         let validation = validate_before_resume(&cp, arc_dir)?;
                         for w in &validation.warnings {
                             println!("  WARN: {}", w);

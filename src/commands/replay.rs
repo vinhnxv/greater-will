@@ -3,7 +3,7 @@
 //! Displays checkpoint status and allows resuming from a checkpoint.
 
 use crate::checkpoint::schema::Checkpoint;
-use color_eyre::eyre::{self, Context};
+use color_eyre::eyre::{self};
 use color_eyre::Result;
 use std::path::PathBuf;
 
@@ -19,11 +19,7 @@ pub fn execute(checkpoint: PathBuf, resume: bool, force: bool) -> Result<()> {
     }
 
     // Load checkpoint
-    let contents = std::fs::read_to_string(&checkpoint)
-        .wrap_err_with(|| format!("Failed to read checkpoint: {}", checkpoint.display()))?;
-
-    let cp: Checkpoint = serde_json::from_str(&contents)
-        .wrap_err_with(|| "Failed to parse checkpoint JSON. Invalid schema?")?;
+    let cp = crate::checkpoint::reader::read_checkpoint(&checkpoint)?;
 
     // Check schema compatibility and warn if needed
     let compat = cp.schema_compat();

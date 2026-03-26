@@ -515,12 +515,23 @@ impl PhaseGroupExecutor {
 
         let mut nudge_sent = false;
         let mut tick_count: u64 = 0;
+        let mut last_pane_hash: u64 = 0;
         let monitor_start = Instant::now();
 
         loop {
             tick_count += 1;
             // Get pane content
             let pane_content = capture_pane(session_id)?;
+
+            // Track pane hash to reset nudge when new content appears
+            let pane_hash = crate::session::detect::compute_content_hash(&pane_content);
+            if pane_hash != last_pane_hash {
+                last_pane_hash = pane_hash;
+                if nudge_sent {
+                    info!(group = %group.name, "New pane content detected after nudge, resetting nudge state");
+                    nudge_sent = false;
+                }
+            }
 
             // Check completion
             match detector.tick(&pane_content)? {
@@ -581,10 +592,10 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::Nudge => {
                     if !nudge_sent {
-                        info!(group = %group.name, "Sending nudge");
-                        let _nudge_mgr = crate::monitor::nudge::NudgeManager::with_defaults(session_id);
-                        // Note: We'd need mutable access to send the nudge
-                        // For now, just log it
+                        info!(group = %group.name, "Sending nudge: 'please continue'");
+                        if let Err(e) = send_keys_with_workaround(session_id, "please continue") {
+                            warn!(error = %e, "Failed to send nudge (non-fatal)");
+                        }
                         nudge_sent = true;
                         detector.mark_nudged();
                     }
@@ -598,6 +609,27 @@ impl PhaseGroupExecutor {
                             break;
                         }
                     }
+                    // Prompt returned but group not complete — session exited prematurely
+                    warn!(
+                        group = %group.name,
+                        "Prompt returned but group phases not complete — treating as failure"
+                    );
+                    kill_session(session_id)?;
+                    return Ok(PhaseGroupResult {
+                        group_name: group.name.clone(),
+                        state: PhaseGroupState::Failed {
+                            retries: 0,
+                            error: ErrorClass::Unknown,
+                        },
+                        session_id: Some(session_id.to_string()),
+                        pid,
+                        duration: start.elapsed(),
+                        retries: 0,
+                        error_message: Some(
+                            "Prompt returned but group phases not complete — Claude may have exited the skill early".to_string()
+                        ),
+                        phases: group.phases.clone(),
+                    });
                 }
                 CompletionEvent::StillRunning => {
                     // Log status every ~10 ticks (30s)
@@ -756,12 +788,24 @@ pub fn append_result_jsonl(result: &PhaseGroupResult, arc_dir: &Path) -> Result<
     Ok(())
 }
 
-/// Compute a short hash for a plan path.
+/// Compute a short hash for a plan, based on path + file content.
+///
+/// Hashing content (not just path) ensures that two runs of the same plan
+/// file at the same path produce the same arc directory, while different
+/// content produces a different one. The path is included for uniqueness
+/// when two files at different paths have identical content.
 fn compute_plan_hash(plan_path: &Path) -> String {
     use sha2::{Sha256, Digest};
-    let path_str = plan_path.to_string_lossy();
     let mut hasher = Sha256::new();
+    // Include path for uniqueness across locations
+    let path_str = plan_path.to_string_lossy();
     hasher.update(path_str.as_bytes());
+    // Include file content so the hash reflects the actual plan, not just where it lives
+    if let Ok(content) = std::fs::read_to_string(plan_path) {
+        hasher.update(content.as_bytes());
+    } else {
+        warn!(path = %plan_path.display(), "Could not read plan file for hashing — using path-only hash");
+    }
     let result = hasher.finalize();
     result.iter().take(6).map(|b| format!("{:02x}", b)).collect::<String>()
 }

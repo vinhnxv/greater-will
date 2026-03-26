@@ -265,29 +265,52 @@ pub fn has_prompt_in_last_line(session_id: &str) -> Result<bool> {
 /// Detect error patterns in pane output.
 ///
 /// Returns an error class if a known error pattern is found.
+/// Only checks the last 20 lines to avoid false positives from
+/// code output containing HTTP status codes.
 pub fn detect_error_pattern(content: &str) -> Option<String> {
-    let content_lower = content.to_lowercase();
+    // Only check the tail of output to reduce false positives
+    let tail: String = content
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
 
-    // Check for common error patterns
-    let patterns = [
+    // Multi-word patterns are safe from false positives
+    let safe_patterns = [
         ("billing", "billing_error"),
         ("payment required", "billing_error"),
         ("subscription expired", "billing_error"),
         ("authentication_error", "auth_error"),
         ("invalid_api_key", "auth_error"),
-        ("unauthorized", "auth_error"),
         ("rate_limit", "rate_limit"),
-        ("429", "rate_limit"),
         ("too many requests", "rate_limit"),
         ("overloaded", "api_overload"),
-        ("529", "api_overload"),
         ("server_error", "api_overload"),
-        ("502", "api_overload"),
-        ("503", "api_overload"),
     ];
 
-    for (pattern, error_type) in patterns {
-        if content_lower.contains(pattern) {
+    for (pattern, error_type) in safe_patterns {
+        if tail.contains(pattern) {
+            return Some(error_type.to_string());
+        }
+    }
+
+    // Numeric patterns need context to avoid matching line numbers, ports, etc.
+    // Require "error" or "status" near the number.
+    let contextual_patterns = [
+        (&["error", "429"] as &[&str], "rate_limit"),
+        (&["status", "429"], "rate_limit"),
+        (&["unauthorized"], "auth_error"),
+        (&["error", "529"], "api_overload"),
+        (&["error", "502"], "api_overload"),
+        (&["error", "503"], "api_overload"),
+        (&["status", "502"], "api_overload"),
+        (&["status", "503"], "api_overload"),
+    ];
+
+    for (keywords, error_type) in contextual_patterns {
+        if keywords.iter().all(|kw| tail.contains(kw)) {
             return Some(error_type.to_string());
         }
     }
@@ -439,6 +462,23 @@ mod tests {
     fn test_detect_error_pattern_none() {
         let content = "Normal output without errors";
         assert_eq!(detect_error_pattern(content), None);
+    }
+
+    #[test]
+    fn test_detect_error_pattern_no_false_positive_on_bare_numbers() {
+        // Bare "429" in code output should NOT trigger
+        let content = "Processing line 429 of main.rs\nAll tests passed";
+        assert_eq!(detect_error_pattern(content), None);
+    }
+
+    #[test]
+    fn test_detect_error_pattern_contextual_429() {
+        // "error" + "429" together should trigger
+        let content = "some output\nerror: status 429 too many requests";
+        assert_eq!(
+            detect_error_pattern(content),
+            Some("rate_limit".to_string())
+        );
     }
 
     #[test]

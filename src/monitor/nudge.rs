@@ -53,22 +53,16 @@
 //! ```
 
 use crate::session::detect::compute_content_hash;
+use crate::session::spawn::send_keys_with_workaround;
 use color_eyre::Result;
-use std::process::Command;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Default idle duration before nudging (3 minutes).
 pub const DEFAULT_IDLE_NUDGE_SECS: u64 = 180;
 
 /// Default idle duration before killing (5 minutes).
 pub const DEFAULT_IDLE_KILL_SECS: u64 = 300;
-
-/// Delay for Ink autocomplete workaround (ms).
-const SEND_DELAY_MS: u64 = 300;
-
-/// Short delay after Escape (ms).
-const ESCAPE_DELAY_MS: u64 = 100;
 
 /// Default nudge message.
 pub const DEFAULT_NUDGE_MESSAGE: &str = "please continue";
@@ -262,67 +256,7 @@ impl NudgeManager {
     }
 }
 
-/// Send keys with the Ink autocomplete workaround.
-///
-/// Same logic as session::spawn::send_keys_with_workaround,
-/// duplicated here to avoid circular dependencies.
-fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
-    debug!(
-        session_id = %session_id,
-        text = %text,
-        "Sending keys with Ink workaround"
-    );
-
-    // Step 1: Send text literally (no Enter)
-    Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "-l", text])
-        .output()?;
-
-    // Step 2: Wait for autocomplete to render
-    std::thread::sleep(Duration::from_millis(SEND_DELAY_MS));
-
-    // Step 3: Send Escape to dismiss autocomplete
-    Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Escape"])
-        .output()?;
-
-    // Step 4: Brief wait for Ink to process
-    std::thread::sleep(Duration::from_millis(ESCAPE_DELAY_MS));
-
-    // Step 5: Send Enter to submit
-    Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Enter"])
-        .output()?;
-
-    Ok(())
-}
-
-/// Quick check if a session appears idle.
-///
-/// Compares current pane hash to a provided previous hash.
-pub fn is_session_idle(
-    session_id: &str,
-    previous_hash: Option<u64>,
-    _threshold: Duration,
-) -> Result<(bool, u64)> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
-        .output()?;
-
-    let content = String::from_utf8_lossy(&output.stdout);
-    let current_hash = compute_content_hash(&content);
-
-    let is_idle = match previous_hash {
-        Some(prev) if current_hash == prev => {
-            // Content unchanged - we don't know how long, so return false
-            // Caller should track time
-            false
-        }
-        _ => false,
-    };
-
-    Ok((is_idle, current_hash))
-}
+// send_keys_with_workaround is now imported from crate::session::spawn
 
 /// Idle tracker for tracking multiple sessions.
 ///

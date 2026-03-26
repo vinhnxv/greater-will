@@ -88,8 +88,13 @@ impl BatchState {
     }
 
     /// Path to the batch state file.
+    ///
+    /// Anchored to the current working directory at call time. For reliable
+    /// resume, the caller should ensure CWD matches the original batch run.
     pub fn state_path() -> PathBuf {
-        PathBuf::from(".gw/batch-state.json")
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".gw/batch-state.json")
     }
 
     /// Atomically write state to disk (write-to-tmp + rename).
@@ -179,5 +184,113 @@ impl std::fmt::Display for PlanOutcome {
             PlanOutcome::Failed => write!(f, "FAILED"),
             PlanOutcome::Skipped => write!(f, "SKIPPED"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_passed_result(plan: &str) -> PlanResult {
+        PlanResult {
+            plan: plan.to_string(),
+            outcome: PlanOutcome::Passed,
+            duration_secs: 10.0,
+            completed_at: Utc::now(),
+            error: None,
+        }
+    }
+
+    fn make_failed_result(plan: &str) -> PlanResult {
+        PlanResult {
+            plan: plan.to_string(),
+            outcome: PlanOutcome::Failed,
+            duration_secs: 5.0,
+            completed_at: Utc::now(),
+            error: Some("test error".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_batch_state_new() {
+        let plans = vec!["a.md".into(), "b.md".into(), "c.md".into()];
+        let state = BatchState::new(plans.clone());
+
+        assert_eq!(state.plans, plans);
+        assert_eq!(state.current_index, 0);
+        assert!(state.results.is_empty());
+        assert!(!state.is_circuit_broken());
+        assert!(state.has_remaining());
+        assert_eq!(state.next_plan(), Some("a.md"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_after_3_failures() {
+        let mut state = BatchState::new(vec!["a.md".into(), "b.md".into(), "c.md".into(), "d.md".into()]);
+
+        // 2 failures — not tripped yet
+        state.record_result(make_failed_result("a.md"));
+        state.record_result(make_failed_result("b.md"));
+        assert!(!state.is_circuit_broken());
+
+        // 3rd failure — tripped
+        state.record_result(make_failed_result("c.md"));
+        assert!(state.is_circuit_broken());
+    }
+
+    #[test]
+    fn test_circuit_breaker_resets_on_success() {
+        let mut state = BatchState::new(vec!["a.md".into(), "b.md".into(), "c.md".into()]);
+
+        state.record_result(make_failed_result("a.md"));
+        state.record_result(make_failed_result("b.md"));
+        assert_eq!(state.circuit_breaker.consecutive_failures, 2);
+
+        // Success resets
+        state.record_result(make_passed_result("c.md"));
+        assert_eq!(state.circuit_breaker.consecutive_failures, 0);
+        assert!(!state.is_circuit_broken());
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        // Override CWD temporarily for state_path
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let mut state = BatchState::new(vec!["plan1.md".into(), "plan2.md".into()]);
+        state.record_result(make_passed_result("plan1.md"));
+        state.save().unwrap();
+
+        let loaded = BatchState::load(&BatchState::state_path()).unwrap();
+        assert_eq!(loaded.batch_id, state.batch_id);
+        assert_eq!(loaded.plans, state.plans);
+        assert_eq!(loaded.current_index, 1);
+        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(loaded.results[0].outcome, PlanOutcome::Passed);
+
+        // Restore CWD
+        std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_current_index_advances() {
+        let mut state = BatchState::new(vec!["a.md".into(), "b.md".into()]);
+
+        assert_eq!(state.next_plan(), Some("a.md"));
+        state.record_result(make_passed_result("a.md"));
+        assert_eq!(state.next_plan(), Some("b.md"));
+        state.record_result(make_passed_result("b.md"));
+        assert_eq!(state.next_plan(), None);
+        assert!(!state.has_remaining());
+    }
+
+    #[test]
+    fn test_plan_outcome_display() {
+        assert_eq!(format!("{}", PlanOutcome::Passed), "PASSED");
+        assert_eq!(format!("{}", PlanOutcome::Failed), "FAILED");
+        assert_eq!(format!("{}", PlanOutcome::Skipped), "SKIPPED");
     }
 }

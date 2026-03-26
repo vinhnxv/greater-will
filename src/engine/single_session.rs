@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+// Used by verify_completion_via_checkpoint for parsing checkpoint JSON.
+use serde_json;
+
 /// Maximum number of crash-recovery restarts before giving up.
 const MAX_CRASH_RETRIES: u32 = 3;
 
@@ -339,6 +342,7 @@ fn run_session_attempt(
     let mut nudged = false;
     let mut last_status_log = Instant::now();
     let mut poll_count: u64 = 0;
+    let mut last_pane_content = String::new();
 
     /// Minimum session duration to consider a "real" run (not an instant crash).
     /// If the session dies within this window after dispatch, it's a crash.
@@ -378,10 +382,20 @@ fn run_session_attempt(
                 });
             }
 
-            // Session ran for a meaningful time — check if it completed normally
+            // Session ran for a meaningful time — verify via last pane output before declaring success
             if !crate::cleanup::process::is_pid_alive(pid) {
-                info!("Session ended, process dead — treating as completion");
-                return Ok(SessionOutcome::Completed);
+                if verify_pipeline_completed_via_pane(&last_pane_content, Some(&config.working_dir)) {
+                    info!("Session ended, completion signal confirmed in pane output");
+                    return Ok(SessionOutcome::Completed);
+                }
+                // No completion signal — treat as crash, not success
+                warn!("Session ended without completion signal — treating as crash");
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "Session exited after {}s without completion signal",
+                        session_age.as_secs()
+                    ),
+                });
             }
 
             // Session gone but process alive? Unusual — treat as crash.
@@ -395,6 +409,7 @@ fn run_session_attempt(
             Ok(content) => content,
             Err(_) => continue, // Transient error, retry next cycle
         };
+        last_pane_content = pane_content.clone();
 
         // Compute output hash for idle detection
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -408,7 +423,7 @@ fn run_session_attempt(
         }
 
         // Check for completion signals in pane output
-        if is_pipeline_complete(&pane_content) {
+        if is_pipeline_complete(&pane_content, Some(&config.working_dir)) {
             let elapsed = dispatch_time.elapsed();
             info!("Pipeline completion detected in pane output");
             println!(
@@ -449,8 +464,19 @@ fn run_session_attempt(
                     reason: format!("Claude process died after only {}s", session_age.as_secs()),
                 });
             }
-            // Process ran for a while then died — likely completed
-            return Ok(SessionOutcome::Completed);
+            // Process ran for a while then died — verify via pane output
+            if verify_pipeline_completed_via_pane(&pane_content, Some(&config.working_dir)) {
+                info!("Process died but completion signal found in pane output");
+                return Ok(SessionOutcome::Completed);
+            }
+            warn!("Process died without completion signal — treating as crash");
+            return Ok(SessionOutcome::Crashed {
+                reason: format!(
+                    "Claude process died after {}m{}s without completion signal",
+                    session_age.as_secs() / 60,
+                    session_age.as_secs() % 60,
+                ),
+            });
         }
 
         // Periodic status logging
@@ -505,23 +531,124 @@ fn run_session_attempt(
     }
 }
 
+/// Verify that the pipeline actually completed by checking pane output for
+/// completion signals. Used when a session/process dies to distinguish
+/// between a successful completion and a crash.
+fn verify_pipeline_completed_via_pane(pane_content: &str, working_dir: Option<&Path>) -> bool {
+    is_pipeline_complete(pane_content, working_dir)
+}
+
 /// Check pane output for signals that the arc pipeline has completed.
 ///
-/// Looks for common arc completion patterns in the visible pane content.
-fn is_pipeline_complete(pane_content: &str) -> bool {
+/// Looks for common arc completion patterns in the visible pane content,
+/// then cross-verifies against the checkpoint file if a working directory
+/// is provided. This prevents false positives from strings that happen
+/// to appear in output without the pipeline actually finishing.
+fn is_pipeline_complete(pane_content: &str, working_dir: Option<&Path>) -> bool {
     // Check last ~20 lines for completion signals
     let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
     let tail = last_lines.join("\n").to_lowercase();
 
     // Arc completion signals
-    tail.contains("arc completed")
+    let string_match = tail.contains("arc completed")
         || tail.contains("all phases complete")
         || tail.contains("pipeline completed")
         || tail.contains("merge completed")
         || tail.contains("arc run finished")
         // Rune-specific completion markers
         || tail.contains("the tarnished rests")
-        || tail.contains("arc result: success")
+        || tail.contains("arc result: success");
+
+    if !string_match {
+        return false;
+    }
+
+    // String matched — cross-verify via checkpoint if working_dir available
+    if let Some(dir) = working_dir {
+        match verify_completion_via_checkpoint(dir) {
+            Some(true) => return true,
+            Some(false) => {
+                warn!("Completion string detected in pane but checkpoint shows incomplete — ignoring false signal");
+                return false;
+            }
+            None => {
+                // Checkpoint unreadable or not found, fall back to string-only detection
+                info!("Completion string detected, checkpoint unavailable — accepting string signal");
+                return true;
+            }
+        }
+    }
+
+    // No working_dir provided, accept string match
+    true
+}
+
+/// Verify pipeline completion by reading the most recent checkpoint.json
+/// under `.rune/arc/`. Returns `Some(true)` if all phases are completed/skipped,
+/// `Some(false)` if checkpoint exists but shows incomplete, or `None` if
+/// no checkpoint could be read.
+fn verify_completion_via_checkpoint(working_dir: &Path) -> Option<bool> {
+    let arc_dir = working_dir.join(".rune").join("arc");
+    let entries = std::fs::read_dir(&arc_dir).ok()?;
+
+    // Find the most recently modified checkpoint.json
+    let mut checkpoints: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let cp = e.path().join("checkpoint.json");
+            let mtime = cp.metadata().ok()?.modified().ok()?;
+            Some((cp, mtime))
+        })
+        .collect();
+
+    checkpoints.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let (cp_path, _) = checkpoints.first()?;
+    let content = std::fs::read_to_string(cp_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let phases = json.get("phases")?.as_object()?;
+    if phases.is_empty() {
+        return None; // No phase data — can't verify
+    }
+
+    let all_done = phases.values().all(|v| {
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "completed" || s == "skipped")
+            .unwrap_or(false)
+    });
+
+    Some(all_done)
+}
+
+/// Check if an arc flag is safe to pass to a shell command.
+///
+/// Valid flags must start with `--` and must not contain characters that
+/// could enable command injection (newlines, semicolons, backticks, pipes,
+/// dollar signs, ampersands).
+fn is_valid_arc_flag(flag: &str) -> bool {
+    flag.starts_with("--")
+        && !flag.contains('\n')
+        && !flag.contains('\r')
+        && !flag.contains(';')
+        && !flag.contains('`')
+        && !flag.contains('|')
+        && !flag.contains('$')
+        && !flag.contains('&')
+}
+
+/// Append validated arc_flags to a command string.
+/// Invalid flags are skipped with a warning log.
+fn append_validated_flags(cmd: &mut String, flags: &[String]) {
+    for flag in flags {
+        if is_valid_arc_flag(flag) {
+            cmd.push(' ');
+            cmd.push_str(flag);
+        } else {
+            warn!(flag = %flag, "Skipping invalid arc flag (must start with '--' and contain no shell metacharacters)");
+        }
+    }
 }
 
 /// Build the `/rune:arc` command string for initial run.
@@ -532,10 +659,7 @@ fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
         cmd.push_str(" --resume");
     }
 
-    for flag in &config.arc_flags {
-        cmd.push(' ');
-        cmd.push_str(flag);
-    }
+    append_validated_flags(&mut cmd, &config.arc_flags);
 
     cmd
 }
@@ -544,10 +668,7 @@ fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
 fn build_resume_command(plan_path: &str, config: &SingleSessionConfig) -> String {
     let mut cmd = format!("/rune:arc {} --resume", plan_path);
 
-    for flag in &config.arc_flags {
-        cmd.push(' ');
-        cmd.push_str(flag);
-    }
+    append_validated_flags(&mut cmd, &config.arc_flags);
 
     cmd
 }
@@ -620,10 +741,11 @@ mod tests {
 
     #[test]
     fn test_is_pipeline_complete() {
-        assert!(is_pipeline_complete("some output\narc completed\n❯"));
-        assert!(is_pipeline_complete("The Tarnished rests after a long journey"));
-        assert!(!is_pipeline_complete("still working on phase 5..."));
-        assert!(!is_pipeline_complete(""));
+        // Without working_dir (None) falls back to string-only check
+        assert!(is_pipeline_complete("some output\narc completed\n❯", None));
+        assert!(is_pipeline_complete("The Tarnished rests after a long journey", None));
+        assert!(!is_pipeline_complete("still working on phase 5...", None));
+        assert!(!is_pipeline_complete("", None));
     }
 
     #[test]

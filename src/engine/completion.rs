@@ -43,9 +43,8 @@
 use crate::checkpoint::phase_order::phase_index;
 use crate::checkpoint::reader::read_checkpoint;
 use crate::checkpoint::schema::Checkpoint;
+use crate::session::detect::compute_content_hash;
 use color_eyre::Result;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -302,7 +301,7 @@ impl CompletionDetector {
         }
 
         // Layer 3: Check for idle
-        let pane_hash = compute_pane_hash(pane_content);
+        let pane_hash = compute_content_hash(pane_content);
 
         if let Some(last_hash) = self.state.last_pane_hash {
             if pane_hash != last_hash {
@@ -433,50 +432,8 @@ impl CompletionDetector {
     }
 }
 
-/// Compute a hash of pane content for idle detection.
-///
-/// Uses a simple DefaultHasher for speed.
-pub fn compute_pane_hash(content: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Capture pane content from tmux session.
-///
-/// Returns the visible text in the current pane.
-pub fn capture_pane_content(session_id: &str) -> Result<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
-        .output()?;
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Capture the last line from the tmux pane.
-///
-/// Skips empty lines.
-pub fn capture_last_line(session_id: &str) -> Result<Option<String>> {
-    let content = capture_pane_content(session_id)?;
-
-    let last_line = content
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .map(|s| s.to_string());
-
-    Ok(last_line)
-}
-
-/// Check if a prompt (❯) is present in the last line.
-pub fn has_prompt_in_last_line(session_id: &str) -> Result<bool> {
-    let last_line = capture_last_line(session_id)?;
-
-    match last_line {
-        Some(line) => Ok(line.contains('❯')),
-        None => Ok(false),
-    }
-}
+// capture_pane, has_prompt_in_last_line, and compute_content_hash are
+// available from crate::session::detect — callers should use those directly.
 
 #[cfg(test)]
 mod tests {
@@ -499,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_pane_hash() {
+    fn test_compute_content_hash_via_detect() {
         let content1 = "Hello world";
         let content2 = "Hello world";
         let content3 = "Different content";
 
-        let hash1 = compute_pane_hash(content1);
-        let hash2 = compute_pane_hash(content2);
-        let hash3 = compute_pane_hash(content3);
+        let hash1 = compute_content_hash(content1);
+        let hash2 = compute_content_hash(content2);
+        let hash3 = compute_content_hash(content3);
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);

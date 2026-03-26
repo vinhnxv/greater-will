@@ -432,3 +432,63 @@ fn parse_plan_timeout() -> Duration {
         Err(_) => Duration::from_secs(DEFAULT_PLAN_TIMEOUT_SECS),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All parse_plan_timeout tests in a single sequential test to avoid
+    /// env var race conditions between parallel test threads.
+    #[test]
+    fn test_parse_plan_timeout_all() {
+        // Save any existing value
+        let saved = std::env::var("GW_PLAN_TIMEOUT").ok();
+
+        // Default (env var not set)
+        std::env::remove_var("GW_PLAN_TIMEOUT");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(3 * 3600));
+
+        // Hours
+        std::env::set_var("GW_PLAN_TIMEOUT", "2h");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(2 * 3600));
+
+        // Minutes
+        std::env::set_var("GW_PLAN_TIMEOUT", "90m");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(90 * 60));
+
+        // Seconds suffix
+        std::env::set_var("GW_PLAN_TIMEOUT", "7200s");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(7200));
+
+        // Bare number (seconds)
+        std::env::set_var("GW_PLAN_TIMEOUT", "600");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(600));
+
+        // Invalid → default (3h)
+        std::env::set_var("GW_PLAN_TIMEOUT", "not_a_number");
+        assert_eq!(parse_plan_timeout(), Duration::from_secs(3 * 3600));
+
+        // Restore
+        match saved {
+            Some(val) => std::env::set_var("GW_PLAN_TIMEOUT", val),
+            None => std::env::remove_var("GW_PLAN_TIMEOUT"),
+        }
+    }
+
+    #[test]
+    fn test_batch_summary_display() {
+        let summary = BatchSummary {
+            batch_id: "test-batch".to_string(),
+            passed: 3,
+            failed: 1,
+            skipped: 0,
+            duration: Duration::from_secs(120),
+            results: vec![],
+        };
+
+        let display = format!("{}", summary);
+        assert!(display.contains("test-batch"));
+        assert!(display.contains("Passed:  3"));
+        assert!(display.contains("Failed: 1"));
+    }
+}

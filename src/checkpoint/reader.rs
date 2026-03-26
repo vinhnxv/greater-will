@@ -50,6 +50,17 @@ pub fn read_checkpoint<P: AsRef<Path>>(path: P) -> Result<Checkpoint> {
     let mut file = File::open(path)
         .wrap_err_with(|| format!("Failed to open checkpoint file: {}", path.display()))?;
 
+    const MAX_CHECKPOINT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+    let file_size = file.metadata()
+        .wrap_err_with(|| format!("Failed to read metadata for: {}", path.display()))?
+        .len();
+    if file_size > MAX_CHECKPOINT_SIZE {
+        return Err(eyre!(
+            "Checkpoint file too large ({} bytes, max {} bytes): {}",
+            file_size, MAX_CHECKPOINT_SIZE, path.display()
+        ));
+    }
+
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .wrap_err_with(|| format!("Failed to read checkpoint file: {}", path.display()))?;
@@ -289,6 +300,11 @@ pub fn find_checkpoint_for_plan(plan_path: &Path, cwd: &Path) -> Result<Option<s
             Some(cp) if plan_matches(&cp.plan_file, &plan_str) => {
                 let started = cp.started_at.clone();
                 if started.is_empty() { continue; }  // Skip checkpoints without started_at
+                // String comparison is valid here because `started_at` uses RFC 3339 / ISO 8601
+                // format (e.g., "2026-03-25T12:00:00Z"). This format is lexicographically
+                // ordered — later timestamps always sort after earlier ones when compared
+                // as strings, provided the format is consistent (which serde serialization
+                // guarantees via `chrono::Utc::now().to_rfc3339()`).
                 match &best {
                     None => best = Some((cp_path, started)),
                     Some((_, prev_started)) if started > *prev_started => {
@@ -365,9 +381,9 @@ pub fn validate_before_resume(
 /// * `checkpoint` - Mutable reference to the checkpoint to modify
 /// * `target_phase` - Name of the phase to resume at
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `target_phase` is not in `PHASE_ORDER`.
+/// Returns an error if `target_phase` is not in `PHASE_ORDER`.
 ///
 /// # Example
 ///
@@ -378,9 +394,9 @@ pub fn validate_before_resume(
 /// mark_phases_completed_before(&mut checkpoint, "work");
 /// // Now forge, forge_qa, plan_review, etc. are marked "completed"
 /// ```
-pub fn mark_phases_completed_before(checkpoint: &mut Checkpoint, target_phase: &str) {
+pub fn mark_phases_completed_before(checkpoint: &mut Checkpoint, target_phase: &str) -> Result<()> {
     let target_idx = phase_index(target_phase)
-        .expect("target_phase must be in PHASE_ORDER");
+        .ok_or_else(|| eyre!("Unknown phase '{}' not found in PHASE_ORDER", target_phase))?;
 
     info!(
         "Marking phases before {} (index {}) as completed",
@@ -425,6 +441,8 @@ pub fn mark_phases_completed_before(checkpoint: &mut Checkpoint, target_phase: &
     checkpoint.phase_sequence = Some(target_idx as u32);
 
     info!("Updated phase_sequence to {}", target_idx);
+
+    Ok(())
 }
 
 /// Get a summary of checkpoint status for display.
@@ -509,7 +527,7 @@ mod tests {
     fn test_mark_phases_completed_before_work() {
         let mut cp = make_test_checkpoint();
 
-        mark_phases_completed_before(&mut cp, "work");
+        mark_phases_completed_before(&mut cp, "work").unwrap();
 
         // Work should be pending
         assert_eq!(cp.phases["work"].status, "pending");
@@ -530,7 +548,7 @@ mod tests {
         skip_map.insert("semantic_verification".into(), "not_needed".into());
         cp.skip_map = Some(skip_map);
 
-        mark_phases_completed_before(&mut cp, "design_extraction");
+        mark_phases_completed_before(&mut cp, "design_extraction").unwrap();
 
         // semantic_verification is after design_extraction, so it's not affected
         // Let's mark before work to test skip behavior
@@ -539,7 +557,7 @@ mod tests {
         skip_map2.insert("verification".into(), "not_needed".into());
         cp2.skip_map = Some(skip_map2);
 
-        mark_phases_completed_before(&mut cp2, "task_decomposition");
+        mark_phases_completed_before(&mut cp2, "task_decomposition").unwrap();
 
         // verification (index 4) should be skipped
         assert_eq!(cp2.phases["verification"].status, "skipped");
