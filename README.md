@@ -1,6 +1,6 @@
 # Greater Will
 
-External arc controller for [Rune](https://github.com/anthropics/claude-code) workflows. Runs `/rune:arc` pipelines in managed tmux sessions with crash recovery, stuck detection, and context injection.
+External arc controller for [Rune](https://github.com/vinhnxv/rune) workflows. Runs `/rune:arc` pipelines in managed tmux sessions with crash recovery, stuck detection, and context injection.
 
 Named after the Greater Will from Elden Ring — the outer god that orchestrates from beyond.
 
