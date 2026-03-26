@@ -403,6 +403,7 @@ fn run_session_attempt(
     let mut last_checkpoint_poll = Instant::now();
     let mut last_checkpoint_activity = Instant::now();
     let mut last_checkpoint_hash: Option<u64> = None;
+    let mut last_process_gone_at: Option<Instant> = None;
 
     /// Minimum session duration to consider a "real" run (not an instant crash).
     /// If the session dies within this window after dispatch, it's a crash.
@@ -525,6 +526,13 @@ fn run_session_attempt(
             });
         }
 
+        // Process is alive — reset crash grace tracker if it was set
+        // (process came back after disappearing briefly, e.g., self-update)
+        if last_process_gone_at.is_some() {
+            info!("Claude process recovered after temporary disappearance");
+            last_process_gone_at = None;
+        }
+
         // Capture pane and check for activity
         let pane_content = match capture_pane(session_name) {
             Ok(content) => content,
@@ -602,7 +610,7 @@ fn run_session_attempt(
         let screen_stall_secs = last_activity.elapsed().as_secs();
         let keyword_match = if current_hash == last_output_hash {
             // Only scan for keywords when screen is not changing
-            ErrorClass::from_pane_output(&pane_content)
+            ErrorClass::from_pane_output(&pane_content, true)
         } else {
             None
         };
@@ -651,15 +659,38 @@ fn run_session_attempt(
             );
         }
 
-        // Check if Claude process is still alive (tmux session may exist but process dead)
+        // Check if Claude process is still alive (tmux session may exist but process dead).
+        // Grace period: Claude Code self-updates can take 45-90s. Wait CRASH_GRACE_SECS
+        // before declaring a crash to avoid false positives during updates.
+        // Ported from torrent's D7 crash grace period.
         if !crate::cleanup::process::is_pid_alive(pid) {
+            // Track when we first noticed the process gone
+            if last_process_gone_at.is_none() {
+                last_process_gone_at = Some(Instant::now());
+                info!(pid = pid, "Claude process not found — starting crash grace period ({}s)", crate::engine::retry::CRASH_GRACE_SECS);
+                println!(
+                    "[gw] Claude process (pid={}) not found — waiting {}s grace period (self-update?)",
+                    pid, crate::engine::retry::CRASH_GRACE_SECS,
+                );
+                continue; // Don't kill yet — wait for grace period
+            }
+            let gone_duration = last_process_gone_at.unwrap().elapsed();
+            if gone_duration.as_secs() < crate::engine::retry::CRASH_GRACE_SECS {
+                // Within grace period — process may be restarting (self-update)
+                debug!(
+                    gone_secs = gone_duration.as_secs(),
+                    grace_secs = crate::engine::retry::CRASH_GRACE_SECS,
+                    "Process still gone — within grace period"
+                );
+                continue;
+            }
+            // Grace period expired — process is actually dead
             let session_age = dispatch_time.elapsed();
-            warn!(pid = pid, age_secs = session_age.as_secs(), "Claude process died but tmux session still exists");
+            warn!(pid = pid, age_secs = session_age.as_secs(), gone_secs = gone_duration.as_secs(), "Claude process died (grace period expired)");
             println!(
-                "[gw] Claude process (pid={}) died after {}m{}s",
+                "[gw] Claude process (pid={}) confirmed dead after {}s grace — killing session",
                 pid,
-                session_age.as_secs() / 60,
-                session_age.as_secs() % 60,
+                gone_duration.as_secs(),
             );
             kill_session(session_name)?;
 

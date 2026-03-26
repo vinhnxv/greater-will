@@ -54,6 +54,13 @@ use std::time::Duration;
 /// thinking pauses.
 const ERROR_STALL_THRESHOLD_SECS: u64 = 60;
 
+/// Grace period before declaring a process crash (D7).
+///
+/// Claude Code self-updates can take 45-90s on slow connections. Using 60s
+/// grace period to avoid false positive crash detection during updates.
+/// Ported from torrent's `CRASH_GRACE_SECS`.
+pub const CRASH_GRACE_SECS: u64 = 60;
+
 /// Evidence collected for error diagnosis.
 ///
 /// Each signal contributes a confidence weight. Only when combined confidence
@@ -161,6 +168,8 @@ impl ErrorEvidence {
 /// Classification of errors that can occur during phase execution.
 ///
 /// Each variant maps to specific retry behavior defined by `RetryStrategy`.
+///
+/// Ported from torrent's `DiagnosticState` for comprehensive coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ErrorClass {
     /// Claude Code process crashed or died unexpectedly.
@@ -175,13 +184,25 @@ pub enum ErrorClass {
     /// → Kill session, retry with 30s backoff, max 3 retries.
     Timeout,
 
-    /// API is overloaded (429, 529, 500-class errors).
+    /// API is overloaded (429, 529, 500-class errors, bad gateway, service unavailable).
     /// → Exponential backoff: 15→30→60→120 min, max 4 retries.
     ApiOverload,
 
     /// Authentication or billing error.
     /// → Skip plan entirely (no retry).
     AuthError,
+
+    /// Network/connection error (ECONNREFUSED, ECONNRESET, DNS failure, etc.).
+    /// → Retry with escalating backoff, max 3 retries.
+    NetworkError,
+
+    /// Permission blocked — Claude waiting for user approval.
+    /// → Retry session (permissions may auto-resolve on restart).
+    PermissionBlocked,
+
+    /// Request too large (413) — context won't fit.
+    /// → Skip plan entirely (no retry, won't get smaller).
+    RequestTooLarge,
 
     /// Unclassified error.
     /// → Retry once with 60s backoff.
@@ -200,6 +221,9 @@ impl ErrorClass {
             ErrorClass::Timeout => Duration::from_secs(30),
             ErrorClass::ApiOverload => Duration::from_secs(15 * 60), // 15 min
             ErrorClass::AuthError => Duration::ZERO,
+            ErrorClass::NetworkError => Duration::from_secs(30),
+            ErrorClass::PermissionBlocked => Duration::from_secs(30),
+            ErrorClass::RequestTooLarge => Duration::ZERO,
             ErrorClass::Unknown => Duration::from_secs(60),
         }
     }
@@ -212,6 +236,9 @@ impl ErrorClass {
             ErrorClass::Timeout => 3,
             ErrorClass::ApiOverload => 4,
             ErrorClass::AuthError => 0,
+            ErrorClass::NetworkError => 3,
+            ErrorClass::PermissionBlocked => 2,
+            ErrorClass::RequestTooLarge => 0,
             ErrorClass::Unknown => 1,
         }
     }
@@ -236,7 +263,7 @@ impl ErrorClass {
 
     /// Check if this error class should skip the entire plan.
     pub fn skips_plan(&self) -> bool {
-        matches!(self, ErrorClass::AuthError)
+        matches!(self, ErrorClass::AuthError | ErrorClass::RequestTooLarge)
     }
 
     /// Classify error patterns found in pane output.
@@ -247,9 +274,22 @@ impl ErrorClass {
     /// MUST gate this behind stall detection (screen unchanged + checkpoint
     /// stale) before taking action.
     ///
-    /// Only scans the last 10 lines and requires error-adjacent context
-    /// (e.g., "error", "failed", "fatal") to reduce false positives.
-    pub fn from_pane_output(output: &str) -> Option<Self> {
+    /// # Arguments
+    ///
+    /// * `output` - Pane text to scan (last N lines captured from tmux)
+    /// * `runtime` - If true, skip bootstrap-only patterns (plan_not_found,
+    ///   plugin_missing) that would false-positive during active arc execution.
+    ///   Ported from torrent's `bootstrap_only` pattern flag.
+    ///
+    /// # Detection Strategy (ported from torrent)
+    ///
+    /// 1. Simple patterns — checked in priority order (billing > auth > permission > network > overload > rate-limit > request-too-large)
+    /// 2. Anchored patterns — HTTP status codes require co-occurrence with
+    ///    anchor strings (e.g., "500" + "api_error") to avoid false positives
+    ///    like "Processing 500 items" or "ticket #429".
+    /// 3. Error-context gate — requires at least one error indicator line
+    ///    (starts with "error:", "fatal:", "failed", or contains "❌").
+    pub fn from_pane_output(output: &str, runtime: bool) -> Option<Self> {
         // Only check the tail — errors that matter are recent.
         // Scanning full pane causes false positives when Claude's output
         // contains error keywords in code, docs, or plan enrichments.
@@ -266,70 +306,168 @@ impl ErrorClass {
 
         // Require error-adjacent context: the keyword must appear near
         // an indicator that it's an actual error, not just mentioned in output.
-        //
-        // We check per-line for indicators that look like real errors, not
-        // code identifiers like "ErrorClass" or "AuthError". Real API errors
-        // start lines with "error:" or "Error:" or contain standalone markers.
         let has_error_context = tail.lines().any(|line| {
             let trimmed = line.trim();
-            // Line starts with "error" followed by colon/space (real error output)
-            trimmed.starts_with("error:") || trimmed.starts_with("error ") ||
-            // Capitalized error messages from APIs
-            trimmed.starts_with("fatal:") || trimmed.starts_with("fatal ") ||
-            // Exception traces
-            trimmed.starts_with("exception:") || trimmed.starts_with("exception ") ||
-            // Standalone failure indicators
-            trimmed.starts_with("failed") ||
-            // Error emoji indicator
-            trimmed.contains("❌")
+            trimmed.starts_with("error:") || trimmed.starts_with("error ")
+            || trimmed.starts_with("fatal:") || trimmed.starts_with("fatal ")
+            || trimmed.starts_with("exception:") || trimmed.starts_with("exception ")
+            || trimmed.starts_with("failed")
+            || trimmed.contains("❌")
         });
 
         if !has_error_context {
             return None;
         }
 
-        // Billing / auth errors (require error context to avoid false positives
-        // from Claude writing about auth patterns in code or plans)
+        // --- Priority 1: Billing (terminal — stops entire batch) ---
         if tail.contains("billing")
             || tail.contains("payment required")
+            || tail.contains("payment_required")
+            || tail.contains("insufficient funds")
             || tail.contains("subscription expired")
         {
             return Some(ErrorClass::AuthError);
         }
 
+        // --- Priority 2: Auth errors ---
         if tail.contains("authentication_error")
             || tail.contains("invalid_api_key")
+            || tail.contains("invalid api key")
+            || tail.contains("api key expired")
+            || tail.contains("unauthorized")
+            || tail.contains("token expired")
+            || tail.contains("not authenticated")
         {
             return Some(ErrorClass::AuthError);
         }
 
-        // Rate limit / API overload
-        if tail.contains("rate_limit")
-            || tail.contains("too many requests")
+        // --- Priority 3: Permission blocked ---
+        if tail.contains("permission denied")
+            || tail.contains("permission_error")
+            || tail.contains("not permitted")
+            || tail.contains("access denied")
         {
-            return Some(ErrorClass::ApiOverload);
+            return Some(ErrorClass::PermissionBlocked);
         }
 
-        // Server overload
-        if tail.contains("overloaded")
+        // --- Priority 4: Bootstrap-only patterns (skip during runtime) ---
+        // These patterns should never trigger mid-arc because the plan/plugin
+        // has already been loaded. Normal tool output (Read errors, file probes)
+        // can contain these phrases and would cause false SkipPlan actions.
+        if !runtime {
+            if tail.contains("plan not found")
+                || tail.contains("plan file not found")
+                || tail.contains("plan does not exist")
+            {
+                return Some(ErrorClass::Unknown);
+            }
+            if tail.contains("plugin not found")
+                || tail.contains("plugin not installed")
+                || tail.contains("skill not found")
+            {
+                return Some(ErrorClass::AuthError); // terminal — stop batch
+            }
+        }
+
+        // --- Priority 5: Network/connection errors ---
+        if tail.contains("connection_error")
+            || tail.contains("network error")
+            || tail.contains("connection refused")
+            || tail.contains("connection reset")
+            || tail.contains("connection timed out")
+            || tail.contains("dns resolution failed")
+            || tail.contains("econnrefused")
+            || tail.contains("econnreset")
+            || tail.contains("etimedout")
+        {
+            return Some(ErrorClass::NetworkError);
+        }
+
+        // --- Priority 6: API overload / server errors ---
+        if tail.contains("overloaded_error")
+            || tail.contains("overloaded")
+            || tail.contains("api is overloaded")
             || tail.contains("server_error")
         {
             return Some(ErrorClass::ApiOverload);
         }
 
-        // HTTP status codes need extra care — only match as standalone tokens
-        // to avoid matching port numbers (e.g., 5293) or line numbers.
-        let status_code_patterns = [
-            ("429", Self::ApiOverload),
-            ("529", Self::ApiOverload),
-            ("502", Self::ApiOverload),
-            ("503", Self::ApiOverload),
+        // --- Priority 7: Rate limit ---
+        if tail.contains("rate_limit_error")
+            || tail.contains("rate_limit")
+            || tail.contains("rate limit")
+            || tail.contains("rate-limit")
+            || tail.contains("too many requests")
+        {
+            return Some(ErrorClass::ApiOverload);
+        }
+
+        // --- Priority 8: Request too large ---
+        if tail.contains("request too large")
+            || tail.contains("request_too_large")
+            || tail.contains("payload too large")
+            || tail.contains("content too long")
+        {
+            return Some(ErrorClass::RequestTooLarge);
+        }
+
+        // --- Priority 9: Service unavailable ---
+        if tail.contains("bad gateway")
+            || tail.contains("bad_gateway")
+            || tail.contains("service unavailable")
+            || tail.contains("service_unavailable")
+        {
+            return Some(ErrorClass::ApiOverload);
+        }
+
+        // --- Anchored patterns: HTTP status codes requiring co-occurrence ---
+        // Prevents false positives like "Processing 500 items" or "ticket #429".
+        // Ported from torrent's AnchoredPattern system.
+        struct AnchoredCode {
+            code: &'static str,
+            anchors: &'static [&'static str],
+            class: ErrorClass,
+        }
+
+        let anchored_codes = [
+            AnchoredCode {
+                code: "500",
+                anchors: &["api_error", "internal server error", "internal_server_error", "server error", "status code", "http error"],
+                class: ErrorClass::ApiOverload,
+            },
+            AnchoredCode {
+                code: "429",
+                anchors: &["rate_limit", "rate limit", "too many requests", "status code", "http error"],
+                class: ErrorClass::ApiOverload,
+            },
+            AnchoredCode {
+                code: "529",
+                anchors: &["overloaded", "overloaded_error", "status code", "http error"],
+                class: ErrorClass::ApiOverload,
+            },
+            AnchoredCode {
+                code: "502",
+                anchors: &["bad gateway", "bad_gateway", "status code", "http error"],
+                class: ErrorClass::ApiOverload,
+            },
+            AnchoredCode {
+                code: "503",
+                anchors: &["service unavailable", "service_unavailable", "status code", "http error"],
+                class: ErrorClass::ApiOverload,
+            },
+            AnchoredCode {
+                code: "413",
+                anchors: &["request too large", "payload too large", "content too long", "status code", "http error"],
+                class: ErrorClass::RequestTooLarge,
+            },
         ];
 
-        for (code, class) in status_code_patterns {
-            for word in tail.split_whitespace() {
-                if word.trim_matches(|c: char| !c.is_ascii_digit()) == code {
-                    return Some(class);
+        for anchored in &anchored_codes {
+            if tail.contains(anchored.code) {
+                for anchor in anchored.anchors {
+                    if tail.contains(anchor) {
+                        return Some(anchored.class);
+                    }
                 }
             }
         }
@@ -592,7 +730,7 @@ mod tests {
         // Billing keyword WITH error context → match
         let output = "Error: billing payment required";
         assert_eq!(
-            ErrorClass::from_pane_output(output),
+            ErrorClass::from_pane_output(output, false),
             Some(ErrorClass::AuthError)
         );
     }
@@ -602,7 +740,7 @@ mod tests {
         // Billing keyword WITHOUT error context → no match (avoids false positives
         // when Claude writes about billing in code or plans)
         let output = "The retry module handles billing with backoff";
-        assert_eq!(ErrorClass::from_pane_output(output), None);
+        assert_eq!(ErrorClass::from_pane_output(output, false), None);
     }
 
     #[test]
@@ -612,7 +750,7 @@ mod tests {
         let output = "- **Already has** patterns (billing, auth)\n\
                       - ErrorClass enum with AuthError, Crash, Stuck\n\
                       - `from_pane_output()` duplicates patterns from detect.rs";
-        assert_eq!(ErrorClass::from_pane_output(output), None);
+        assert_eq!(ErrorClass::from_pane_output(output, false), None);
     }
 
     #[test]
@@ -623,14 +761,14 @@ mod tests {
                       ⎿  if output_lower.contains(\"billing\") {\n\
                       ⎿      return Some(ErrorClass::AuthError);\n\
                       ⎿  }";
-        assert_eq!(ErrorClass::from_pane_output(output), None);
+        assert_eq!(ErrorClass::from_pane_output(output, false), None);
     }
 
     #[test]
     fn test_error_class_from_pane_output_rate_limit_with_context() {
         let output = "Error: rate_limit exceeded (429)";
         assert_eq!(
-            ErrorClass::from_pane_output(output),
+            ErrorClass::from_pane_output(output, false),
             Some(ErrorClass::ApiOverload)
         );
     }
@@ -638,7 +776,7 @@ mod tests {
     #[test]
     fn test_error_class_from_pane_output_unknown() {
         let output = "Some random output without error patterns";
-        assert_eq!(ErrorClass::from_pane_output(output), None);
+        assert_eq!(ErrorClass::from_pane_output(output, false), None);
     }
 
     #[test]
@@ -648,14 +786,179 @@ mod tests {
         for i in 0..20 {
             output.push_str(&format!("normal output line {}\n", i));
         }
-        assert_eq!(ErrorClass::from_pane_output(&output), None);
+        assert_eq!(ErrorClass::from_pane_output(&output, false), None);
     }
 
     #[test]
     fn test_error_class_skips_plan() {
         assert!(ErrorClass::AuthError.skips_plan());
+        assert!(ErrorClass::RequestTooLarge.skips_plan());
         assert!(!ErrorClass::Crash.skips_plan());
         assert!(!ErrorClass::Timeout.skips_plan());
+        assert!(!ErrorClass::NetworkError.skips_plan());
+        assert!(!ErrorClass::PermissionBlocked.skips_plan());
+    }
+
+    // --- New ErrorClass variant tests ---
+
+    #[test]
+    fn test_new_error_class_backoffs() {
+        assert_eq!(ErrorClass::NetworkError.default_backoff(), Duration::from_secs(30));
+        assert_eq!(ErrorClass::PermissionBlocked.default_backoff(), Duration::from_secs(30));
+        assert_eq!(ErrorClass::RequestTooLarge.default_backoff(), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_new_error_class_max_retries() {
+        assert_eq!(ErrorClass::NetworkError.max_retries(), 3);
+        assert_eq!(ErrorClass::PermissionBlocked.max_retries(), 2);
+        assert_eq!(ErrorClass::RequestTooLarge.max_retries(), 0);
+    }
+
+    // --- Bootstrap vs runtime pattern filtering ---
+
+    #[test]
+    fn test_plan_not_found_detected_in_bootstrap() {
+        let output = "Error: plan not found at plans/missing.md";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::Unknown));
+    }
+
+    #[test]
+    fn test_plan_not_found_skipped_during_runtime() {
+        // D4: bootstrap_only — must NOT trigger during runtime (mid-arc)
+        let output = "Error: plan not found at plans/missing.md";
+        assert_eq!(ErrorClass::from_pane_output(output, true), None);
+    }
+
+    #[test]
+    fn test_plugin_missing_skipped_during_runtime() {
+        // D5: bootstrap_only — must NOT trigger during runtime (mid-arc)
+        let output = "Error: skill not found: rune:arc";
+        assert_eq!(ErrorClass::from_pane_output(output, true), None);
+    }
+
+    #[test]
+    fn test_api_errors_still_detected_during_runtime() {
+        let output = "Error: overloaded_error: API is overloaded";
+        assert_eq!(ErrorClass::from_pane_output(output, true), Some(ErrorClass::ApiOverload));
+    }
+
+    // --- Network error detection ---
+
+    #[test]
+    fn test_network_error_connection_refused() {
+        let output = "Error: connection refused to api.anthropic.com";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::NetworkError));
+    }
+
+    #[test]
+    fn test_network_error_econnreset() {
+        let output = "Error: ECONNRESET during API call";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::NetworkError));
+    }
+
+    #[test]
+    fn test_network_error_dns() {
+        let output = "Error: dns resolution failed for api.anthropic.com";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::NetworkError));
+    }
+
+    // --- Permission blocked detection ---
+
+    #[test]
+    fn test_permission_denied_detected() {
+        let output = "Error: permission denied for tool Bash";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::PermissionBlocked));
+    }
+
+    #[test]
+    fn test_access_denied_detected() {
+        let output = "Error: access denied to resource";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::PermissionBlocked));
+    }
+
+    // --- Request too large detection ---
+
+    #[test]
+    fn test_request_too_large_detected() {
+        let output = "Error: request too large, reduce context";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::RequestTooLarge));
+    }
+
+    #[test]
+    fn test_payload_too_large_detected() {
+        let output = "Error: payload too large for API";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::RequestTooLarge));
+    }
+
+    // --- Anchored HTTP code tests (ported from torrent) ---
+
+    #[test]
+    fn test_500_without_anchor_is_none() {
+        // "500" alone should NOT trigger — could be "Processing 500 items"
+        let output = "Error: Processing 500 items in batch";
+        assert_ne!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_500_with_anchor_triggers_api_overload() {
+        let output = "Error: HTTP 500 api_error: internal server error";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_429_without_anchor_is_none() {
+        // "429" without error context anchor should not trigger
+        let output = "Error: ticket #429 assigned to user";
+        // rate_limit not in text, so anchored pattern won't match
+        assert_ne!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_429_with_anchor_triggers_overload() {
+        let output = "Error: status code 429: rate limit exceeded";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_413_with_anchor_triggers_request_too_large() {
+        let output = "Error: status code 413 request too large";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::RequestTooLarge));
+    }
+
+    // --- Service unavailable ---
+
+    #[test]
+    fn test_bad_gateway_detected() {
+        let output = "Error: bad gateway from upstream";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_service_unavailable_detected() {
+        let output = "Error: service unavailable, try again later";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::ApiOverload));
+    }
+
+    // --- Priority ordering ---
+
+    #[test]
+    fn test_billing_takes_priority_over_auth() {
+        let output = "Error: billing error and also unauthorized access";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::AuthError));
+    }
+
+    #[test]
+    fn test_auth_takes_priority_over_rate_limit() {
+        let output = "Error: unauthorized and rate_limit_error together";
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::AuthError));
+    }
+
+    // --- Crash grace period constant ---
+
+    #[test]
+    fn test_crash_grace_period_constant() {
+        assert_eq!(CRASH_GRACE_SECS, 60);
     }
 
     // --- ErrorEvidence confidence tests ---

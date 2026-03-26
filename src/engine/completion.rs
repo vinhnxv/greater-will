@@ -369,7 +369,10 @@ impl CompletionDetector {
         // When Claude is actively producing output, keyword matches are
         // ignored because they're likely from code/plans/docs content.
         let keyword_match = if !pane_changed {
-            ErrorClass::from_pane_output(pane_content)
+            // Always runtime=true: CompletionDetector runs during active arc execution,
+            // so bootstrap-only patterns (plan_not_found, plugin_missing) are skipped
+            // to avoid false positives from normal tool output.
+            ErrorClass::from_pane_output(pane_content, true)
         } else {
             None
         };
