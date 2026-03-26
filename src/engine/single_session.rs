@@ -160,6 +160,9 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     println!("=== Greater-Will Single-Session Mode ===");
     println!("Plan: {}", plan_path.display());
     println!("Session: {}", session_name);
+    if let Some(ref dir) = config.config_dir {
+        println!("Config: {} (CLAUDE_CONFIG_DIR)", dir.display());
+    }
     println!("Command: {}", arc_command);
     println!("Timeout: {}h", config.pipeline_timeout.as_secs() / 3600);
     println!("Tip: use -v for detailed monitoring logs, -vv for debug output");

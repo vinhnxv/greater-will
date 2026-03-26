@@ -37,6 +37,19 @@ pub fn execute(
 ) -> Result<()> {
     let cwd = env::current_dir()?;
 
+    // Resolve config_dir: CLI --config-dir takes priority, then $CLAUDE_CONFIG_DIR env var
+    let config_dir = config_dir.or_else(|| {
+        env::var("CLAUDE_CONFIG_DIR").ok().and_then(|v| {
+            if v.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(&v);
+                tracing::info!(config_dir = %v, "Using CLAUDE_CONFIG_DIR from environment");
+                Some(path)
+            }
+        })
+    });
+
     // Pre-flight: check for uncommitted git changes
     // Skip for dry-run, mock, and --allow-dirty
     if !dry_run && mock.is_none() && !allow_dirty {
@@ -291,6 +304,9 @@ fn run_real(
         config.groups.len(),
         config.total_phases()
     );
+    if let Some(ref dir) = config_dir {
+        println!("Config: {} (CLAUDE_CONFIG_DIR)", dir.display());
+    }
     println!();
 
     let mut all_succeeded = true;
