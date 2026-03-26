@@ -22,6 +22,7 @@
 use crate::checkpoint::reader::find_checkpoint_for_plan;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
+use crate::config::watchdog::WatchdogConfig;
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
@@ -34,23 +35,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of crash-recovery restarts before giving up.
-const MAX_CRASH_RETRIES: u32 = 3;
+// Max crash retries is now in WatchdogConfig (default 5, env: GW_MAX_CRASH_RETRIES).
 
 /// Poll interval for monitoring the session (seconds).
 const POLL_INTERVAL_SECS: u64 = 5;
 
 /// How often to print a status line during monitoring (seconds).
 const STATUS_LOG_INTERVAL_SECS: u64 = 30;
-
-/// Idle threshold before sending a nudge (seconds).
-const IDLE_NUDGE_SECS: u64 = 300; // 5 min
-
-/// Idle threshold before killing a stuck session (seconds).
-const IDLE_KILL_SECS: u64 = 600; // 10 min
-
-/// Default total pipeline timeout (6 hours).
-const DEFAULT_PIPELINE_TIMEOUT_SECS: u64 = 6 * 3600;
 
 /// Result of a single-session pipeline run.
 #[derive(Debug, Clone)]
@@ -82,18 +73,22 @@ pub struct SingleSessionConfig {
     pub resume: bool,
     /// Additional flags to pass to `/rune:arc`.
     pub arc_flags: Vec<String>,
+    /// Watchdog tuning parameters (idle thresholds, scan intervals, etc.).
+    pub watchdog: WatchdogConfig,
 }
 
 impl SingleSessionConfig {
     /// Create a default config for a working directory.
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
+        let watchdog = WatchdogConfig::from_env();
         Self {
             working_dir: working_dir.into(),
             config_dir: None,
             claude_path: "claude".to_string(),
-            pipeline_timeout: Duration::from_secs(DEFAULT_PIPELINE_TIMEOUT_SECS),
+            pipeline_timeout: watchdog.pipeline_timeout,
             resume: false,
             arc_flags: Vec::new(),
+            watchdog,
         }
     }
 
@@ -215,7 +210,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > MAX_CRASH_RETRIES {
+                if crash_restarts > config.watchdog.max_crash_retries {
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
@@ -230,13 +225,13 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
                 warn!(
                     restart = crash_restarts,
-                    max = MAX_CRASH_RETRIES,
+                    max = config.watchdog.max_crash_retries,
                     reason = %reason,
                     "Session crashed, will restart with --resume"
                 );
                 println!(
                     "[gw] Session crashed ({}/{}): {}. Restarting in 5s...",
-                    crash_restarts, MAX_CRASH_RETRIES, reason,
+                    crash_restarts, config.watchdog.max_crash_retries, reason,
                 );
 
                 // Brief cooldown before restart
@@ -255,7 +250,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > MAX_CRASH_RETRIES {
+                if crash_restarts > config.watchdog.max_crash_retries {
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
@@ -268,7 +263,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 warn!(restart = crash_restarts, "Session stuck, restarting");
                 println!(
                     "[gw] Session stuck ({}/{}). Restarting in 5s...",
-                    crash_restarts, MAX_CRASH_RETRIES,
+                    crash_restarts, config.watchdog.max_crash_retries,
                 );
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -407,17 +402,28 @@ fn run_session_attempt(
     let mut last_checkpoint_activity = Instant::now();
     let mut last_checkpoint_hash: Option<u64> = None;
     let mut last_process_gone_at: Option<Instant> = None;
+    let mut last_artifact_scan = Instant::now();
+    let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
+    let mut last_artifact_activity = Instant::now();
 
-    /// Minimum session duration to consider a "real" run (not an instant crash).
-    /// If the session dies within this window after dispatch, it's a crash.
+    // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
+    // we start a confirmation timer. If the timer expires without new activity,
+    // we kill. Any heartbeat/artifact/checkpoint change cancels the pending kill.
+    //
+    // | Confidence | Confirmation Period | Rationale |
+    // |------------|-------------------|-----------|
+    // | < 0.5      | never act         | Below threshold |
+    // | 0.5 - 0.8  | 15 min            | Medium confidence — could be transient |
+    // | >= 0.8     | 5 min             | High confidence — strong evidence |
+    let mut error_confirm_since: Option<(Instant, ErrorClass, f64)> = None;
+    let wd = &config.watchdog;
+
     const MIN_SESSION_DURATION_SECS: u64 = 30;
-
-    /// How often to check the checkpoint file (seconds).
-    /// Less frequent than pane polling since file I/O is heavier.
-    const CHECKPOINT_POLL_INTERVAL_SECS: u64 = 10;
+    let error_confirm_medium_secs = wd.error_confirm_medium_secs;
+    let error_confirm_high_secs = wd.error_confirm_high_secs;
 
     info!("Entering monitor loop (poll={}s, nudge={}s, kill={}s)",
-        POLL_INTERVAL_SECS, IDLE_NUDGE_SECS, IDLE_KILL_SECS);
+        POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
     println!("[gw] Monitoring session (poll every {}s)...", POLL_INTERVAL_SECS);
 
     loop {
@@ -556,7 +562,7 @@ fn run_session_attempt(
         // PRIMARY: Check checkpoint.json for arc completion.
         // This is the most reliable signal — Rune writes structured state here.
         // Only poll every CHECKPOINT_POLL_INTERVAL_SECS to avoid excessive file I/O.
-        if last_checkpoint_poll.elapsed() >= Duration::from_secs(CHECKPOINT_POLL_INTERVAL_SECS) {
+        if last_checkpoint_poll.elapsed() >= Duration::from_secs(wd.checkpoint_poll_interval_secs) {
             last_checkpoint_poll = Instant::now();
             if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
                 if checkpoint.is_complete() {
@@ -583,6 +589,27 @@ fn run_session_attempt(
                     last_checkpoint_activity = Instant::now();
                 }
                 last_checkpoint_hash = Some(cp_hash);
+            }
+        }
+
+        // ARTIFACT DIR SCAN: Check if agents are writing output files.
+        // This catches activity that neither screen nor checkpoint reflect —
+        // e.g., review agents writing TOME fragments, workers creating files.
+        if last_artifact_scan.elapsed() >= Duration::from_secs(wd.artifact_scan_interval_secs) {
+            last_artifact_scan = Instant::now();
+            if let Some(artifact_dir) = find_artifact_dir(plan_path, &config.working_dir) {
+                if let Some(snapshot) = scan_artifact_dir(&artifact_dir) {
+                    if last_artifact_snapshot.map_or(true, |prev| prev != snapshot) {
+                        debug!(
+                            files = snapshot.file_count,
+                            bytes = snapshot.total_bytes,
+                            dir = %artifact_dir.display(),
+                            "Artifact dir activity detected"
+                        );
+                        last_artifact_activity = Instant::now();
+                        last_artifact_snapshot = Some(snapshot);
+                    }
+                }
             }
         }
 
@@ -618,48 +645,97 @@ fn run_session_attempt(
             None
         };
 
+        // Check if swarm teammates are running (lightweight: one tmux call)
+        let swarm = check_swarm_activity(pid);
+        let swarm_active = swarm.map_or(false, |s| s.active_count > 0);
+
         let evidence = ErrorEvidence {
             keyword_match,
             screen_stall_secs,
             checkpoint_stale_secs: Some(last_checkpoint_activity.elapsed().as_secs()),
             process_alive: crate::cleanup::process::is_pid_alive(pid),
+            artifacts_active: last_artifact_activity.elapsed().as_secs() < wd.error_stall_threshold_secs,
+            swarm_active,
         };
 
         if let Some(error_class) = evidence.classify() {
-            warn!(
-                error_class = ?error_class,
-                confidence = evidence.confidence(),
-                screen_stall_secs = screen_stall_secs,
-                checkpoint_stale_secs = last_checkpoint_activity.elapsed().as_secs(),
-                keyword = ?evidence.keyword_match,
-                process_alive = evidence.process_alive,
-                "Error evidence threshold reached — multiple signals confirm error"
-            );
-            println!(
-                "[gw] Error detected: {:?} (confidence={:.1}, stall={}s) — killing session",
-                error_class,
-                evidence.confidence(),
-                screen_stall_secs,
-            );
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::ErrorDetected {
-                reason: format!(
-                    "Error pattern detected: {:?} (confidence={:.1}, stall={}s, checkpoint_stale={}s)",
-                    error_class,
-                    evidence.confidence(),
-                    screen_stall_secs,
-                    last_checkpoint_activity.elapsed().as_secs(),
-                ),
-                error_class,
-            });
-        } else if evidence.keyword_match.is_some() {
-            // Keyword matched but confidence too low — log and continue monitoring
-            debug!(
-                keyword = ?evidence.keyword_match,
-                confidence = evidence.confidence(),
-                screen_stall_secs = screen_stall_secs,
-                "Error keyword found but confidence too low — Claude likely still active"
-            );
+            let conf = evidence.confidence();
+
+            // Confirmation period: don't kill immediately. Start a timer and
+            // wait for confirmation_secs. If activity resumes, cancel the kill.
+            let confirmation_secs = if conf >= 0.8 {
+                error_confirm_high_secs  // 5 min for high confidence
+            } else {
+                error_confirm_medium_secs // 15 min for medium confidence
+            };
+
+            if let Some((started, prev_class, _prev_conf)) = &error_confirm_since {
+                // Already in confirmation period — check if time to act
+                let elapsed_confirm = started.elapsed().as_secs();
+                if elapsed_confirm >= confirmation_secs {
+                    // Confirmation period expired — act now
+                    warn!(
+                        error_class = ?error_class,
+                        confidence = conf,
+                        screen_stall_secs = screen_stall_secs,
+                        confirmation_secs = elapsed_confirm,
+                        "Error confirmed after {}s observation — killing session",
+                        elapsed_confirm,
+                    );
+                    println!(
+                        "[gw] Error confirmed: {:?} (confidence={:.1}, observed for {}s) — killing session",
+                        error_class, conf, elapsed_confirm,
+                    );
+                    kill_session(session_name)?;
+                    return Ok(SessionOutcome::ErrorDetected {
+                        reason: format!(
+                            "Error pattern confirmed: {:?} (confidence={:.1}, observed={}s, stall={}s)",
+                            error_class, conf, elapsed_confirm, screen_stall_secs,
+                        ),
+                        error_class,
+                    });
+                } else {
+                    // Still in confirmation period — log and continue
+                    debug!(
+                        error_class = ?prev_class,
+                        confidence = conf,
+                        remaining_secs = confirmation_secs - elapsed_confirm,
+                        "Error confirmation in progress — {}s remaining",
+                        confirmation_secs - elapsed_confirm,
+                    );
+                }
+            } else {
+                // Start confirmation period
+                warn!(
+                    error_class = ?error_class,
+                    confidence = conf,
+                    confirmation_secs = confirmation_secs,
+                    "Error detected — starting {}s confirmation period before killing",
+                    confirmation_secs,
+                );
+                println!(
+                    "[gw] Error signal: {:?} (confidence={:.1}) — watching for {}m before killing",
+                    error_class, conf, confirmation_secs / 60,
+                );
+                error_confirm_since = Some((Instant::now(), error_class, conf));
+            }
+        } else {
+            // No error detected — cancel any pending confirmation
+            if error_confirm_since.is_some() {
+                info!("Error signals cleared — cancelling pending confirmation");
+                println!("[gw] Error signals cleared — system recovered, cancelling pending kill");
+                error_confirm_since = None;
+            }
+
+            if evidence.keyword_match.is_some() {
+                // Keyword matched but confidence too low — log and continue monitoring
+                debug!(
+                    keyword = ?evidence.keyword_match,
+                    confidence = evidence.confidence(),
+                    screen_stall_secs = screen_stall_secs,
+                    "Error keyword found but confidence too low — Claude likely still active"
+                );
+            }
         }
 
         // Check if Claude process is still alive (tmux session may exist but process dead).
@@ -750,7 +826,7 @@ fn run_session_attempt(
         // Idle detection
         let idle_duration = last_activity.elapsed();
 
-        if idle_duration > Duration::from_secs(IDLE_KILL_SECS) {
+        if idle_duration > Duration::from_secs(wd.idle_kill_secs) {
             warn!(
                 idle_secs = idle_duration.as_secs(),
                 "Session stuck (idle too long), killing"
@@ -758,13 +834,13 @@ fn run_session_attempt(
             println!(
                 "[gw] Session stuck (idle {}s > {}s limit), killing...",
                 idle_duration.as_secs(),
-                IDLE_KILL_SECS,
+                wd.idle_kill_secs,
             );
             kill_session(session_name)?;
             return Ok(SessionOutcome::Stuck);
         }
 
-        if idle_duration > Duration::from_secs(IDLE_NUDGE_SECS) && !nudged {
+        if idle_duration > Duration::from_secs(wd.idle_nudge_secs) && !nudged {
             info!(
                 idle_secs = idle_duration.as_secs(),
                 "Session idle, sending nudge"
@@ -889,6 +965,141 @@ pub fn run_single_session_batch(
     }
 
     Ok(results)
+}
+
+/// Swarm activity snapshot — number of active Claude teammates.
+///
+/// Claude Code spawns `tmux -L claude-swarm-{lead_pid}` for agent teams.
+/// Each pane runs a teammate. If teammates are running, the system is working
+/// even if the main screen is stalled (team lead waiting for agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwarmSnapshot {
+    /// Number of tmux panes in the swarm server.
+    pane_count: u32,
+    /// Number of panes with a live Claude child process.
+    active_count: u32,
+}
+
+/// Check swarm activity for a Claude Code process.
+///
+/// Looks for `claude-swarm-{pid}` tmux server and counts active panes.
+/// Returns `None` if no swarm server exists (not running agent teams).
+///
+/// Lightweight: one `tmux list-panes` call + one `ps` per pane.
+fn check_swarm_activity(claude_pid: u32) -> Option<SwarmSnapshot> {
+    use std::process::Command;
+
+    let socket_name = format!("claude-swarm-{}", claude_pid);
+
+    // Check if the swarm server exists by listing panes
+    let output = Command::new("tmux")
+        .args(["-L", &socket_name, "list-panes", "-a", "-F", "#{pane_pid}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None; // No swarm server for this PID
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane_pids: Vec<u32> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    if pane_pids.is_empty() {
+        return None;
+    }
+
+    // Count panes with active Claude child processes
+    // Each pane runs a shell → claude child. Check if claude child is alive.
+    let mut active_count = 0u32;
+    for &shell_pid in &pane_pids {
+        // Check if shell has a claude child via pgrep
+        let child_check = Command::new("pgrep")
+            .args(["-P", &shell_pid.to_string(), "-x", "claude"])
+            .output();
+        if let Ok(out) = child_check {
+            if out.status.success() {
+                active_count += 1;
+            }
+        }
+    }
+
+    Some(SwarmSnapshot {
+        pane_count: pane_pids.len() as u32,
+        active_count,
+    })
+}
+
+/// Lightweight snapshot of an artifact directory — file count and total size.
+///
+/// Used as an activity signal: if file_count or total_bytes changes between
+/// poll cycles, agents are actively writing output (review files, TOME,
+/// worker reports, etc.) even if the screen is stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactSnapshot {
+    file_count: u64,
+    total_bytes: u64,
+}
+
+/// Scan a directory recursively for file count and total size.
+///
+/// Lightweight: only calls `metadata()` per file, never reads content.
+/// Returns `None` if the directory doesn't exist (normal for early phases).
+fn scan_artifact_dir(dir: &Path) -> Option<ArtifactSnapshot> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    // Use a stack-based walk to avoid recursion depth issues
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                dirs_to_visit.push(entry.path());
+            } else if ft.is_file() {
+                file_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    Some(ArtifactSnapshot {
+        file_count,
+        total_bytes,
+    })
+}
+
+/// Find the arc artifact directory for a plan.
+///
+/// Pattern: `{working_dir}/tmp/arc/arc-{id}/` — the same `arc-{id}` that holds
+/// the checkpoint. Returns `None` if no matching directory exists yet.
+fn find_artifact_dir(plan_path: &Path, working_dir: &Path) -> Option<PathBuf> {
+    // Reuse checkpoint discovery to find the arc-{id}
+    let cp_path = find_checkpoint_for_plan(plan_path, working_dir).ok()??;
+    // checkpoint.json is at .rune/arc/arc-{id}/checkpoint.json
+    // artifact dir is at   tmp/arc/arc-{id}/
+    let arc_id = cp_path.parent()?.file_name()?;
+    let artifact_dir = working_dir.join("tmp").join("arc").join(arc_id);
+    if artifact_dir.is_dir() {
+        Some(artifact_dir)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

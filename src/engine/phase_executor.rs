@@ -535,7 +535,7 @@ impl PhaseGroupExecutor {
                         group_name: group.name.clone(),
                         state: PhaseGroupState::Failed {
                             retries: 0,
-                            error: ErrorClass::Unknown,
+                            error: ErrorClass::Crash,
                         },
                         session_id: Some(session_id.to_string()),
                         pid,

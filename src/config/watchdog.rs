@@ -1,0 +1,98 @@
+//! Watchdog tuning parameters.
+//!
+//! All thresholds are configurable via environment variables with sensible
+//! defaults. This module centralizes the knobs that control how aggressively
+//! Greater-Will intervenes in Claude Code sessions.
+//!
+//! # Environment Variables
+//!
+//! | Variable | Default | Unit | Description |
+//! |----------|---------|------|-------------|
+//! | `GW_IDLE_NUDGE_SECS` | 300 | seconds | Send nudge after this idle time |
+//! | `GW_IDLE_KILL_SECS` | 1800 | seconds | Kill session after this idle time |
+//! | `GW_ERROR_STALL_THRESHOLD_SECS` | 60 | seconds | Screen/checkpoint stale threshold for error confidence |
+//! | `GW_ARTIFACT_SCAN_INTERVAL_SECS` | 15 | seconds | How often to scan artifact directory |
+//! | `GW_PIPELINE_TIMEOUT_SECS` | 21600 | seconds | Total pipeline timeout (6 hours) |
+//! | `GW_CHECKPOINT_POLL_INTERVAL_SECS` | 10 | seconds | How often to check checkpoint file |
+
+use std::time::Duration;
+
+/// Watchdog configuration — controls how aggressively GW intervenes.
+///
+/// Loaded from environment variables with defaults tuned for arc pipeline
+/// execution where individual phases can take 30+ minutes.
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    /// Idle time before sending a nudge (Enter key) to unstick session.
+    pub idle_nudge_secs: u64,
+    /// Idle time before killing a stuck session.
+    /// Default 1800s (30 min) — allows long-running phases to complete.
+    pub idle_kill_secs: u64,
+    /// Screen/checkpoint staleness threshold for error confidence scoring.
+    /// Below this, checkpoint is considered "fresh" (negative signal).
+    pub error_stall_threshold_secs: u64,
+    /// How often to scan the artifact directory for changes.
+    pub artifact_scan_interval_secs: u64,
+    /// Total pipeline timeout.
+    pub pipeline_timeout: Duration,
+    /// How often to check the checkpoint file.
+    pub checkpoint_poll_interval_secs: u64,
+    /// Maximum crash-recovery restarts before giving up.
+    pub max_crash_retries: u32,
+    /// Confirmation period for medium-confidence errors (0.5-0.8), in seconds.
+    pub error_confirm_medium_secs: u64,
+    /// Confirmation period for high-confidence errors (>= 0.8), in seconds.
+    pub error_confirm_high_secs: u64,
+}
+
+impl WatchdogConfig {
+    /// Load configuration from environment variables with defaults.
+    pub fn from_env() -> Self {
+        Self {
+            idle_nudge_secs: env_or("GW_IDLE_NUDGE_SECS", 300),      // 5 min
+            idle_kill_secs: env_or("GW_IDLE_KILL_SECS", 1800),       // 30 min
+            error_stall_threshold_secs: env_or("GW_ERROR_STALL_THRESHOLD_SECS", 60),
+            artifact_scan_interval_secs: env_or("GW_ARTIFACT_SCAN_INTERVAL_SECS", 15),
+            pipeline_timeout: Duration::from_secs(
+                env_or("GW_PIPELINE_TIMEOUT_SECS", 6 * 3600),
+            ),
+            checkpoint_poll_interval_secs: env_or("GW_CHECKPOINT_POLL_INTERVAL_SECS", 10),
+            max_crash_retries: env_or("GW_MAX_CRASH_RETRIES", 5) as u32,
+            error_confirm_medium_secs: env_or("GW_ERROR_CONFIRM_MEDIUM_SECS", 15 * 60),
+            error_confirm_high_secs: env_or("GW_ERROR_CONFIRM_HIGH_SECS", 5 * 60),
+        }
+    }
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+fn env_or(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_values() {
+        let config = WatchdogConfig::from_env();
+        // These are the defaults when no env vars are set
+        assert_eq!(config.idle_nudge_secs, 300);
+        assert_eq!(config.idle_kill_secs, 1800);
+        assert_eq!(config.error_stall_threshold_secs, 60);
+        assert_eq!(config.artifact_scan_interval_secs, 15);
+        assert_eq!(config.checkpoint_poll_interval_secs, 10);
+        assert_eq!(config.pipeline_timeout, Duration::from_secs(6 * 3600));
+        assert_eq!(config.max_crash_retries, 5);
+        assert_eq!(config.error_confirm_medium_secs, 15 * 60);
+        assert_eq!(config.error_confirm_high_secs, 5 * 60);
+    }
+}
