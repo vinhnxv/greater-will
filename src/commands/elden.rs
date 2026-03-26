@@ -43,6 +43,70 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+// ─── Session ID Management ──────────────────────────────────────────
+
+/// File where session UUID is persisted for cross-hook access.
+const SESSION_ID_FILE: &str = ".gw/session_id";
+
+/// Resolve session ID from available sources (priority order):
+///   1. GW_SESSION_ID env var
+///   2. Persisted .gw/session_id file (written by SessionStart hook)
+///   3. Stdin JSON from Claude Code
+///   4. "unknown" fallback
+///
+/// Same pattern as gastown's readHookSessionID().
+fn resolve_session_id(hook_input: &Option<HookInput>) -> String {
+    // 1. Env var (set by gw monitor or prior hook)
+    if let Ok(id) = std::env::var("GW_SESSION_ID") {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+
+    // 2. Persisted file (written by SessionStart hook)
+    if let Ok(content) = std::fs::read_to_string(SESSION_ID_FILE) {
+        let id = content.lines().next().unwrap_or("").trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+
+    // 3. Stdin JSON (Claude Code sends session_id)
+    if let Some(input) = hook_input {
+        if let Some(ref id) = input.session_id {
+            if !id.is_empty() {
+                return id.clone();
+            }
+        }
+    }
+
+    // 4. Fallback
+    "unknown".to_string()
+}
+
+/// Persist session ID to file and env var.
+///
+/// Called by SessionStart hook so subsequent hooks (Stop, StopFailure, etc.)
+/// can find the session ID without needing stdin JSON.
+fn persist_session_id(session_id: &str) {
+    // Write to file
+    if let Some(parent) = Path::new(SESSION_ID_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = format!("{}\n{}\n", session_id, Utc::now().to_rfc3339());
+    let _ = std::fs::write(SESSION_ID_FILE, content);
+
+    // Set env var for child processes
+    std::env::set_var("GW_SESSION_ID", session_id);
+}
+
+/// Read the persisted session ID (for use by monitor loop).
+pub fn read_persisted_session_id() -> Option<String> {
+    let content = std::fs::read_to_string(SESSION_ID_FILE).ok()?;
+    let id = content.lines().next()?.trim().to_string();
+    if id.is_empty() { None } else { Some(id) }
+}
+
 /// Hook event source — how the session was initiated.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,17 +135,16 @@ pub fn execute() -> Result<()> {
     // 1. Read hook input from stdin (non-blocking with timeout)
     let hook_input = read_hook_input();
 
-    let session_id = hook_input
-        .as_ref()
-        .and_then(|h| h.session_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    // 2. Resolve and persist session ID
+    let session_id = resolve_session_id(&hook_input);
+    persist_session_id(&session_id);
 
     let source = hook_input
         .as_ref()
         .and_then(|h| h.source.clone())
         .unwrap_or(HookSource::Startup);
 
-    // 2. Route by source — compact/resume get brief context
+    // 3. Route by source — compact/resume get brief context
     match source {
         HookSource::Compact | HookSource::Resume => {
             print_brief_context(&session_id, &source)?;
@@ -126,12 +189,8 @@ pub fn execute_event(event: &str) -> Result<()> {
 /// instead of waiting for process death or text pattern matching.
 fn handle_stop_event() -> Result<()> {
     let hook_input = read_hook_input();
-    let session_id = hook_input
-        .as_ref()
-        .and_then(|h| h.session_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let session_id = resolve_session_id(&hook_input);
 
-    // Read checkpoint to include final state
     let checkpoint_info = detect_arc_checkpoint();
 
     let signal = json!({
@@ -163,10 +222,7 @@ fn handle_stop_event() -> Result<()> {
 /// Note: Claude Code ignores stdout and exit code for this hook.
 fn handle_stop_failure_event() -> Result<()> {
     let hook_input = read_hook_input();
-    let session_id = hook_input
-        .as_ref()
-        .and_then(|h| h.session_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let session_id = resolve_session_id(&hook_input);
 
     let checkpoint_info = detect_arc_checkpoint();
 
@@ -196,10 +252,7 @@ fn handle_stop_failure_event() -> Result<()> {
 /// clean exit from crash.
 fn handle_session_end_event() -> Result<()> {
     let hook_input = read_hook_input();
-    let session_id = hook_input
-        .as_ref()
-        .and_then(|h| h.session_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let session_id = resolve_session_id(&hook_input);
 
     let checkpoint_info = detect_arc_checkpoint();
     let is_complete = checkpoint_info
@@ -233,8 +286,12 @@ fn handle_session_end_event() -> Result<()> {
 /// misclassifying permission waits as "stuck" sessions.
 /// The monitor should reset its idle timer when this file is fresh.
 fn handle_permission_event() -> Result<()> {
+    let hook_input = read_hook_input();
+    let session_id = resolve_session_id(&hook_input);
+
     let signal = json!({
         "event": "permission_request",
+        "session_id": session_id,
         "timestamp": Utc::now().to_rfc3339(),
     });
 
@@ -247,9 +304,10 @@ fn handle_permission_event() -> Result<()> {
 
 // ─── Signal File Reader (for monitor loop) ──────────────────────────
 
-/// Check if a stop signal file exists and is recent (within threshold).
+/// Check if a stop signal file exists.
 ///
 /// Used by the monitor loop to detect clean session exit.
+/// If `expected_session_id` is Some, validates the signal belongs to this session.
 pub fn read_stop_signal() -> Option<Value> {
     read_signal_file("session-stop.json")
 }
@@ -260,11 +318,28 @@ pub fn read_session_end_signal() -> Option<Value> {
 }
 
 /// Check if an API error signal exists (from StopFailure hook).
-///
-/// This is the most reliable way to detect API errors — Claude Code itself
-/// reports the failure via hook, no text matching needed.
 pub fn read_stop_failure_signal() -> Option<Value> {
     read_signal_file("stop-failure.json")
+}
+
+/// Read a signal file and validate it belongs to the expected session.
+///
+/// Returns None if the signal is for a different session.
+/// This prevents cross-session signal contamination when multiple
+/// gw instances run in the same project directory.
+pub fn read_signal_for_session(filename: &str, expected_session_id: &str) -> Option<Value> {
+    let signal = read_signal_file(filename)?;
+    let signal_session = signal.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Accept if session matches or if either side is "unknown"
+    if signal_session == expected_session_id
+        || signal_session == "unknown"
+        || expected_session_id == "unknown"
+    {
+        Some(signal)
+    } else {
+        None
+    }
 }
 
 /// Check if a permission-pending signal exists and is recent.
