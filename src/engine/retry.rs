@@ -48,7 +48,11 @@ use std::time::Duration;
 /// Minimum stall duration before error keywords are considered meaningful.
 /// Below this threshold, keyword matches are ignored because Claude Code
 /// is likely still actively working.
-const ERROR_STALL_THRESHOLD_SECS: u64 = 30;
+///
+/// Set to 60s because Claude routinely "thinks" for 30-45s without screen
+/// updates. A 30s threshold caused false-positive kills during normal
+/// thinking pauses.
+const ERROR_STALL_THRESHOLD_SECS: u64 = 60;
 
 /// Evidence collected for error diagnosis.
 ///
@@ -125,7 +129,19 @@ impl ErrorEvidence {
     }
 
     /// Whether confidence is high enough to act on the error.
+    ///
+    /// Requires at least one actual error indicator (keyword match or process
+    /// death) before acting. Screen stall + checkpoint staleness alone is NOT
+    /// an error — it's handled by the idle detection system (nudge at 180s,
+    /// kill at 300s). Without this gate, normal Claude "thinking" pauses
+    /// (30-60s of no output) combined with checkpoint staleness would falsely
+    /// trigger kills, especially during agent team execution when the team
+    /// lead waits for teammates.
     pub fn should_act(&self) -> bool {
+        // No error indicator at all → defer to idle detection, not error detection
+        if self.keyword_match.is_none() && self.process_alive {
+            return false;
+        }
         self.confidence() >= 0.5
     }
 
@@ -661,9 +677,10 @@ mod tests {
     #[test]
     fn test_evidence_stall_alone_not_enough() {
         // Screen stall + fresh checkpoint = 0.3 - 0.2 = 0.1 → should NOT act
+        // (also blocked by no-keyword gate)
         let evidence = ErrorEvidence {
             keyword_match: None,
-            screen_stall_secs: 60,
+            screen_stall_secs: 120,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
         };
@@ -677,7 +694,7 @@ mod tests {
         // This is the key scenario: Claude waiting for teammates with auth keyword in output
         let evidence = ErrorEvidence {
             keyword_match: Some(ErrorClass::AuthError),
-            screen_stall_secs: 60,
+            screen_stall_secs: 120,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
         };
@@ -701,15 +718,32 @@ mod tests {
     }
 
     #[test]
-    fn test_evidence_stall_plus_checkpoint_stale_reaches_threshold() {
-        // Screen stall + checkpoint stale = 0.3 + 0.3 = 0.6 → should act (as Unknown)
+    fn test_evidence_stall_plus_checkpoint_stale_no_keyword_no_action() {
+        // Screen stall + checkpoint stale but no keyword and process alive
+        // → should NOT act. This is idle behavior, not an error.
+        // The idle detection system (nudge at 180s, kill at 300s) handles this.
         let evidence = ErrorEvidence {
             keyword_match: None,
-            screen_stall_secs: 60,
-            checkpoint_stale_secs: Some(60),
+            screen_stall_secs: 120,
+            checkpoint_stale_secs: Some(120),
             process_alive: true,
         };
         assert_eq!(evidence.confidence(), 0.6);
+        assert!(!evidence.should_act()); // No error indicator → idle, not error
+        assert!(evidence.classify().is_none());
+    }
+
+    #[test]
+    fn test_evidence_stall_plus_checkpoint_stale_process_dead_acts() {
+        // Screen stall + checkpoint stale + process dead → should act
+        // Process death IS an error indicator
+        let evidence = ErrorEvidence {
+            keyword_match: None,
+            screen_stall_secs: 120,
+            checkpoint_stale_secs: Some(120),
+            process_alive: false,
+        };
+        assert!(evidence.confidence() >= 0.5);
         assert!(evidence.should_act());
         assert_eq!(evidence.classify(), Some(ErrorClass::Unknown));
     }
@@ -732,8 +766,8 @@ mod tests {
         // All signals → capped at 1.0
         let evidence = ErrorEvidence {
             keyword_match: Some(ErrorClass::ApiOverload),
-            screen_stall_secs: 60,
-            checkpoint_stale_secs: Some(60),
+            screen_stall_secs: 120,
+            checkpoint_stale_secs: Some(120),
             process_alive: false,
         };
         assert_eq!(evidence.confidence(), 1.0);
@@ -758,9 +792,10 @@ mod tests {
     #[test]
     fn test_evidence_no_checkpoint_exists() {
         // No checkpoint at all = None → no checkpoint contribution (positive or negative)
+        // Keyword + stall (≥60s threshold) = 0.2 + 0.3 = 0.5 → should act
         let evidence = ErrorEvidence {
             keyword_match: Some(ErrorClass::AuthError),
-            screen_stall_secs: 60,
+            screen_stall_secs: 120,
             checkpoint_stale_secs: None,
             process_alive: true,
         };
@@ -772,6 +807,7 @@ mod tests {
     fn test_evidence_claude_waiting_for_teammates() {
         // Claude teamlead waiting: screen idle, keyword in output, BUT checkpoint fresh
         // This is normal during agent team execution → should NOT kill
+        // keyword=0.2 + stall(120s>=60s)=0.3 + checkpoint_fresh=-0.2 = 0.3 < 0.5
         let evidence = ErrorEvidence {
             keyword_match: Some(ErrorClass::AuthError),
             screen_stall_secs: 120, // 2 min stall
