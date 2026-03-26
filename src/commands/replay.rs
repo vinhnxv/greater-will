@@ -12,7 +12,7 @@ use std::path::PathBuf;
 /// # Arguments
 ///
 /// * `checkpoint` - Path to the checkpoint file to resume from
-pub fn execute(checkpoint: PathBuf) -> Result<()> {
+pub fn execute(checkpoint: PathBuf, resume: bool, force: bool) -> Result<()> {
     // Check if checkpoint file exists
     if !checkpoint.exists() {
         eyre::bail!("Checkpoint file not found: {}", checkpoint.display());
@@ -34,7 +34,57 @@ pub fn execute(checkpoint: PathBuf) -> Result<()> {
     // Display checkpoint info
     print_checkpoint_table(&cp);
 
-    Ok(())
+    if !resume {
+        return Ok(());
+    }
+
+    // --- Resume path ---
+    use crate::checkpoint::reader::{next_pending_phase, validate_before_resume};
+
+    let next_phase = next_pending_phase(&cp)
+        .ok_or_else(|| eyre::eyre!("All phases are completed or skipped. Nothing to resume."))?;
+
+    println!();
+    println!("Next pending phase: {}", next_phase);
+
+    if !force {
+        let arc_dir = checkpoint.parent()
+            .ok_or_else(|| eyre::eyre!("Cannot determine arc directory from checkpoint path"))?;
+        let validation = validate_before_resume(&cp, arc_dir)?;
+        for warning in &validation.warnings {
+            println!("  WARN: {}", warning);
+        }
+        for error in &validation.errors {
+            println!("  ERROR: {}", error);
+        }
+        if !validation.can_resume() {
+            println!();
+            println!("Resume blocked: {} critical artifact(s) missing.", validation.errors.len());
+            println!("Phases to re-run: {:?}", validation.phases_to_reset);
+            println!("Use --force to skip validation.");
+            eyre::bail!("Pre-resume validation failed");
+        }
+    }
+
+    let plan_path = std::path::PathBuf::from(&cp.plan_file);
+    if !plan_path.exists() {
+        eyre::bail!("Plan file not found: {}. Cannot resume.", cp.plan_file);
+    }
+
+    println!();
+    println!("Resuming from phase: {}", next_phase);
+
+    use crate::engine::single_session::{SingleSessionConfig, run_single_session};
+    let cwd = std::env::current_dir()?;
+    let ss_config = SingleSessionConfig::new(&cwd).with_resume();
+    let result = run_single_session(&plan_path, &ss_config)?;
+
+    if result.success {
+        println!("Resume completed successfully ({:.1}s)", result.duration.as_secs_f64());
+        Ok(())
+    } else {
+        eyre::bail!("Resume failed: {}", result.message);
+    }
 }
 
 /// Print checkpoint in tabular format.

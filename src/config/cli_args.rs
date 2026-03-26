@@ -108,6 +108,14 @@ pub enum Commands {
     Replay {
         /// Path to the checkpoint file.
         checkpoint: PathBuf,
+
+        /// Actually resume execution (not just display status).
+        #[arg(long)]
+        resume: bool,
+
+        /// Skip pre-resume artifact validation.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Inject workspace context into Claude Code session (hook command).

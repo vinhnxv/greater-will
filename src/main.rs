@@ -63,7 +63,9 @@ fn main() -> Result<()> {
             }
         }
         commands::Commands::Status => commands::status::execute(),
-        commands::Commands::Replay { checkpoint } => commands::replay::execute(checkpoint),
+        commands::Commands::Replay { checkpoint, resume, force } => {
+            commands::replay::execute(checkpoint, resume, force)
+        }
         commands::Commands::Clean => commands::clean::execute(),
     }
 }
