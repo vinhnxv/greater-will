@@ -265,30 +265,75 @@ pub fn has_prompt_in_last_line(session_id: &str) -> Result<bool> {
 /// Detect error patterns in pane output.
 ///
 /// Returns an error class if a known error pattern is found.
+///
+/// Only scans the last 10 lines of pane output to avoid false positives
+/// from code snippets, documentation, or log history in the scrollback.
 pub fn detect_error_pattern(content: &str) -> Option<String> {
-    let content_lower = content.to_lowercase();
+    // Only check the tail of the pane — errors that matter are recent.
+    // Scanning the full pane causes false positives when Claude's output
+    // contains error keywords in code, docs, or logs.
+    let tail: String = content
+        .lines()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
 
-    // Check for common error patterns
-    let patterns = [
+    // Require error-adjacent context: the keyword must appear near
+    // an indicator that it's an actual error, not just mentioned in output.
+    let error_indicators = ["error", "failed", "fatal", "exception", "❌"];
+    let has_error_context = error_indicators.iter().any(|ind| tail.contains(ind));
+
+    // Billing/auth patterns — these are specific enough to match without extra context
+    let fatal_patterns = [
         ("billing", "billing_error"),
         ("payment required", "billing_error"),
         ("subscription expired", "billing_error"),
         ("authentication_error", "auth_error"),
         ("invalid_api_key", "auth_error"),
-        ("unauthorized", "auth_error"),
-        ("rate_limit", "rate_limit"),
-        ("429", "rate_limit"),
-        ("too many requests", "rate_limit"),
-        ("overloaded", "api_overload"),
-        ("529", "api_overload"),
-        ("server_error", "api_overload"),
-        ("502", "api_overload"),
-        ("503", "api_overload"),
     ];
 
-    for (pattern, error_type) in patterns {
-        if content_lower.contains(pattern) {
+    for (pattern, error_type) in fatal_patterns {
+        if tail.contains(pattern) {
             return Some(error_type.to_string());
+        }
+    }
+
+    // Rate limit / overload patterns — require error context to avoid false positives
+    // from code that mentions "429" or "rate_limit" as strings.
+    if has_error_context {
+        let contextual_patterns = [
+            ("rate_limit", "rate_limit"),
+            ("too many requests", "rate_limit"),
+            ("overloaded", "api_overload"),
+            ("server_error", "api_overload"),
+        ];
+
+        for (pattern, error_type) in contextual_patterns {
+            if tail.contains(pattern) {
+                return Some(error_type.to_string());
+            }
+        }
+
+        // HTTP status codes need even more care — only match as standalone tokens
+        let status_code_patterns = [
+            ("429", "rate_limit"),
+            ("529", "api_overload"),
+            ("502", "api_overload"),
+            ("503", "api_overload"),
+        ];
+
+        for (code, error_type) in status_code_patterns {
+            // Check that the code isn't part of a longer number (e.g., port 5293)
+            for word in tail.split_whitespace() {
+                if word.trim_matches(|c: char| !c.is_ascii_digit()) == code {
+                    return Some(error_type.to_string());
+                }
+            }
         }
     }
 
@@ -419,7 +464,8 @@ mod tests {
 
     #[test]
     fn test_detect_error_pattern_billing() {
-        let content = "Error: billing payment required";
+        // Billing patterns are specific enough to match without error context
+        let content = "billing payment required";
         assert_eq!(
             detect_error_pattern(content),
             Some("billing_error".to_string())
@@ -427,7 +473,8 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_error_pattern_rate_limit() {
+    fn test_detect_error_pattern_rate_limit_with_context() {
+        // Rate limit requires error context (e.g., "error" keyword nearby)
         let content = "Error: rate_limit exceeded (429)";
         assert_eq!(
             detect_error_pattern(content),
@@ -436,9 +483,26 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_error_pattern_rate_limit_no_context() {
+        // rate_limit mentioned without error context → no match (avoids false positives)
+        let content = "The retry module handles rate_limit with backoff";
+        assert_eq!(detect_error_pattern(content), None);
+    }
+
+    #[test]
     fn test_detect_error_pattern_none() {
         let content = "Normal output without errors";
         assert_eq!(detect_error_pattern(content), None);
+    }
+
+    #[test]
+    fn test_detect_error_pattern_ignores_old_scrollback() {
+        // Error in early lines (beyond last 10) should be ignored
+        let mut content = "Error: rate_limit exceeded\n".to_string();
+        for i in 0..20 {
+            content.push_str(&format!("normal output line {}\n", i));
+        }
+        assert_eq!(detect_error_pattern(&content), None);
     }
 
     #[test]

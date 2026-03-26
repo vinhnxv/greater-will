@@ -20,7 +20,8 @@
 //! | Complexity      | Low                      | High                          |
 
 use crate::cleanup::{self, startup_cleanup};
-use crate::session::detect::{capture_pane, detect_error_pattern};
+use crate::engine::retry::ErrorClass;
+use crate::session::detect::capture_pane;
 use crate::session::spawn::{
     has_session, kill_session, send_keys_with_workaround, spawn_claude_session,
     SpawnConfig,
@@ -265,6 +266,54 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 );
                 std::thread::sleep(Duration::from_secs(5));
             }
+            SessionOutcome::ErrorDetected { error_class, reason } => {
+                // Auth/billing errors are fatal — skip immediately, no retry
+                if error_class.skips_plan() {
+                    return Ok(PipelineResult {
+                        success: false,
+                        duration: start.elapsed(),
+                        crash_restarts,
+                        message: format!("Fatal error (no retry): {}", reason),
+                        session_name,
+                    });
+                }
+
+                crash_restarts += 1;
+                is_first_run = false;
+
+                if crash_restarts > error_class.max_retries() {
+                    return Ok(PipelineResult {
+                        success: false,
+                        duration: start.elapsed(),
+                        crash_restarts,
+                        message: format!(
+                            "Pipeline failed after {} retries for {:?}. Last: {}",
+                            crash_restarts, error_class, reason
+                        ),
+                        session_name,
+                    });
+                }
+
+                let backoff = error_class.backoff_for_attempt(crash_restarts - 1);
+                warn!(
+                    restart = crash_restarts,
+                    max = error_class.max_retries(),
+                    backoff_secs = backoff.as_secs(),
+                    error_class = ?error_class,
+                    reason = %reason,
+                    "Error detected, will restart with --resume after backoff"
+                );
+                println!(
+                    "[gw] {:?} error ({}/{}): {}. Waiting {}s before restart...",
+                    error_class,
+                    crash_restarts,
+                    error_class.max_retries(),
+                    reason,
+                    backoff.as_secs(),
+                );
+
+                std::thread::sleep(backoff);
+            }
         }
     }
 }
@@ -280,6 +329,11 @@ enum SessionOutcome {
     Timeout,
     /// Session stuck (no output for too long).
     Stuck,
+    /// A classified error was detected in pane output (rate limit, overload, auth).
+    ErrorDetected {
+        error_class: ErrorClass,
+        reason: String,
+    },
 }
 
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
@@ -423,12 +477,14 @@ fn run_session_attempt(
         }
 
         // Check for error patterns in pane output (billing, auth, rate limit, etc.)
-        if let Some(error_type) = detect_error_pattern(&pane_content) {
-            warn!(error_type = %error_type, "Error pattern detected in pane output");
-            println!("[gw] Error detected: {} — killing session", error_type);
+        // Use ErrorClass for proper classification — rate limits get backoff, auth skips plan.
+        if let Some(error_class) = ErrorClass::from_pane_output(&pane_content) {
+            warn!(error_class = ?error_class, "Error pattern detected in pane output");
+            println!("[gw] Error detected: {:?} — killing session", error_class);
             kill_session(session_name)?;
-            return Ok(SessionOutcome::Crashed {
-                reason: format!("Error pattern detected: {}", error_type),
+            return Ok(SessionOutcome::ErrorDetected {
+                reason: format!("Error pattern detected: {:?}", error_class),
+                error_class,
             });
         }
 

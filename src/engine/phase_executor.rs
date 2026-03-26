@@ -579,6 +579,27 @@ impl PhaseGroupExecutor {
                         phases: group.phases.clone(),
                     });
                 }
+                CompletionEvent::ErrorDetected { error_class } => {
+                    warn!(
+                        group = %group.name,
+                        error_class = ?error_class,
+                        "Error pattern detected in pane output"
+                    );
+                    kill_session(session_id)?;
+                    return Ok(PhaseGroupResult {
+                        group_name: group.name.clone(),
+                        state: PhaseGroupState::Failed {
+                            retries: 0,
+                            error: error_class,
+                        },
+                        session_id: Some(session_id.to_string()),
+                        pid,
+                        duration: start.elapsed(),
+                        retries: 0,
+                        error_message: Some(format!("Error detected: {:?}", error_class)),
+                        phases: group.phases.clone(),
+                    });
+                }
                 CompletionEvent::Nudge => {
                     if !nudge_sent {
                         info!(group = %group.name, "Sending nudge");

@@ -43,6 +43,7 @@
 use crate::checkpoint::phase_order::phase_index;
 use crate::checkpoint::reader::read_checkpoint;
 use crate::checkpoint::schema::Checkpoint;
+use crate::engine::retry::ErrorClass;
 use color_eyre::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -151,6 +152,8 @@ pub enum CompletionEvent {
     Timeout,
     /// Prompt detected, checkpoint unchanged after grace period.
     PromptReturned,
+    /// An error pattern was detected in the pane output.
+    ErrorDetected { error_class: ErrorClass },
 }
 
 /// Completion detector for a single phase group.
@@ -222,6 +225,15 @@ impl CompletionDetector {
                 "Phase timeout exceeded"
             );
             return Ok(CompletionEvent::Timeout);
+        }
+
+        // Layer 0 (highest priority after timeout): Check for error patterns.
+        // Detects rate limits, auth errors, overload — must fire before idle/prompt
+        // checks, otherwise the session wastes minutes appearing "stuck" when
+        // the real cause is an API error.
+        if let Some(error_class) = ErrorClass::from_pane_output(pane_content) {
+            tracing::warn!(error_class = ?error_class, "Error pattern detected in pane output");
+            return Ok(CompletionEvent::ErrorDetected { error_class });
         }
 
         // Layer 1: Read checkpoint
