@@ -285,10 +285,19 @@ pub fn detect_error_pattern(content: &str) -> Option<String> {
 
     // Require error-adjacent context: the keyword must appear near
     // an indicator that it's an actual error, not just mentioned in output.
-    let error_indicators = ["error", "failed", "fatal", "exception", "❌"];
-    let has_error_context = error_indicators.iter().any(|ind| tail.contains(ind));
+    // Uses line-level matching to avoid false positives from identifiers
+    // like "ErrorClass" or "AuthError" in Claude's code output.
+    let has_error_context = tail.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("error:") || trimmed.starts_with("error ")
+            || trimmed.starts_with("fatal:") || trimmed.starts_with("fatal ")
+            || trimmed.starts_with("exception:") || trimmed.starts_with("exception ")
+            || trimmed.starts_with("failed")
+            || trimmed.contains("❌")
+    });
 
-    // Billing/auth patterns — these are specific enough to match without extra context
+    // Billing/auth patterns — also require error context to avoid false positives
+    // from Claude writing about these patterns in code or plans.
     let fatal_patterns = [
         ("billing", "billing_error"),
         ("payment required", "billing_error"),
@@ -297,9 +306,11 @@ pub fn detect_error_pattern(content: &str) -> Option<String> {
         ("invalid_api_key", "auth_error"),
     ];
 
-    for (pattern, error_type) in fatal_patterns {
-        if tail.contains(pattern) {
-            return Some(error_type.to_string());
+    if has_error_context {
+        for (pattern, error_type) in fatal_patterns {
+            if tail.contains(pattern) {
+                return Some(error_type.to_string());
+            }
         }
     }
 
@@ -463,13 +474,21 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_error_pattern_billing() {
-        // Billing patterns are specific enough to match without error context
-        let content = "billing payment required";
+    fn test_detect_error_pattern_billing_with_context() {
+        // Billing pattern WITH error context → match
+        let content = "error: billing payment required";
         assert_eq!(
             detect_error_pattern(content),
             Some("billing_error".to_string())
         );
+    }
+
+    #[test]
+    fn test_detect_error_pattern_billing_no_context() {
+        // Billing keyword without error context → no match
+        // (Claude writing about billing in code/plans)
+        let content = "billing payment required";
+        assert_eq!(detect_error_pattern(content), None);
     }
 
     #[test]

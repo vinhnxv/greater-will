@@ -22,7 +22,7 @@
 use crate::checkpoint::reader::find_checkpoint_for_plan;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
-use crate::engine::retry::ErrorClass;
+use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
     has_session, kill_session, send_keys_with_workaround, spawn_claude_session,
@@ -401,6 +401,8 @@ fn run_session_attempt(
     let mut last_status_log = Instant::now();
     let mut poll_count: u64 = 0;
     let mut last_checkpoint_poll = Instant::now();
+    let mut last_checkpoint_activity = Instant::now();
+    let mut last_checkpoint_hash: Option<u64> = None;
 
     /// Minimum session duration to consider a "real" run (not an instant crash).
     /// If the session dies within this window after dispatch, it's a crash.
@@ -559,6 +561,17 @@ fn run_session_attempt(
                     kill_session(session_name)?;
                     return Ok(SessionOutcome::Completed);
                 }
+
+                // Track checkpoint heartbeat — hash the current phase to detect changes
+                let mut cp_hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&checkpoint.current_phase().unwrap_or("none"), &mut cp_hasher);
+                std::hash::Hash::hash(&checkpoint.count_by_status("completed"), &mut cp_hasher);
+                let cp_hash = std::hash::Hasher::finish(&cp_hasher);
+
+                if last_checkpoint_hash.map_or(true, |h| h != cp_hash) {
+                    last_checkpoint_activity = Instant::now();
+                }
+                last_checkpoint_hash = Some(cp_hash);
             }
         }
 
@@ -578,16 +591,64 @@ fn run_session_attempt(
             return Ok(SessionOutcome::Completed);
         }
 
-        // Check for error patterns in pane output (billing, auth, rate limit, etc.)
-        // Use ErrorClass for proper classification — rate limits get backoff, auth skips plan.
-        if let Some(error_class) = ErrorClass::from_pane_output(&pane_content) {
-            warn!(error_class = ?error_class, "Error pattern detected in pane output");
-            println!("[gw] Error detected: {:?} — killing session", error_class);
+        // Evidence-based error detection.
+        // Error keywords are the LOWEST confidence signal — Claude Code often
+        // discusses auth, billing, HTTP codes in normal output (code, plans, docs).
+        // Only act when multiple signals confirm an error:
+        //   - Screen stalled (pane unchanged)
+        //   - Error keyword matched in tail
+        //   - Checkpoint not updating (heartbeat stale)
+        //   - Process may be dead
+        let screen_stall_secs = last_activity.elapsed().as_secs();
+        let keyword_match = if current_hash == last_output_hash {
+            // Only scan for keywords when screen is not changing
+            ErrorClass::from_pane_output(&pane_content)
+        } else {
+            None
+        };
+
+        let evidence = ErrorEvidence {
+            keyword_match,
+            screen_stall_secs,
+            checkpoint_stale_secs: Some(last_checkpoint_activity.elapsed().as_secs()),
+            process_alive: crate::cleanup::process::is_pid_alive(pid),
+        };
+
+        if let Some(error_class) = evidence.classify() {
+            warn!(
+                error_class = ?error_class,
+                confidence = evidence.confidence(),
+                screen_stall_secs = screen_stall_secs,
+                checkpoint_stale_secs = last_checkpoint_activity.elapsed().as_secs(),
+                keyword = ?evidence.keyword_match,
+                process_alive = evidence.process_alive,
+                "Error evidence threshold reached — multiple signals confirm error"
+            );
+            println!(
+                "[gw] Error detected: {:?} (confidence={:.1}, stall={}s) — killing session",
+                error_class,
+                evidence.confidence(),
+                screen_stall_secs,
+            );
             kill_session(session_name)?;
             return Ok(SessionOutcome::ErrorDetected {
-                reason: format!("Error pattern detected: {:?}", error_class),
+                reason: format!(
+                    "Error pattern detected: {:?} (confidence={:.1}, stall={}s, checkpoint_stale={}s)",
+                    error_class,
+                    evidence.confidence(),
+                    screen_stall_secs,
+                    last_checkpoint_activity.elapsed().as_secs(),
+                ),
                 error_class,
             });
+        } else if evidence.keyword_match.is_some() {
+            // Keyword matched but confidence too low — log and continue monitoring
+            debug!(
+                keyword = ?evidence.keyword_match,
+                confidence = evidence.confidence(),
+                screen_stall_secs = screen_stall_secs,
+                "Error keyword found but confidence too low — Claude likely still active"
+            );
         }
 
         // Check if Claude process is still alive (tmux session may exist but process dead)

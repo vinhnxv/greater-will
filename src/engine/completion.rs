@@ -1,24 +1,37 @@
-//! 4-layer completion detection for phase group monitoring.
+//! Evidence-based completion detection for phase group monitoring.
 //!
 //! This module implements the detection system that monitors running
 //! phase groups and determines when they have completed (or failed).
 //!
-//! # Detection Layers
+//! # Detection Model
+//!
+//! No single signal triggers a kill decision. Multiple signals are collected
+//! as evidence and combined into a confidence score via [`ErrorEvidence`].
+//! Only when combined confidence exceeds the action threshold (≥ 0.5) does
+//! the detector recommend action.
+//!
+//! # Signal Sources
 //!
 //! 1. **Checkpoint Polling (PRIMARY)**: Poll `checkpoint.json` every 3 seconds
-//!    for status changes. When the last phase in a group shows "completed",
-//!    the group is done.
+//!    for status changes. Also serves as a heartbeat — if checkpoint stops
+//!    updating, the session may be stuck or errored.
 //!
-//! 2. **Phase Timeout (SAFETY NET)**: Each group has a configurable timeout.
-//!    If exceeded, the session is killed and classified as `ErrorClass::Timeout`.
+//! 2. **Phase Timeout (SAFETY NET)**: Hard timeout per phase group.
+//!    If exceeded, kill unconditionally.
 //!
-//! 3. **Idle Detection + Nudge (ANTI-STALL)**: Monitor pane output hash.
-//!    After 3 minutes of no changes, send "please continue" via send-keys.
-//!    After 5 minutes, kill session and classify as `ErrorClass::Stuck`.
+//! 3. **Screen Activity**: Track pane output hash changes. When Claude is
+//!    actively producing output, error keywords are ignored (they're likely
+//!    from code, plans, or documentation).
 //!
-//! 4. **Prompt Return Detection (SECONDARY)**: Detect `❯` prompt in last line.
+//! 4. **Idle Detection + Nudge (ANTI-STALL)**: After 3 minutes of no screen
+//!    changes, send "please continue". After 5 minutes, kill as stuck.
+//!
+//! 5. **Error Keywords (LOW CONFIDENCE)**: Scan tail of pane for auth/billing/
+//!    rate limit patterns. Only meaningful when combined with stall + checkpoint
+//!    staleness. Keyword alone = 0.2 confidence (not enough to act).
+//!
+//! 6. **Prompt Return (SECONDARY)**: Detect `❯` prompt in last line.
 //!    If prompt appears but checkpoint hasn't updated, wait 5s and recheck.
-//!    Used as secondary signal, not primary (prompt can appear mid-execution).
 //!
 //! # Example
 //!
@@ -43,7 +56,7 @@
 use crate::checkpoint::phase_order::phase_index;
 use crate::checkpoint::reader::read_checkpoint;
 use crate::checkpoint::schema::Checkpoint;
-use crate::engine::retry::ErrorClass;
+use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use color_eyre::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -119,6 +132,10 @@ pub struct CompletionState {
     pub prompt_detected_at: Option<Instant>,
     /// Phase sequence when detection started.
     pub starting_phase_sequence: Option<u32>,
+    /// When the checkpoint last changed (heartbeat tracking).
+    pub last_checkpoint_activity: Instant,
+    /// Hash of last checkpoint content (for staleness detection).
+    pub last_checkpoint_hash: Option<u64>,
 }
 
 impl Default for CompletionState {
@@ -131,6 +148,8 @@ impl Default for CompletionState {
             nudged: false,
             prompt_detected_at: None,
             starting_phase_sequence: None,
+            last_checkpoint_activity: Instant::now(),
+            last_checkpoint_hash: None,
         }
     }
 }
@@ -209,15 +228,23 @@ impl CompletionDetector {
     ///
     /// This should be called every `config.poll_interval`.
     ///
-    /// # Arguments
+    /// # Detection Model
     ///
-    /// * `pane_content` - Current content of the tmux pane (for idle detection)
+    /// No single signal triggers a kill. Instead, multiple signals are
+    /// collected as evidence and combined into a confidence score:
     ///
-    /// # Returns
+    /// 1. **Checkpoint** (primary): completion/failure status
+    /// 2. **Timeout** (safety net): hard phase timeout
+    /// 3. **Screen activity**: pane hash changes → Claude is working
+    /// 4. **Checkpoint heartbeat**: checkpoint changes → Claude is progressing
+    /// 5. **Error keywords** (low confidence): only meaningful when stalled
+    /// 6. **Prompt return**: Claude returned to prompt without completing
     ///
-    /// A `CompletionEvent` indicating what action to take.
+    /// Error keywords are the **lowest confidence signal** — they only
+    /// contribute to a kill decision when combined with stall + checkpoint
+    /// staleness evidence.
     pub fn tick(&mut self, pane_content: &str) -> Result<CompletionEvent> {
-        // Layer 2: Check for phase timeout
+        // Hard timeout — this is unconditional (safety net)
         if self.elapsed() > self.config.phase_timeout {
             tracing::warn!(
                 elapsed_secs = self.elapsed().as_secs(),
@@ -227,32 +254,40 @@ impl CompletionDetector {
             return Ok(CompletionEvent::Timeout);
         }
 
-        // Layer 0 (highest priority after timeout): Check for error patterns.
-        // Detects rate limits, auth errors, overload — must fire before idle/prompt
-        // checks, otherwise the session wastes minutes appearing "stuck" when
-        // the real cause is an API error.
-        if let Some(error_class) = ErrorClass::from_pane_output(pane_content) {
-            tracing::warn!(error_class = ?error_class, "Error pattern detected in pane output");
-            return Ok(CompletionEvent::ErrorDetected { error_class });
-        }
+        // --- Collect signals ---
 
-        // Layer 1: Read checkpoint
+        // Signal 1: Screen activity (pane hash)
+        let pane_hash = compute_pane_hash(pane_content);
+        let pane_changed = self
+            .state
+            .last_pane_hash
+            .map_or(true, |h| h != pane_hash);
+
+        if pane_changed {
+            self.state.last_activity = Instant::now();
+            self.state.nudged = false;
+            self.state.prompt_detected_at = None;
+        }
+        self.state.last_pane_hash = Some(pane_hash);
+
+        let screen_stall_secs = self.state.last_activity.elapsed().as_secs();
+
+        // Signal 2: Checkpoint (primary completion/failure + heartbeat)
         let checkpoint_result = read_checkpoint(&self.checkpoint_path);
 
         match checkpoint_result {
             Ok(checkpoint) => {
-                // Initialize starting phase sequence if not set
                 if self.state.starting_phase_sequence.is_none() {
                     self.state.starting_phase_sequence = checkpoint.phase_sequence;
                 }
 
-                // Check if group is complete
+                // Completion check
                 if self.is_group_complete(&checkpoint) {
                     tracing::info!("Group completed successfully");
                     return Ok(CompletionEvent::Completed);
                 }
 
-                // Check for failed phase
+                // Failure check
                 if let Some(failed_phase) = self.find_failed_phase(&checkpoint) {
                     tracing::warn!(phase = %failed_phase, "Phase failed");
                     return Ok(CompletionEvent::Failed {
@@ -260,29 +295,47 @@ impl CompletionDetector {
                     });
                 }
 
-                // Detect checkpoint changes and log them
-                if let Some(ref prev) = self.state.last_checkpoint {
+                // Checkpoint heartbeat tracking — detect if checkpoint content changed
+                let checkpoint_hash = {
+                    let mut hasher = DefaultHasher::new();
+                    // Hash the phase statuses as a proxy for checkpoint content
                     for phase_name in &self.group_phases {
-                        let prev_status = prev.phases.get(phase_name).map(|s| s.status.as_str());
-                        let curr_status = checkpoint.phases.get(phase_name).map(|s| s.status.as_str());
-                        if prev_status != curr_status {
-                            tracing::info!(
-                                phase = %phase_name,
-                                from = ?prev_status,
-                                to = ?curr_status,
-                                "Phase status changed: {} -> {}",
-                                prev_status.unwrap_or("none"),
-                                curr_status.unwrap_or("none"),
-                            );
+                        if let Some(status) = checkpoint.phases.get(phase_name) {
+                            phase_name.hash(&mut hasher);
+                            status.status.hash(&mut hasher);
+                        }
+                    }
+                    hasher.finish()
+                };
+
+                if self.state.last_checkpoint_hash.map_or(true, |h| h != checkpoint_hash) {
+                    self.state.last_checkpoint_activity = Instant::now();
+
+                    // Log phase status changes
+                    if let Some(ref prev) = self.state.last_checkpoint {
+                        for phase_name in &self.group_phases {
+                            let prev_status =
+                                prev.phases.get(phase_name).map(|s| s.status.as_str());
+                            let curr_status =
+                                checkpoint.phases.get(phase_name).map(|s| s.status.as_str());
+                            if prev_status != curr_status {
+                                tracing::info!(
+                                    phase = %phase_name,
+                                    from = ?prev_status,
+                                    to = ?curr_status,
+                                    "Phase status changed: {} -> {}",
+                                    prev_status.unwrap_or("none"),
+                                    curr_status.unwrap_or("none"),
+                                );
+                            }
                         }
                     }
                 }
 
-                // Update state
+                self.state.last_checkpoint_hash = Some(checkpoint_hash);
                 self.state.last_checkpoint = Some(checkpoint);
             }
             Err(e) => {
-                // Checkpoint might not exist yet (early in phase)
                 tracing::debug!(
                     error = %e,
                     "Could not read checkpoint (may be early in phase)"
@@ -290,62 +343,87 @@ impl CompletionDetector {
             }
         }
 
-        // Layer 4: Check for prompt return
+        let checkpoint_stale_secs = Some(self.state.last_checkpoint_activity.elapsed().as_secs());
+
+        // Signal 3: Prompt return detection
         let prompt_returned = self.detect_prompt(pane_content);
         if prompt_returned {
             if let Some(detected_at) = self.state.prompt_detected_at {
-                // Prompt was already detected, check grace period
                 if detected_at.elapsed() > self.config.prompt_grace_period {
-                    // Re-read checkpoint to see if it updated
                     if let Ok(checkpoint) = read_checkpoint(&self.checkpoint_path) {
                         if self.is_group_complete(&checkpoint) {
                             return Ok(CompletionEvent::Completed);
                         }
                     }
-                    // Checkpoint unchanged after grace period
                     tracing::info!("Prompt detected but checkpoint unchanged after grace period");
                     return Ok(CompletionEvent::PromptReturned);
                 }
             } else {
-                // First time detecting prompt
                 self.state.prompt_detected_at = Some(Instant::now());
                 tracing::debug!("Prompt detected, starting grace period");
             }
         }
 
-        // Layer 3: Check for idle
-        let pane_hash = compute_pane_hash(pane_content);
+        // --- Evidence-based error detection ---
+        // Error keywords are only evaluated when the session is stalled.
+        // When Claude is actively producing output, keyword matches are
+        // ignored because they're likely from code/plans/docs content.
+        let keyword_match = if !pane_changed {
+            ErrorClass::from_pane_output(pane_content)
+        } else {
+            None
+        };
 
-        if let Some(last_hash) = self.state.last_pane_hash {
-            if pane_hash != last_hash {
-                // Pane content changed, update activity time
-                self.state.last_activity = Instant::now();
-                self.state.nudged = false;
-                self.state.prompt_detected_at = None; // Reset prompt detection
-            } else {
-                // Content unchanged - check idle thresholds
-                let idle_duration = self.state.last_activity.elapsed();
+        let evidence = ErrorEvidence {
+            keyword_match,
+            screen_stall_secs,
+            checkpoint_stale_secs,
+            // Process liveness is checked by the caller (single_session/phase_executor).
+            // CompletionDetector doesn't have access to the PID.
+            process_alive: true,
+        };
 
-                if idle_duration > self.config.idle_kill_after {
-                    tracing::warn!(
-                        idle_secs = idle_duration.as_secs(),
-                        kill_after_secs = self.config.idle_kill_after.as_secs(),
-                        "Session stuck (idle too long)"
-                    );
-                    return Ok(CompletionEvent::Stuck);
-                }
-
-                if idle_duration > self.config.idle_nudge_after && !self.state.nudged {
-                    tracing::info!(
-                        idle_secs = idle_duration.as_secs(),
-                        "Session idle, should nudge"
-                    );
-                    return Ok(CompletionEvent::Nudge);
-                }
-            }
+        if let Some(error_class) = evidence.classify() {
+            tracing::warn!(
+                error_class = ?error_class,
+                confidence = evidence.confidence(),
+                screen_stall_secs = screen_stall_secs,
+                checkpoint_stale_secs = ?checkpoint_stale_secs,
+                keyword = ?evidence.keyword_match,
+                "Error evidence threshold reached — multiple signals confirm error"
+            );
+            return Ok(CompletionEvent::ErrorDetected { error_class });
+        } else if evidence.keyword_match.is_some() {
+            // Keyword matched but confidence too low — log for debugging
+            tracing::debug!(
+                keyword = ?evidence.keyword_match,
+                confidence = evidence.confidence(),
+                screen_stall_secs = screen_stall_secs,
+                "Error keyword found but confidence too low (session likely still active)"
+            );
         }
 
-        self.state.last_pane_hash = Some(pane_hash);
+        // --- Idle thresholds ---
+        if !pane_changed {
+            let idle_duration = self.state.last_activity.elapsed();
+
+            if idle_duration > self.config.idle_kill_after {
+                tracing::warn!(
+                    idle_secs = idle_duration.as_secs(),
+                    kill_after_secs = self.config.idle_kill_after.as_secs(),
+                    "Session stuck (idle too long)"
+                );
+                return Ok(CompletionEvent::Stuck);
+            }
+
+            if idle_duration > self.config.idle_nudge_after && !self.state.nudged {
+                tracing::info!(
+                    idle_secs = idle_duration.as_secs(),
+                    "Session idle, should nudge"
+                );
+                return Ok(CompletionEvent::Nudge);
+            }
+        }
 
         Ok(CompletionEvent::StillRunning)
     }

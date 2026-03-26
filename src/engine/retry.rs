@@ -1,8 +1,15 @@
-//! Retry logic and error classification for phase groups.
+//! Retry logic, error classification, and evidence-based error detection.
 //!
 //! This module implements the retry system that handles failures during
 //! phase group execution. Each error type has a specific backoff curve
 //! and maximum retry count.
+//!
+//! # Evidence-Based Error Detection
+//!
+//! Error classification uses [`ErrorEvidence`] to combine multiple signals
+//! (keyword match, screen stall, checkpoint staleness, process liveness)
+//! into a confidence score. No single signal triggers a kill decision.
+//! See [`ErrorEvidence::confidence`] for the scoring model.
 //!
 //! # Error Classes
 //!
@@ -37,6 +44,103 @@
 
 use serde::Serialize;
 use std::time::Duration;
+
+/// Minimum stall duration before error keywords are considered meaningful.
+/// Below this threshold, keyword matches are ignored because Claude Code
+/// is likely still actively working.
+const ERROR_STALL_THRESHOLD_SECS: u64 = 30;
+
+/// Evidence collected for error diagnosis.
+///
+/// Each signal contributes a confidence weight. Only when combined confidence
+/// exceeds the action threshold does `gw` take action (kill/retry/skip).
+///
+/// # Confidence Model
+///
+/// | Signal | Weight | Rationale |
+/// |--------|--------|-----------|
+/// | Keyword match | 0.2 | Lowest — Claude often writes about errors in code/plans |
+/// | Screen stall (>30s) | 0.3 | Medium — could be "thinking" or real stall |
+/// | Checkpoint stale | 0.3 | Medium — no heartbeat from Claude Code |
+/// | Process dead | 0.5 | High — strong evidence of real failure |
+///
+/// Action thresholds:
+/// - `>= 0.5` → Classify error and act (kill/retry/skip)
+/// - `< 0.5` → Continue monitoring (StillRunning)
+#[derive(Debug, Clone)]
+pub struct ErrorEvidence {
+    /// Error keyword matched in tail of pane output.
+    pub keyword_match: Option<ErrorClass>,
+    /// Screen has not changed for this duration.
+    pub screen_stall_secs: u64,
+    /// Checkpoint has not updated for this duration (None if no checkpoint exists).
+    pub checkpoint_stale_secs: Option<u64>,
+    /// Whether the Claude process is still alive.
+    pub process_alive: bool,
+}
+
+impl ErrorEvidence {
+    /// Compute combined confidence score (0.0 - 1.0).
+    ///
+    /// Positive signals increase confidence:
+    /// - Keyword match: +0.2 (lowest — Claude often writes about errors)
+    /// - Screen stall (>30s): +0.3 (medium)
+    /// - Checkpoint stale (>30s): +0.3 (medium)
+    /// - Process dead: +0.5 (high)
+    ///
+    /// Negative signals decrease confidence:
+    /// - Checkpoint fresh (still updating): -0.2 (system is making progress,
+    ///   e.g., Claude waiting for teammates while checkpoint advances)
+    pub fn confidence(&self) -> f64 {
+        let mut score: f64 = 0.0;
+
+        if self.keyword_match.is_some() {
+            score += 0.2;
+        }
+
+        if self.screen_stall_secs >= ERROR_STALL_THRESHOLD_SECS {
+            score += 0.3;
+        }
+
+        if let Some(stale_secs) = self.checkpoint_stale_secs {
+            if stale_secs >= ERROR_STALL_THRESHOLD_SECS {
+                score += 0.3;
+            } else {
+                // Checkpoint is fresh — system is making progress.
+                // This is a negative signal: even if screen is stalled
+                // (e.g., Claude waiting for teammate agents), checkpoint
+                // updates prove work is happening.
+                score -= 0.2;
+            }
+        }
+
+        if !self.process_alive {
+            // Process death overrides checkpoint freshness — if the process
+            // is dead, checkpoint can't update anymore regardless.
+            score = (score + 0.5).max(0.5);
+        }
+
+        // Clamp to [0.0, 1.0]
+        score.clamp(0.0, 1.0)
+    }
+
+    /// Whether confidence is high enough to act on the error.
+    pub fn should_act(&self) -> bool {
+        self.confidence() >= 0.5
+    }
+
+    /// Get the error classification if confidence is sufficient.
+    ///
+    /// Returns the keyword-matched error class only when combined evidence
+    /// supports it. If no keyword matched but confidence is high (e.g.,
+    /// process dead + stall), returns `ErrorClass::Unknown`.
+    pub fn classify(&self) -> Option<ErrorClass> {
+        if !self.should_act() {
+            return None;
+        }
+        Some(self.keyword_match.unwrap_or(ErrorClass::Unknown))
+    }
+}
 
 /// Classification of errors that can occur during phase execution.
 ///
@@ -119,45 +223,99 @@ impl ErrorClass {
         matches!(self, ErrorClass::AuthError)
     }
 
-    /// Create from diagnostic patterns found in pane output.
+    /// Classify error patterns found in pane output.
     ///
-    /// This provides simplified error classification based on
-    /// string matching against common error messages.
+    /// This is a **low-confidence signal** — keyword matches alone do NOT
+    /// indicate a real error. Claude Code often discusses auth, billing,
+    /// HTTP status codes in normal output (code, plans, docs). Callers
+    /// MUST gate this behind stall detection (screen unchanged + checkpoint
+    /// stale) before taking action.
+    ///
+    /// Only scans the last 10 lines and requires error-adjacent context
+    /// (e.g., "error", "failed", "fatal") to reduce false positives.
     pub fn from_pane_output(output: &str) -> Option<Self> {
-        let output_lower = output.to_lowercase();
+        // Only check the tail — errors that matter are recent.
+        // Scanning full pane causes false positives when Claude's output
+        // contains error keywords in code, docs, or plan enrichments.
+        let tail: String = output
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
 
-        // Billing errors
-        if output_lower.contains("billing")
-            || output_lower.contains("payment required")
-            || output_lower.contains("subscription expired")
+        // Require error-adjacent context: the keyword must appear near
+        // an indicator that it's an actual error, not just mentioned in output.
+        //
+        // We check per-line for indicators that look like real errors, not
+        // code identifiers like "ErrorClass" or "AuthError". Real API errors
+        // start lines with "error:" or "Error:" or contain standalone markers.
+        let has_error_context = tail.lines().any(|line| {
+            let trimmed = line.trim();
+            // Line starts with "error" followed by colon/space (real error output)
+            trimmed.starts_with("error:") || trimmed.starts_with("error ") ||
+            // Capitalized error messages from APIs
+            trimmed.starts_with("fatal:") || trimmed.starts_with("fatal ") ||
+            // Exception traces
+            trimmed.starts_with("exception:") || trimmed.starts_with("exception ") ||
+            // Standalone failure indicators
+            trimmed.starts_with("failed") ||
+            // Error emoji indicator
+            trimmed.contains("❌")
+        });
+
+        if !has_error_context {
+            return None;
+        }
+
+        // Billing / auth errors (require error context to avoid false positives
+        // from Claude writing about auth patterns in code or plans)
+        if tail.contains("billing")
+            || tail.contains("payment required")
+            || tail.contains("subscription expired")
         {
             return Some(ErrorClass::AuthError);
         }
 
-        // Auth errors
-        if output_lower.contains("authentication_error")
-            || output_lower.contains("invalid_api_key")
-            || output_lower.contains("unauthorized")
+        if tail.contains("authentication_error")
+            || tail.contains("invalid_api_key")
         {
             return Some(ErrorClass::AuthError);
         }
 
         // Rate limit / API overload
-        if output_lower.contains("rate_limit")
-            || output_lower.contains("429")
-            || output_lower.contains("too many requests")
+        if tail.contains("rate_limit")
+            || tail.contains("too many requests")
         {
             return Some(ErrorClass::ApiOverload);
         }
 
         // Server overload
-        if output_lower.contains("overloaded")
-            || output_lower.contains("529")
-            || output_lower.contains("server_error")
-            || output_lower.contains("502")
-            || output_lower.contains("503")
+        if tail.contains("overloaded")
+            || tail.contains("server_error")
         {
             return Some(ErrorClass::ApiOverload);
+        }
+
+        // HTTP status codes need extra care — only match as standalone tokens
+        // to avoid matching port numbers (e.g., 5293) or line numbers.
+        let status_code_patterns = [
+            ("429", Self::ApiOverload),
+            ("529", Self::ApiOverload),
+            ("502", Self::ApiOverload),
+            ("503", Self::ApiOverload),
+        ];
+
+        for (code, class) in status_code_patterns {
+            for word in tail.split_whitespace() {
+                if word.trim_matches(|c: char| !c.is_ascii_digit()) == code {
+                    return Some(class);
+                }
+            }
         }
 
         None
@@ -414,7 +572,8 @@ mod tests {
     }
 
     #[test]
-    fn test_error_class_from_pane_output_billing() {
+    fn test_error_class_from_pane_output_billing_with_context() {
+        // Billing keyword WITH error context → match
         let output = "Error: billing payment required";
         assert_eq!(
             ErrorClass::from_pane_output(output),
@@ -423,7 +582,36 @@ mod tests {
     }
 
     #[test]
-    fn test_error_class_from_pane_output_rate_limit() {
+    fn test_error_class_from_pane_output_billing_no_context() {
+        // Billing keyword WITHOUT error context → no match (avoids false positives
+        // when Claude writes about billing in code or plans)
+        let output = "The retry module handles billing with backoff";
+        assert_eq!(ErrorClass::from_pane_output(output), None);
+    }
+
+    #[test]
+    fn test_error_class_from_pane_output_auth_in_plan() {
+        // Claude enriching a plan that mentions auth patterns → no match
+        // Real plan output discusses these as code concepts, not API errors
+        let output = "- **Already has** patterns (billing, auth)\n\
+                      - ErrorClass enum with AuthError, Crash, Stuck\n\
+                      - `from_pane_output()` duplicates patterns from detect.rs";
+        assert_eq!(ErrorClass::from_pane_output(output), None);
+    }
+
+    #[test]
+    fn test_error_class_from_pane_output_auth_in_code_output() {
+        // Claude writing code that references auth/billing keywords → no match
+        // Tool output markers show Claude is actively working
+        let output = "⏺ Update(src/engine/retry.rs)\n\
+                      ⎿  if output_lower.contains(\"billing\") {\n\
+                      ⎿      return Some(ErrorClass::AuthError);\n\
+                      ⎿  }";
+        assert_eq!(ErrorClass::from_pane_output(output), None);
+    }
+
+    #[test]
+    fn test_error_class_from_pane_output_rate_limit_with_context() {
         let output = "Error: rate_limit exceeded (429)";
         assert_eq!(
             ErrorClass::from_pane_output(output),
@@ -438,10 +626,173 @@ mod tests {
     }
 
     #[test]
+    fn test_error_class_from_pane_output_ignores_old_scrollback() {
+        // Error in early lines (beyond last 10) should be ignored
+        let mut output = "Error: billing payment required\n".to_string();
+        for i in 0..20 {
+            output.push_str(&format!("normal output line {}\n", i));
+        }
+        assert_eq!(ErrorClass::from_pane_output(&output), None);
+    }
+
+    #[test]
     fn test_error_class_skips_plan() {
         assert!(ErrorClass::AuthError.skips_plan());
         assert!(!ErrorClass::Crash.skips_plan());
         assert!(!ErrorClass::Timeout.skips_plan());
+    }
+
+    // --- ErrorEvidence confidence tests ---
+
+    #[test]
+    fn test_evidence_keyword_alone_not_enough() {
+        // Keyword match alone with fresh checkpoint = 0.2 - 0.2 = 0.0 → should NOT act
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 0,
+            checkpoint_stale_secs: Some(0),
+            process_alive: true,
+        };
+        assert_eq!(evidence.confidence(), 0.0);
+        assert!(!evidence.should_act());
+        assert!(evidence.classify().is_none());
+    }
+
+    #[test]
+    fn test_evidence_stall_alone_not_enough() {
+        // Screen stall + fresh checkpoint = 0.3 - 0.2 = 0.1 → should NOT act
+        let evidence = ErrorEvidence {
+            keyword_match: None,
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(0),
+            process_alive: true,
+        };
+        assert!(evidence.confidence() < 0.5);
+        assert!(!evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_keyword_plus_stall_fresh_checkpoint_not_enough() {
+        // Keyword + stall but checkpoint fresh = 0.2 + 0.3 - 0.2 = 0.3 → NOT enough
+        // This is the key scenario: Claude waiting for teammates with auth keyword in output
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(0),
+            process_alive: true,
+        };
+        assert!(evidence.confidence() < 0.5);
+        assert!(!evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_keyword_plus_stall_stale_checkpoint_acts() {
+        // Keyword + stall + stale checkpoint = 0.2 + 0.3 + 0.3 = 0.8 → ACT
+        // All signals agree: real error
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(60),
+            process_alive: true,
+        };
+        assert_eq!(evidence.confidence(), 0.8);
+        assert!(evidence.should_act());
+        assert_eq!(evidence.classify(), Some(ErrorClass::AuthError));
+    }
+
+    #[test]
+    fn test_evidence_stall_plus_checkpoint_stale_reaches_threshold() {
+        // Screen stall + checkpoint stale = 0.3 + 0.3 = 0.6 → should act (as Unknown)
+        let evidence = ErrorEvidence {
+            keyword_match: None,
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(60),
+            process_alive: true,
+        };
+        assert_eq!(evidence.confidence(), 0.6);
+        assert!(evidence.should_act());
+        assert_eq!(evidence.classify(), Some(ErrorClass::Unknown));
+    }
+
+    #[test]
+    fn test_evidence_process_dead_high_confidence() {
+        // Process dead overrides checkpoint freshness → at least 0.5
+        let evidence = ErrorEvidence {
+            keyword_match: None,
+            screen_stall_secs: 0,
+            checkpoint_stale_secs: Some(0),
+            process_alive: false,
+        };
+        assert!(evidence.confidence() >= 0.5);
+        assert!(evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_all_signals_capped_at_1() {
+        // All signals → capped at 1.0
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::ApiOverload),
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(60),
+            process_alive: false,
+        };
+        assert_eq!(evidence.confidence(), 1.0);
+        assert!(evidence.should_act());
+        assert_eq!(evidence.classify(), Some(ErrorClass::ApiOverload));
+    }
+
+    #[test]
+    fn test_evidence_no_signals_fresh_checkpoint() {
+        // No signals + fresh checkpoint = -0.2, clamped to 0.0
+        let evidence = ErrorEvidence {
+            keyword_match: None,
+            screen_stall_secs: 0,
+            checkpoint_stale_secs: Some(0),
+            process_alive: true,
+        };
+        assert_eq!(evidence.confidence(), 0.0);
+        assert!(!evidence.should_act());
+        assert!(evidence.classify().is_none());
+    }
+
+    #[test]
+    fn test_evidence_no_checkpoint_exists() {
+        // No checkpoint at all = None → no checkpoint contribution (positive or negative)
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: None,
+            process_alive: true,
+        };
+        assert_eq!(evidence.confidence(), 0.5);
+        assert!(evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_claude_waiting_for_teammates() {
+        // Claude teamlead waiting: screen idle, keyword in output, BUT checkpoint fresh
+        // This is normal during agent team execution → should NOT kill
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 120, // 2 min stall
+            checkpoint_stale_secs: Some(5), // checkpoint updated 5s ago (fresh)
+            process_alive: true,
+        };
+        assert!(evidence.confidence() < 0.5);
+        assert!(!evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_claude_thinking_with_keyword() {
+        // Claude is thinking (screen stall < 30s) with keyword in output → no action
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 15,
+            checkpoint_stale_secs: Some(10),
+            process_alive: true,
+        };
+        assert!(evidence.confidence() < 0.5);
+        assert!(!evidence.should_act());
     }
 
     #[test]
