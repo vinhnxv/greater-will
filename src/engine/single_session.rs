@@ -137,6 +137,67 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     // Startup cleanup
     startup_cleanup()?;
 
+    // Pre-flight: Check for existing arc-phase-loop.local.md.
+    // If a loop state file already exists, it could be from:
+    //   (a) A previous gw run for the SAME plan (resume scenario)
+    //   (b) A different plan's arc session (conflict)
+    //   (c) An orphaned file from a crashed session
+    if let Some(existing_state) = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir) {
+        let existing_plan = existing_state.plan_file.clone();
+        let our_plan = plan_str.to_string();
+
+        // Normalize for comparison: strip leading "./" and compare
+        let normalize = |p: &str| p.trim_start_matches("./").to_string();
+        let existing_normalized = normalize(&existing_plan);
+        let our_normalized = normalize(&our_plan);
+
+        if existing_normalized == our_normalized {
+            info!(
+                plan = %existing_plan,
+                iteration = existing_state.iteration,
+                "Found existing loop state for same plan — will resume"
+            );
+            println!("[gw] Found existing arc session for this plan (iteration {})", existing_state.iteration);
+        } else {
+            warn!(
+                existing_plan = %existing_plan,
+                our_plan = %our_plan,
+                owner_pid = %existing_state.owner_pid,
+                "Loop state exists for a DIFFERENT plan"
+            );
+
+            // Check if the owner process is still alive
+            let owner_alive = existing_state.owner_pid.parse::<u32>()
+                .map(|pid| crate::cleanup::process::is_pid_alive(pid))
+                .unwrap_or(false);
+
+            if owner_alive {
+                eyre::bail!(
+                    "Another arc session is actively running for '{}' (pid {}). \
+                     Cannot run '{}' concurrently in the same project directory. \
+                     Wait for it to finish or kill it first.",
+                    existing_plan,
+                    existing_state.owner_pid,
+                    our_plan,
+                );
+            } else {
+                // Owner is dead — orphaned loop state. Clean it up.
+                info!(
+                    owner_pid = %existing_state.owner_pid,
+                    "Owner process is dead — cleaning up orphaned loop state"
+                );
+                println!(
+                    "[gw] Stale loop state from '{}' (dead pid {}) — cleaning up",
+                    existing_plan, existing_state.owner_pid,
+                );
+                let loop_file = config.working_dir.join(".rune").join("arc-phase-loop.local.md");
+                if let Err(e) = std::fs::remove_file(&loop_file) {
+                    warn!(error = %e, "Failed to remove orphaned loop state (non-fatal)");
+                }
+            }
+        }
+    }
+
     // Build session name from plan filename
     let plan_stem = plan_path
         .file_stem()
@@ -456,6 +517,14 @@ fn run_session_attempt(
     );
     let mut last_artifact_activity = Instant::now();
 
+    // Loop state warmup tracking: detect when arc-phase-loop.local.md never appears
+    // or disappears after being created (Rune arc finished or crashed).
+    let mut loop_state_ever_seen = false;
+    // When the file disappears, we wait for a grace period before acting,
+    // to avoid false positives from Rune briefly rewriting the file.
+    let mut loop_state_gone_since: Option<Instant> = None;
+    const LOOP_STATE_GONE_GRACE_SECS: u64 = 15;
+
     // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
     // we start a confirmation timer. If the timer expires without new activity,
     // we kill. Any heartbeat/artifact/checkpoint change cancels the pending kill.
@@ -653,6 +722,84 @@ fn run_session_attempt(
 
                 // Count successful checkpoint polls for delayed archive
                 successful_checkpoint_polls += 1;
+            }
+        }
+
+        // LOOP STATE WARMUP: Detect when arc-phase-loop.local.md hasn't appeared
+        // or has been deleted after appearing. This file is Rune's heartbeat — its
+        // absence after the warmup period means the arc failed to initialize, and
+        // its disappearance after existing means the arc completed or crashed.
+        let loop_state_exists = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir).is_some();
+        if loop_state_exists {
+            loop_state_ever_seen = true;
+            loop_state_gone_since = None; // Reset grace timer — file is back
+        }
+
+        if !loop_state_exists {
+            let session_age = dispatch_time.elapsed();
+
+            if loop_state_ever_seen {
+                // File existed before but is now gone. Use grace period to avoid
+                // false positives from Rune briefly rewriting the file.
+                let gone_since = loop_state_gone_since.get_or_insert_with(|| {
+                    debug!("arc-phase-loop.local.md disappeared — starting grace timer");
+                    Instant::now()
+                });
+
+                if gone_since.elapsed() < Duration::from_secs(LOOP_STATE_GONE_GRACE_SECS) {
+                    // Still within grace period — wait for next poll
+                    debug!(
+                        gone_secs = gone_since.elapsed().as_secs(),
+                        grace_secs = LOOP_STATE_GONE_GRACE_SECS,
+                        "Loop state gone, waiting for grace period"
+                    );
+                } else {
+                    // Grace period expired — file is truly gone.
+                    info!(
+                        gone_secs = gone_since.elapsed().as_secs(),
+                        "arc-phase-loop.local.md confirmed gone — arc has ended or was deleted"
+                    );
+                    if let Some(checkpoint) = read_cached_checkpoint(
+                        plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                    ) {
+                        if checkpoint.is_complete() {
+                            info!("Loop state gone + checkpoint complete → success");
+                            let _ = kill_session(session_name);
+                            return Ok(SessionOutcome::Completed);
+                        }
+                        let current = checkpoint.current_phase().unwrap_or("unknown");
+                        warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
+                        let _ = kill_session(session_name);
+                        return Ok(SessionOutcome::Crashed {
+                            reason: format!(
+                                "arc-phase-loop.local.md deleted during phase '{}' after {}s",
+                                current, session_age.as_secs(),
+                            ),
+                        });
+                    }
+                    // No checkpoint at all — treat as completion (Rune cleaned up everything)
+                    info!("Loop state gone, no checkpoint found — assuming clean completion");
+                    let _ = kill_session(session_name);
+                    return Ok(SessionOutcome::Completed);
+                }
+            } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
+                // File never appeared within warmup window → Rune failed to start arc
+                warn!(
+                    warmup_secs = wd.loop_state_warmup_secs,
+                    elapsed_secs = session_age.as_secs(),
+                    "arc-phase-loop.local.md never appeared — arc failed to initialize"
+                );
+                println!(
+                    "[gw] arc-phase-loop.local.md not found after {}s — restarting session",
+                    session_age.as_secs(),
+                );
+                kill_session(session_name)?;
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s)",
+                        session_age.as_secs(), wd.loop_state_warmup_secs,
+                    ),
+                });
             }
         }
 

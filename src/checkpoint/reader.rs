@@ -369,7 +369,7 @@ pub fn archive_stale_checkpoints(
             continue;
         }
 
-        let mut dest = archive_base.join(&dir_name);
+        let dest = archive_base.join(&dir_name);
 
         // Handle dest collision: if _archived/arc-{id} already exists,
         // remove it first (it's a leftover from a previous interrupted archive).

@@ -18,6 +18,7 @@
 //! | `GW_PROMPT_ACCEPT_DEBOUNCE_SECS` | 5 | seconds | Debounce between auto-accepts |
 //! | `GW_CRASH_WINDOW_SECS` | 900 | seconds | Rolling window for crash loop detection |
 //! | `GW_CRASH_STABILITY_SECS` | 1800 | seconds | Healthy running time to reset crash counters |
+//! | `GW_LOOP_STATE_WARMUP_SECS` | 180 | seconds | Max wait for arc-phase-loop.local.md to appear |
 
 use std::time::Duration;
 
@@ -56,6 +57,10 @@ pub struct WatchdogConfig {
     pub crash_window_secs: u64,
     /// How long healthy running resets crash counters (seconds). Default 1800 (30 min).
     pub crash_stability_secs: u64,
+    /// Max time to wait for `arc-phase-loop.local.md` to appear after session start.
+    /// If the file doesn't appear within this window, the session is treated as crashed.
+    /// Default 180s (3 min) — Rune typically creates this file within 1-2 minutes.
+    pub loop_state_warmup_secs: u64,
 }
 
 impl WatchdogConfig {
@@ -77,6 +82,7 @@ impl WatchdogConfig {
             prompt_accept_debounce_secs: env_or("GW_PROMPT_ACCEPT_DEBOUNCE_SECS", 5),
             crash_window_secs: env_or("GW_CRASH_WINDOW_SECS", 900),
             crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800),
+            loop_state_warmup_secs: env_or("GW_LOOP_STATE_WARMUP_SECS", 180), // 3 min
         }
     }
 }
@@ -115,5 +121,6 @@ mod tests {
         assert_eq!(config.prompt_accept_debounce_secs, 5);
         assert_eq!(config.crash_window_secs, 900);
         assert_eq!(config.crash_stability_secs, 1800);
+        assert_eq!(config.loop_state_warmup_secs, 180);
     }
 }
