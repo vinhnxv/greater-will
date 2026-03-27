@@ -20,8 +20,26 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// Deserialize a value that may be either a JSON string or a JSON number into a String.
+///
+/// Checkpoint producers (JavaScript/TypeScript) are inconsistent about whether
+/// `owner_pid` is written as `"41111"` (string) or `41111` (number).
+/// This helper accepts both forms so we don't fail on valid checkpoints.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
+}
 
 /// Schema version range that greater-will has been tested against.
 /// - MIN: oldest checkpoint format we can reliably parse
@@ -105,7 +123,7 @@ pub struct Checkpoint {
     pub config_dir: String,
 
     /// PID of the process that owns this arc
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_number")]
     pub owner_pid: String,
 
     /// Claude Code session ID running this arc
@@ -597,5 +615,31 @@ mod tests {
 
         cp.phase_sequence = None;
         assert_eq!(cp.current_phase(), None);
+    }
+
+    #[test]
+    fn test_owner_pid_as_number() {
+        let json = r#"{
+            "id": "arc-123",
+            "plan_file": "plans/test.md",
+            "owner_pid": 41111,
+            "started_at": "2026-03-27T00:00:00Z"
+        }"#;
+
+        let cp: Checkpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.owner_pid, "41111");
+    }
+
+    #[test]
+    fn test_owner_pid_as_string() {
+        let json = r#"{
+            "id": "arc-123",
+            "plan_file": "plans/test.md",
+            "owner_pid": "41111",
+            "started_at": "2026-03-27T00:00:00Z"
+        }"#;
+
+        let cp: Checkpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.owner_pid, "41111");
     }
 }
