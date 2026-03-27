@@ -23,7 +23,7 @@
 //! ```
 
 use crate::checkpoint::schema::Checkpoint;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -160,7 +160,8 @@ fn fsync_file<P: AsRef<Path>>(path: P) -> Result<()> {
         let fd = file.as_raw_fd();
         let result = unsafe { libc::fsync(fd) };
         if result != 0 {
-            warn!("fsync failed for {}, data may not be fully persisted", path.display());
+            let err = std::io::Error::last_os_error();
+            return Err(eyre::eyre!("fsync failed for {}: {}", path.display(), err));
         } else {
             debug!("fsync completed for {}", path.display());
         }
