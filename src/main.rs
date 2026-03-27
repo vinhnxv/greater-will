@@ -9,8 +9,6 @@
 //! - `replay`: Resume from a checkpoint
 //! - `clean`: Clean up temporary files and sessions
 
-#![allow(dead_code)]
-
 mod batch;
 mod checkpoint;
 mod cleanup;

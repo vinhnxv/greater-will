@@ -602,10 +602,10 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::Nudge => {
                     if !nudge_sent {
-                        info!(group = %group.name, "Sending nudge");
-                        let _nudge_mgr = crate::monitor::nudge::NudgeManager::with_defaults(session_id);
-                        // Note: We'd need mutable access to send the nudge
-                        // For now, just log it
+                        info!(group = %group.name, "Sending nudge to session");
+                        if let Err(e) = send_keys_with_workaround(session_id, "please continue") {
+                            warn!(group = %group.name, "Failed to send nudge: {}", e);
+                        }
                         nudge_sent = true;
                         detector.mark_nudged();
                     }
