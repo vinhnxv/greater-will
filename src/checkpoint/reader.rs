@@ -304,6 +304,102 @@ pub fn find_checkpoint_for_plan(plan_path: &Path, cwd: &Path) -> Result<Option<s
     Ok(best.map(|(path, _)| path))
 }
 
+/// Archive stale checkpoint directories for a given plan.
+///
+/// After identifying the active checkpoint (by path), moves all OTHER checkpoint
+/// directories that match the same plan into `.rune/arc/_archived/`. This prevents
+/// `find_checkpoint_for_plan` from scanning them on future calls.
+///
+/// Safe to call multiple times — already-archived dirs are skipped.
+pub fn archive_stale_checkpoints(
+    active_checkpoint_path: &Path,
+    plan_path: &Path,
+    cwd: &Path,
+) -> Result<usize> {
+    let arc_base = cwd.join(".rune").join("arc");
+    if !arc_base.exists() {
+        return Ok(0);
+    }
+
+    let plan_str = plan_path.to_string_lossy();
+    let active_dir = active_checkpoint_path
+        .parent()
+        .ok_or_else(|| eyre!("Checkpoint path has no parent dir"))?;
+
+    let entries = std::fs::read_dir(&arc_base)
+        .wrap_err_with(|| format!("Failed to read arc directory: {}", arc_base.display()))?;
+
+    let mut archived_count = 0;
+
+    for entry in entries {
+        let entry = entry?;
+        let dir_path = entry.path();
+        let dir_name = entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
+
+        // Only consider arc-* directories
+        if !dir_name_str.starts_with("arc-") || !dir_path.is_dir() {
+            continue;
+        }
+
+        // Skip the active checkpoint dir
+        if dir_path == active_dir {
+            continue;
+        }
+
+        let cp_path = dir_path.join("checkpoint.json");
+        if !cp_path.exists() {
+            continue;
+        }
+
+        // Check if this checkpoint matches the same plan
+        let matches = match try_read_checkpoint(&cp_path).ok().flatten() {
+            Some(cp) => plan_matches(&cp.plan_file, &plan_str),
+            None => false,
+        };
+
+        if !matches {
+            continue;
+        }
+
+        // Move to _archived/
+        let archive_base = arc_base.join("_archived");
+        if let Err(e) = std::fs::create_dir_all(&archive_base) {
+            warn!(error = %e, "Failed to create archive directory");
+            continue;
+        }
+
+        let dest = archive_base.join(&dir_name);
+        match std::fs::rename(&dir_path, &dest) {
+            Ok(()) => {
+                info!(
+                    from = %dir_name_str,
+                    to = %dest.display(),
+                    "Archived stale checkpoint"
+                );
+                archived_count += 1;
+            }
+            Err(e) => {
+                warn!(
+                    dir = %dir_name_str,
+                    error = %e,
+                    "Failed to archive stale checkpoint"
+                );
+            }
+        }
+    }
+
+    if archived_count > 0 {
+        info!(
+            count = archived_count,
+            plan = %plan_str,
+            "Archived stale checkpoints for plan"
+        );
+    }
+
+    Ok(archived_count)
+}
+
 /// Result of pre-resume validation.
 #[derive(Debug)]
 pub struct ResumeValidation {
@@ -674,5 +770,92 @@ mod tests {
             Path::new("plans/test.md"), dir.path()
         ).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_archive_stale_checkpoints() {
+        use crate::checkpoint::writer::write_checkpoint;
+
+        let dir = TempDir::new().unwrap();
+        let arc_base = dir.path().join(".rune").join("arc");
+
+        // Create 3 checkpoint dirs for the same plan, with different started_at
+        let timestamps = ["2026-03-25T01:00:00Z", "2026-03-25T02:00:00Z", "2026-03-25T03:00:00Z"];
+        let arc_ids = ["arc-1000", "arc-2000", "arc-3000"];
+
+        for (i, (ts, id)) in timestamps.iter().zip(arc_ids.iter()).enumerate() {
+            let arc_dir = arc_base.join(id);
+            std::fs::create_dir_all(&arc_dir).unwrap();
+
+            let mut cp = make_test_checkpoint();
+            cp.id = id.to_string();
+            cp.started_at = ts.to_string();
+            // All match the same plan
+            cp.plan_file = "plans/test.md".to_string();
+
+            write_checkpoint(&cp, arc_dir.join("checkpoint.json")).unwrap();
+            let _ = i; // suppress unused warning
+        }
+
+        // The newest checkpoint is arc-3000
+        let active_path = arc_base.join("arc-3000").join("checkpoint.json");
+
+        let archived = archive_stale_checkpoints(
+            &active_path,
+            Path::new("plans/test.md"),
+            dir.path(),
+        ).unwrap();
+
+        // Should archive 2 stale dirs
+        assert_eq!(archived, 2);
+
+        // Active dir still exists
+        assert!(arc_base.join("arc-3000").exists());
+
+        // Stale dirs moved to _archived/
+        assert!(!arc_base.join("arc-1000").exists());
+        assert!(!arc_base.join("arc-2000").exists());
+        assert!(arc_base.join("_archived").join("arc-1000").exists());
+        assert!(arc_base.join("_archived").join("arc-2000").exists());
+
+        // Calling again is idempotent
+        let archived_again = archive_stale_checkpoints(
+            &active_path,
+            Path::new("plans/test.md"),
+            dir.path(),
+        ).unwrap();
+        assert_eq!(archived_again, 0);
+    }
+
+    #[test]
+    fn test_archive_preserves_different_plan() {
+        use crate::checkpoint::writer::write_checkpoint;
+
+        let dir = TempDir::new().unwrap();
+        let arc_base = dir.path().join(".rune").join("arc");
+
+        // Create 2 dirs: one for plan A, one for plan B
+        for (id, plan) in [("arc-1000", "plans/a.md"), ("arc-2000", "plans/b.md")] {
+            let arc_dir = arc_base.join(id);
+            std::fs::create_dir_all(&arc_dir).unwrap();
+
+            let mut cp = make_test_checkpoint();
+            cp.id = id.to_string();
+            cp.plan_file = plan.to_string();
+
+            write_checkpoint(&cp, arc_dir.join("checkpoint.json")).unwrap();
+        }
+
+        let active_path = arc_base.join("arc-1000").join("checkpoint.json");
+
+        let archived = archive_stale_checkpoints(
+            &active_path,
+            Path::new("plans/a.md"),
+            dir.path(),
+        ).unwrap();
+
+        // Should not archive arc-2000 (different plan)
+        assert_eq!(archived, 0);
+        assert!(arc_base.join("arc-2000").exists());
     }
 }

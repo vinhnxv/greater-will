@@ -19,7 +19,7 @@
 //! | Crash recovery  | gw restarts + `--resume` | gw retries the group          |
 //! | Complexity      | Low                      | High                          |
 
-use crate::checkpoint::reader::find_checkpoint_for_plan;
+use crate::checkpoint::reader::{archive_stale_checkpoints, find_checkpoint_for_plan};
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
 use crate::config::watchdog::WatchdogConfig;
@@ -958,6 +958,12 @@ fn read_cached_checkpoint(
             info!("Discovered checkpoint: {}", cp_path.display());
             match crate::checkpoint::reader::read_checkpoint(&cp_path) {
                 Ok(cp) => {
+                    // Archive stale checkpoint dirs for the same plan.
+                    // This is safe: we've already found the newest, so older
+                    // ones are from previous crash/restart cycles.
+                    if let Err(e) = archive_stale_checkpoints(&cp_path, plan_path, working_dir) {
+                        debug!(error = %e, "Failed to archive stale checkpoints (non-fatal)");
+                    }
                     *cached_path = Some(cp_path);
                     Some(cp)
                 }
