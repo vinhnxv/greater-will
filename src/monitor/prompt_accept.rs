@@ -42,6 +42,7 @@ const PROMPT_PATTERNS: &[&str] = &[
 const SHELL_PROMPTS: &[&str] = &["❯", "$ ", "# ", "% "];
 
 /// Detects permission prompts in pane output and auto-sends Enter.
+#[derive(Debug)]
 pub struct PromptAcceptor {
     /// When the last accept was sent (for debounce).
     last_accept: Option<Instant>,

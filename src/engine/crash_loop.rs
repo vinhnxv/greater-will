@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Decision from the crash loop detector after recording a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashLoopDecision {
     /// Restart allowed — crash count within budget.
     AllowRestart,
@@ -20,6 +21,7 @@ pub enum CrashLoopDecision {
 /// Tracks crash timestamps in a bounded deque. Only crashes within the
 /// rolling `window` count toward the threshold. A sustained healthy period
 /// (`stability_period`) clears the history entirely.
+#[derive(Debug)]
 pub struct CrashLoopDetector {
     /// Timestamps of recent crashes (within window).
     crash_times: VecDeque<Instant>,
