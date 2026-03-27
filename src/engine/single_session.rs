@@ -25,7 +25,7 @@ use crate::cleanup::{self, startup_cleanup};
 use crate::config::watchdog::WatchdogConfig;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
-use crate::session::detect::capture_pane;
+use crate::session::detect::{capture_pane, save_crash_dump};
 use crate::session::spawn::{
     has_session, kill_session, send_keys_with_workaround, shell_escape,
     spawn_claude_session, SpawnConfig,
@@ -647,10 +647,10 @@ fn run_session_attempt(
     info!(command = %command, "Dispatching arc command");
     println!("[gw] Dispatching: {}", command);
     if let Err(e) = send_keys_with_workaround(session_name, command) {
+        let reason = format!("Failed to send command: {}", e);
+        save_crash_dump(session_name, &config.working_dir, &reason);
         kill_session(session_name)?;
-        return Ok(SessionOutcome::Crashed {
-            reason: format!("Failed to send command: {}", e),
-        });
+        return Ok(SessionOutcome::Crashed { reason });
     }
 
     // Delegate to the shared monitor loop
@@ -787,6 +787,7 @@ fn monitor_session(
                 .unwrap_or(ErrorClass::ApiOverload);
             let reason = format!("StopFailure hook — classified as {:?}", error_class);
             println!("[gw] {} — killing session", reason);
+            save_crash_dump(session_name, &config.working_dir, &reason);
             kill_session(session_name)?;
             return Ok(SessionOutcome::ErrorDetected {
                 error_class,
@@ -805,6 +806,7 @@ fn monitor_session(
         // Check total pipeline timeout
         if pipeline_start.elapsed() > config.pipeline_timeout {
             warn!("Pipeline timeout exceeded, killing session");
+            save_crash_dump(session_name, &config.working_dir, "Pipeline timeout exceeded");
             kill_session(session_name)?;
             return Ok(SessionOutcome::Timeout);
         }
@@ -1098,13 +1100,13 @@ fn monitor_session(
                         }
                         let current = checkpoint.current_phase().unwrap_or("unknown");
                         warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
+                        let reason = format!(
+                            "arc-phase-loop.local.md deleted during phase '{}' after {}s",
+                            current, session_age.as_secs(),
+                        );
+                        save_crash_dump(session_name, &config.working_dir, &reason);
                         let _ = kill_session(session_name);
-                        return Ok(SessionOutcome::Crashed {
-                            reason: format!(
-                                "arc-phase-loop.local.md deleted during phase '{}' after {}s",
-                                current, session_age.as_secs(),
-                            ),
-                        });
+                        return Ok(SessionOutcome::Crashed { reason });
                     }
                     // No checkpoint found. Disambiguate using session age:
                     // - Long-running (>5 min): Rune ran and cleaned up after itself → Completed
@@ -1124,13 +1126,13 @@ fn monitor_session(
                         "Loop state gone, no checkpoint, session only ran {}s — treating as crash",
                         session_age.as_secs(),
                     );
+                    let reason = format!(
+                        "arc-phase-loop.local.md gone after only {}s with no checkpoint",
+                        session_age.as_secs(),
+                    );
+                    save_crash_dump(session_name, &config.working_dir, &reason);
                     let _ = kill_session(session_name);
-                    return Ok(SessionOutcome::Crashed {
-                        reason: format!(
-                            "arc-phase-loop.local.md gone after only {}s with no checkpoint",
-                            session_age.as_secs(),
-                        ),
-                    });
+                    return Ok(SessionOutcome::Crashed { reason });
                 }
             } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
                 // File never appeared within warmup window → Rune failed to start arc
@@ -1139,20 +1141,22 @@ fn monitor_session(
                     elapsed_secs = session_age.as_secs(),
                     "arc-phase-loop.local.md never appeared — arc failed to initialize"
                 );
+                let reason = format!(
+                    "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s) — Rune failed to initialize",
+                    session_age.as_secs(), wd.loop_state_warmup_secs,
+                );
                 println!(
                     "[gw] arc-phase-loop.local.md not found after {}s — restarting session",
                     session_age.as_secs(),
                 );
+                save_crash_dump(session_name, &config.working_dir, &reason);
                 kill_session(session_name)?;
                 // Classify as BootstrapError — Rune failed to initialize arc.
                 // This is likely a deterministic failure (plugin not loaded, bad
                 // command, config issue) that won't resolve by retrying.
                 return Ok(SessionOutcome::ErrorDetected {
                     error_class: ErrorClass::BootstrapError,
-                    reason: format!(
-                        "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s) — Rune failed to initialize",
-                        session_age.as_secs(), wd.loop_state_warmup_secs,
-                    ),
+                    reason,
                 });
             }
         }
@@ -1258,12 +1262,14 @@ fn monitor_session(
                             new_class = ?error_class,
                             "Error class escalated to fatal — acting immediately"
                         );
+                        let reason = format!(
+                            "Fatal error detected during confirmation: {:?} (was {:?})",
+                            error_class, prev_class,
+                        );
+                        save_crash_dump(session_name, &config.working_dir, &reason);
                         kill_session(session_name)?;
                         return Ok(SessionOutcome::ErrorDetected {
-                            reason: format!(
-                                "Fatal error detected during confirmation: {:?} (was {:?})",
-                                error_class, prev_class,
-                            ),
+                            reason,
                             error_class,
                         });
                     }
@@ -1287,16 +1293,18 @@ fn monitor_session(
                         "Error confirmed after {}s observation — killing session",
                         elapsed_confirm,
                     );
+                    let reason = format!(
+                        "Error pattern confirmed: {:?} (confidence={:.1}, observed={}s, stall={}s)",
+                        error_class, conf, elapsed_confirm, screen_stall_secs,
+                    );
                     println!(
                         "[gw] Error confirmed: {:?} (confidence={:.1}, observed for {}s) — killing session",
                         error_class, conf, elapsed_confirm,
                     );
+                    save_crash_dump(session_name, &config.working_dir, &reason);
                     kill_session(session_name)?;
                     return Ok(SessionOutcome::ErrorDetected {
-                        reason: format!(
-                            "Error pattern confirmed: {:?} (confidence={:.1}, observed={}s, stall={}s)",
-                            error_class, conf, elapsed_confirm, screen_stall_secs,
-                        ),
+                        reason,
                         error_class,
                     });
                 } else {
@@ -1376,6 +1384,9 @@ fn monitor_session(
                 pid,
                 gone_duration.as_secs(),
             );
+            save_crash_dump(session_name, &config.working_dir, &format!(
+                "Claude process (pid={}) died after {}s grace", pid, gone_duration.as_secs(),
+            ));
             kill_session(session_name)?;
 
             if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
@@ -1513,6 +1524,9 @@ fn monitor_session(
                     phase_elapsed / 60,
                     effective_phase_timeout / 60,
                 );
+                save_crash_dump(session_name, &config.working_dir, &format!(
+                    "Phase '{}' timeout: {}s > {}s budget", phase_name, phase_elapsed, effective_phase_timeout,
+                ));
                 kill_session(session_name)?;
                 return Ok(SessionOutcome::Stuck);
             }
@@ -1540,6 +1554,10 @@ fn monitor_session(
                 effective_kill_secs,
                 current_profile.category,
             );
+            save_crash_dump(session_name, &config.working_dir, &format!(
+                "Session idle {}s > {}s {:?} limit",
+                idle_duration.as_secs(), effective_kill_secs, current_profile.category,
+            ));
             kill_session(session_name)?;
             return Ok(SessionOutcome::Stuck);
         }

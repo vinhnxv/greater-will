@@ -36,7 +36,7 @@ use crate::config::phase_config::{PhaseConfig, PhaseGroup};
 use crate::engine::completion::{CompletionConfig, CompletionDetector, CompletionEvent};
 use crate::engine::retry::{ErrorClass, RetryCoordinator, RetryDecision};
 use crate::session::{spawn_claude_session, kill_session, wait_for_prompt, send_keys_with_workaround, SpawnConfig};
-use crate::session::detect::capture_pane;
+use crate::session::detect::{capture_pane, save_crash_dump};
 use color_eyre::eyre::{eyre, Context};
 use color_eyre::Result;
 use serde::Serialize;
@@ -466,6 +466,7 @@ impl PhaseGroupExecutor {
                 Ok(()) => info!("Prompt detected"),
                 Err(e) => {
                     warn!(error = %e, "Timeout waiting for prompt");
+                    save_crash_dump(session_id, &exec_config.working_dir, &format!("Timeout waiting for prompt: {}", e));
                     kill_session(session_id)?;
                     return Ok(PhaseGroupResult {
                         group_name: group.name.clone(),
@@ -527,6 +528,7 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::Failed { phase } => {
                     warn!(group = %group.name, phase = %phase, "Phase failed");
+                    save_crash_dump(session_id, &exec_config.working_dir, &format!("Phase {} failed", phase));
                     kill_session(session_id)?;
                     return Ok(PhaseGroupResult {
                         group_name: group.name.clone(),
@@ -544,6 +546,7 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::Timeout => {
                     warn!(group = %group.name, "Phase timeout");
+                    save_crash_dump(session_id, &exec_config.working_dir, "Phase timeout");
                     kill_session(session_id)?;
                     return Ok(PhaseGroupResult {
                         group_name: group.name.clone(),
@@ -561,6 +564,7 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::Stuck => {
                     warn!(group = %group.name, "Session stuck");
+                    save_crash_dump(session_id, &exec_config.working_dir, "Session stuck (idle too long)");
                     kill_session(session_id)?;
                     return Ok(PhaseGroupResult {
                         group_name: group.name.clone(),
@@ -582,6 +586,7 @@ impl PhaseGroupExecutor {
                         error_class = ?error_class,
                         "Error pattern detected in pane output"
                     );
+                    save_crash_dump(session_id, &exec_config.working_dir, &format!("Error detected: {:?}", error_class));
                     kill_session(session_id)?;
                     return Ok(PhaseGroupResult {
                         group_name: group.name.clone(),

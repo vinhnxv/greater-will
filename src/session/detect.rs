@@ -226,6 +226,118 @@ pub fn capture_pane_lines(session_id: &str, lines: i32) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Capture the entire scrollback history of a tmux pane.
+///
+/// Unlike `capture_pane` (visible viewport only), this captures from the
+/// beginning of scrollback (`-S -`) to the end, giving the complete history
+/// of what happened in the session.
+pub fn capture_full_scrollback(session_id: &str) -> Result<String> {
+    let output = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-t", session_id,
+            "-p",
+            "-S", "-",  // From start of scrollback
+        ])
+        .output()?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Save a crash dump of the tmux session before killing it.
+///
+/// Captures the full scrollback history and writes it to
+/// `.gw/crash-dumps/<session_id>-<timestamp>.txt` in the working directory.
+/// This preserves the Claude Code output for post-mortem debugging.
+///
+/// Returns the path to the dump file on success, or logs a warning and
+/// returns None if capture fails (non-fatal — should never block session kill).
+pub fn save_crash_dump(session_id: &str, working_dir: &std::path::Path, reason: &str) -> Option<std::path::PathBuf> {
+    let dump_dir = working_dir.join(".gw").join("crash-dumps");
+    if let Err(e) = std::fs::create_dir_all(&dump_dir) {
+        tracing::warn!(error = %e, "Failed to create crash-dumps directory");
+        return None;
+    }
+
+    // Capture full scrollback
+    let scrollback = match capture_full_scrollback(session_id) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id = %session_id, "Failed to capture scrollback for crash dump");
+            return None;
+        }
+    };
+
+    if scrollback.trim().is_empty() {
+        tracing::debug!(session_id = %session_id, "Scrollback empty — skipping crash dump");
+        return None;
+    }
+
+    // Build dump filename: <session_id>-<timestamp>.txt
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("{}-{}.txt", session_id, timestamp);
+    let dump_path = dump_dir.join(&filename);
+
+    // Build dump content with metadata header
+    let header = format!(
+        "=== GW CRASH DUMP ===\n\
+         Session:   {}\n\
+         Timestamp: {}\n\
+         Reason:    {}\n\
+         =====================\n\n",
+        session_id,
+        chrono::Utc::now().to_rfc3339(),
+        reason,
+    );
+
+    let content = format!("{}{}", header, scrollback);
+
+    match std::fs::write(&dump_path, &content) {
+        Ok(()) => {
+            tracing::info!(
+                path = %dump_path.display(),
+                bytes = content.len(),
+                "Crash dump saved"
+            );
+            println!("[gw] Crash dump saved: {}", dump_path.display());
+            // Rotate: keep only the 20 most recent dumps
+            rotate_crash_dumps(&dump_dir, 20);
+            Some(dump_path)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to write crash dump");
+            None
+        }
+    }
+}
+
+/// Keep only the N most recent crash dump files (by modification time).
+fn rotate_crash_dumps(dump_dir: &std::path::Path, keep: usize) {
+    let mut entries: Vec<_> = match std::fs::read_dir(dump_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+
+    if entries.len() <= keep {
+        return;
+    }
+
+    // Sort by modified time, oldest first
+    entries.sort_by_key(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+
+    // Remove oldest entries beyond the keep limit
+    let to_remove = entries.len() - keep;
+    for entry in entries.into_iter().take(to_remove) {
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::debug!(error = %e, path = %entry.path().display(), "Failed to remove old crash dump");
+        }
+    }
+}
+
 /// Compute a hash of content for change detection.
 pub fn compute_content_hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -423,5 +535,16 @@ mod tests {
         assert!(detector.last_hash().is_none());
         // Time since change should be very small (< 100ms)
         assert!(detector.time_since_change() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_save_crash_dump_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // save_crash_dump will fail to capture pane (no tmux session), returning None
+        let result = save_crash_dump("gw-nonexistent-test", dir.path(), "test reason");
+        // Should return None gracefully (no tmux session to capture from)
+        assert!(result.is_none());
+        // But the crash-dumps dir should have been created
+        assert!(dir.path().join(".gw").join("crash-dumps").exists());
     }
 }
