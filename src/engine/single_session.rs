@@ -19,9 +19,11 @@
 //! | Crash recovery  | gw restarts + `--resume` | gw retries the group          |
 //! | Complexity      | Low                      | High                          |
 
-use crate::checkpoint::reader::find_checkpoint_for_plan;
+use crate::checkpoint::reader::archive_stale_checkpoints;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
+use crate::config::watchdog::WatchdogConfig;
+use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
@@ -34,23 +36,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of crash-recovery restarts before giving up.
-const MAX_CRASH_RETRIES: u32 = 3;
+// Max crash retries is now in WatchdogConfig (default 5, env: GW_MAX_CRASH_RETRIES).
 
 /// Poll interval for monitoring the session (seconds).
 const POLL_INTERVAL_SECS: u64 = 5;
 
 /// How often to print a status line during monitoring (seconds).
 const STATUS_LOG_INTERVAL_SECS: u64 = 30;
-
-/// Idle threshold before sending a nudge (seconds).
-const IDLE_NUDGE_SECS: u64 = 300; // 5 min
-
-/// Idle threshold before killing a stuck session (seconds).
-const IDLE_KILL_SECS: u64 = 600; // 10 min
-
-/// Default total pipeline timeout (6 hours).
-const DEFAULT_PIPELINE_TIMEOUT_SECS: u64 = 6 * 3600;
 
 /// Result of a single-session pipeline run.
 #[derive(Debug, Clone)]
@@ -82,18 +74,22 @@ pub struct SingleSessionConfig {
     pub resume: bool,
     /// Additional flags to pass to `/rune:arc`.
     pub arc_flags: Vec<String>,
+    /// Watchdog tuning parameters (idle thresholds, scan intervals, etc.).
+    pub watchdog: WatchdogConfig,
 }
 
 impl SingleSessionConfig {
     /// Create a default config for a working directory.
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
+        let watchdog = WatchdogConfig::from_env();
         Self {
             working_dir: working_dir.into(),
             config_dir: None,
             claude_path: "claude".to_string(),
-            pipeline_timeout: Duration::from_secs(DEFAULT_PIPELINE_TIMEOUT_SECS),
+            pipeline_timeout: watchdog.pipeline_timeout,
             resume: false,
             arc_flags: Vec::new(),
+            watchdog,
         }
     }
 
@@ -141,6 +137,67 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     // Startup cleanup
     startup_cleanup()?;
 
+    // Pre-flight: Check for existing arc-phase-loop.local.md.
+    // If a loop state file already exists, it could be from:
+    //   (a) A previous gw run for the SAME plan (resume scenario)
+    //   (b) A different plan's arc session (conflict)
+    //   (c) An orphaned file from a crashed session
+    if let Some(existing_state) = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir) {
+        let existing_plan = existing_state.plan_file.clone();
+        let our_plan = plan_str.to_string();
+
+        // Normalize for comparison: strip leading "./" and compare
+        let normalize = |p: &str| p.trim_start_matches("./").to_string();
+        let existing_normalized = normalize(&existing_plan);
+        let our_normalized = normalize(&our_plan);
+
+        if existing_normalized == our_normalized {
+            info!(
+                plan = %existing_plan,
+                iteration = existing_state.iteration,
+                "Found existing loop state for same plan — will resume"
+            );
+            println!("[gw] Found existing arc session for this plan (iteration {})", existing_state.iteration);
+        } else {
+            warn!(
+                existing_plan = %existing_plan,
+                our_plan = %our_plan,
+                owner_pid = %existing_state.owner_pid,
+                "Loop state exists for a DIFFERENT plan"
+            );
+
+            // Check if the owner process is still alive
+            let owner_alive = existing_state.owner_pid.parse::<u32>()
+                .map(|pid| crate::cleanup::process::is_pid_alive(pid))
+                .unwrap_or(false);
+
+            if owner_alive {
+                eyre::bail!(
+                    "Another arc session is actively running for '{}' (pid {}). \
+                     Cannot run '{}' concurrently in the same project directory. \
+                     Wait for it to finish or kill it first.",
+                    existing_plan,
+                    existing_state.owner_pid,
+                    our_plan,
+                );
+            } else {
+                // Owner is dead — orphaned loop state. Clean it up.
+                info!(
+                    owner_pid = %existing_state.owner_pid,
+                    "Owner process is dead — cleaning up orphaned loop state"
+                );
+                println!(
+                    "[gw] Stale loop state from '{}' (dead pid {}) — cleaning up",
+                    existing_plan, existing_state.owner_pid,
+                );
+                let loop_file = config.working_dir.join(".rune").join("arc-phase-loop.local.md");
+                if let Err(e) = std::fs::remove_file(&loop_file) {
+                    warn!(error = %e, "Failed to remove orphaned loop state (non-fatal)");
+                }
+            }
+        }
+    }
+
     // Build session name from plan filename
     let plan_stem = plan_path
         .file_stem()
@@ -169,7 +226,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     println!();
 
     // Crash-recovery loop
-    let mut crash_restarts: u32 = 0;
+    let mut crash_detector = CrashLoopDetector::from_watchdog(&config.watchdog);
     let mut is_first_run = true;
 
     loop {
@@ -178,7 +235,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             return Ok(PipelineResult {
                 success: false,
                 duration: start.elapsed(),
-                crash_restarts,
+                crash_restarts: crash_detector.total_restarts(),
                 message: "Pipeline timeout exceeded".to_string(),
                 session_name: session_name.clone(),
             });
@@ -188,11 +245,12 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
         let command = if is_first_run {
             arc_command.clone()
         } else {
-            info!(restart = crash_restarts, "Restarting with --resume after crash");
+            info!(restart = crash_detector.total_restarts(), "Restarting with --resume after crash");
             build_resume_command(plan_str, config)
         };
 
         // Run one session attempt
+        let attempt_start = Instant::now();
         let attempt_result = run_session_attempt(
             &session_name,
             &command,
@@ -201,42 +259,52 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             plan_path,
         )?;
 
+        // If the attempt ran long enough, record it as healthy
+        let attempt_duration = attempt_start.elapsed();
+        if attempt_duration >= Duration::from_secs(config.watchdog.crash_stability_secs) {
+            crash_detector.record_healthy_tick();
+        }
+
         match attempt_result {
             SessionOutcome::Completed => {
                 return Ok(PipelineResult {
                     success: true,
                     duration: start.elapsed(),
-                    crash_restarts,
+                    crash_restarts: crash_detector.total_restarts(),
                     message: "Pipeline completed successfully".to_string(),
                     session_name,
                 });
             }
             SessionOutcome::Crashed { reason } => {
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > MAX_CRASH_RETRIES {
-                    return Ok(PipelineResult {
-                        success: false,
-                        duration: start.elapsed(),
-                        crash_restarts,
-                        message: format!(
-                            "Pipeline failed after {} crash restarts. Last: {}",
-                            crash_restarts, reason
-                        ),
-                        session_name,
-                    });
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop: {} crashes in {}s window. Last: {}",
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                                reason
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
                 }
 
                 warn!(
-                    restart = crash_restarts,
-                    max = MAX_CRASH_RETRIES,
+                    restart = crash_detector.total_restarts(),
+                    max = config.watchdog.max_crash_retries,
                     reason = %reason,
                     "Session crashed, will restart with --resume"
                 );
                 println!(
                     "[gw] Session crashed ({}/{}): {}. Restarting in 5s...",
-                    crash_restarts, MAX_CRASH_RETRIES, reason,
+                    crash_detector.total_restarts(), config.watchdog.max_crash_retries, reason,
                 );
 
                 // Brief cooldown before restart
@@ -246,29 +314,35 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 return Ok(PipelineResult {
                     success: false,
                     duration: start.elapsed(),
-                    crash_restarts,
+                    crash_restarts: crash_detector.total_restarts(),
                     message: "Pipeline timeout exceeded".to_string(),
                     session_name,
                 });
             }
             SessionOutcome::Stuck => {
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > MAX_CRASH_RETRIES {
-                    return Ok(PipelineResult {
-                        success: false,
-                        duration: start.elapsed(),
-                        crash_restarts,
-                        message: "Pipeline stuck and max restarts exceeded".to_string(),
-                        session_name,
-                    });
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop (stuck): {} crashes in {}s window",
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
                 }
 
-                warn!(restart = crash_restarts, "Session stuck, restarting");
+                warn!(restart = crash_detector.total_restarts(), "Session stuck, restarting");
                 println!(
                     "[gw] Session stuck ({}/{}). Restarting in 5s...",
-                    crash_restarts, MAX_CRASH_RETRIES,
+                    crash_detector.total_restarts(), config.watchdog.max_crash_retries,
                 );
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -278,31 +352,50 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
-                        crash_restarts,
+                        crash_restarts: crash_detector.total_restarts(),
                         message: format!("Fatal error (no retry): {}", reason),
                         session_name,
                     });
                 }
 
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > error_class.max_retries() {
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop ({:?}): {} crashes in {}s window. Last: {}",
+                                error_class,
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                                reason
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
+                }
+
+                // Per-error-class max retries still applies
+                if crash_detector.total_restarts() > error_class.max_retries() {
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
-                        crash_restarts,
+                        crash_restarts: crash_detector.total_restarts(),
                         message: format!(
                             "Pipeline failed after {} retries for {:?}. Last: {}",
-                            crash_restarts, error_class, reason
+                            crash_detector.total_restarts(), error_class, reason
                         ),
                         session_name,
                     });
                 }
 
-                let backoff = error_class.backoff_for_attempt(crash_restarts - 1);
+                let backoff = error_class.backoff_for_attempt(crash_detector.total_restarts() - 1);
                 warn!(
-                    restart = crash_restarts,
+                    restart = crash_detector.total_restarts(),
                     max = error_class.max_retries(),
                     backoff_secs = backoff.as_secs(),
                     error_class = ?error_class,
@@ -312,7 +405,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 println!(
                     "[gw] {:?} error ({}/{}): {}. Waiting {}s before restart...",
                     error_class,
-                    crash_restarts,
+                    crash_detector.total_restarts(),
                     error_class.max_retries(),
                     reason,
                     backoff.as_secs(),
@@ -406,18 +499,50 @@ fn run_session_attempt(
     let mut last_checkpoint_poll = Instant::now();
     let mut last_checkpoint_activity = Instant::now();
     let mut last_checkpoint_hash: Option<u64> = None;
+    // Cache the resolved checkpoint path to avoid re-scanning all arc-* dirs every poll.
+    // Once found, the checkpoint path doesn't change during a session.
+    let mut cached_checkpoint_path: Option<PathBuf> = None;
+    // Track whether we've archived stale checkpoints for this session.
+    // We delay archiving until the SECOND successful poll to ensure the
+    // checkpoint is stable (not a leftover from the previous session that
+    // Rune hasn't replaced yet).
+    let mut stale_archive_done = false;
+    let mut successful_checkpoint_polls: u32 = 0;
     let mut last_process_gone_at: Option<Instant> = None;
+    let mut last_artifact_scan = Instant::now();
+    let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
+    let mut prompt_acceptor = crate::monitor::prompt_accept::PromptAcceptor::new(
+        config.watchdog.prompt_accept_enabled,
+        config.watchdog.prompt_accept_debounce_secs,
+    );
+    let mut last_artifact_activity = Instant::now();
 
-    /// Minimum session duration to consider a "real" run (not an instant crash).
-    /// If the session dies within this window after dispatch, it's a crash.
+    // Loop state warmup tracking: detect when arc-phase-loop.local.md never appears
+    // or disappears after being created (Rune arc finished or crashed).
+    let mut loop_state_ever_seen = false;
+    // When the file disappears, we wait for a grace period before acting,
+    // to avoid false positives from Rune briefly rewriting the file.
+    let mut loop_state_gone_since: Option<Instant> = None;
+    const LOOP_STATE_GONE_GRACE_SECS: u64 = 15;
+
+    // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
+    // we start a confirmation timer. If the timer expires without new activity,
+    // we kill. Any heartbeat/artifact/checkpoint change cancels the pending kill.
+    //
+    // | Confidence | Confirmation Period | Rationale |
+    // |------------|-------------------|-----------|
+    // | < 0.5      | never act         | Below threshold |
+    // | 0.5 - 0.8  | 15 min            | Medium confidence — could be transient |
+    // | >= 0.8     | 5 min             | High confidence — strong evidence |
+    let mut error_confirm_since: Option<(Instant, ErrorClass, f64)> = None;
+    let wd = &config.watchdog;
+
     const MIN_SESSION_DURATION_SECS: u64 = 30;
-
-    /// How often to check the checkpoint file (seconds).
-    /// Less frequent than pane polling since file I/O is heavier.
-    const CHECKPOINT_POLL_INTERVAL_SECS: u64 = 10;
+    let error_confirm_medium_secs = wd.error_confirm_medium_secs;
+    let error_confirm_high_secs = wd.error_confirm_high_secs;
 
     info!("Entering monitor loop (poll={}s, nudge={}s, kill={}s)",
-        POLL_INTERVAL_SECS, IDLE_NUDGE_SECS, IDLE_KILL_SECS);
+        POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
     println!("[gw] Monitoring session (poll every {}s)...", POLL_INTERVAL_SECS);
 
     loop {
@@ -504,7 +629,9 @@ fn run_session_attempt(
 
             // Session ran for a meaningful time — verify via checkpoint
             if !crate::cleanup::process::is_pid_alive(pid) {
-                if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+                if let Some(checkpoint) = read_cached_checkpoint(
+                    plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                ) {
                     if checkpoint.is_complete() {
                         info!("Session ended, checkpoint confirms completion");
                         return Ok(SessionOutcome::Completed);
@@ -547,6 +674,13 @@ fn run_session_attempt(
         std::hash::Hash::hash(&pane_content, &mut hasher);
         let current_hash = std::hash::Hasher::finish(&hasher);
 
+        // Auto-accept permission prompts (y/n dialogs)
+        if prompt_acceptor.check_and_accept(&pane_content, session_name) {
+            last_activity = Instant::now();
+            last_output_hash = current_hash; // Prevent idle detection from also acting
+            continue; // Skip rest of loop — we just interacted
+        }
+
         if current_hash != last_output_hash {
             last_output_hash = current_hash;
             last_activity = Instant::now();
@@ -556,9 +690,11 @@ fn run_session_attempt(
         // PRIMARY: Check checkpoint.json for arc completion.
         // This is the most reliable signal — Rune writes structured state here.
         // Only poll every CHECKPOINT_POLL_INTERVAL_SECS to avoid excessive file I/O.
-        if last_checkpoint_poll.elapsed() >= Duration::from_secs(CHECKPOINT_POLL_INTERVAL_SECS) {
+        if last_checkpoint_poll.elapsed() >= Duration::from_secs(wd.checkpoint_poll_interval_secs) {
             last_checkpoint_poll = Instant::now();
-            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+            if let Some(checkpoint) = read_cached_checkpoint(
+                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+            ) {
                 if checkpoint.is_complete() {
                     let elapsed = dispatch_time.elapsed();
                     info!("Pipeline completion detected via checkpoint.json");
@@ -583,6 +719,121 @@ fn run_session_attempt(
                     last_checkpoint_activity = Instant::now();
                 }
                 last_checkpoint_hash = Some(cp_hash);
+
+                // Count successful checkpoint polls for delayed archive
+                successful_checkpoint_polls += 1;
+            }
+        }
+
+        // LOOP STATE WARMUP: Detect when arc-phase-loop.local.md hasn't appeared
+        // or has been deleted after appearing. This file is Rune's heartbeat — its
+        // absence after the warmup period means the arc failed to initialize, and
+        // its disappearance after existing means the arc completed or crashed.
+        let loop_state_exists = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir).is_some();
+        if loop_state_exists {
+            loop_state_ever_seen = true;
+            loop_state_gone_since = None; // Reset grace timer — file is back
+        }
+
+        if !loop_state_exists {
+            let session_age = dispatch_time.elapsed();
+
+            if loop_state_ever_seen {
+                // File existed before but is now gone. Use grace period to avoid
+                // false positives from Rune briefly rewriting the file.
+                let gone_since = loop_state_gone_since.get_or_insert_with(|| {
+                    debug!("arc-phase-loop.local.md disappeared — starting grace timer");
+                    Instant::now()
+                });
+
+                if gone_since.elapsed() < Duration::from_secs(LOOP_STATE_GONE_GRACE_SECS) {
+                    // Still within grace period — wait for next poll
+                    debug!(
+                        gone_secs = gone_since.elapsed().as_secs(),
+                        grace_secs = LOOP_STATE_GONE_GRACE_SECS,
+                        "Loop state gone, waiting for grace period"
+                    );
+                } else {
+                    // Grace period expired — file is truly gone.
+                    info!(
+                        gone_secs = gone_since.elapsed().as_secs(),
+                        "arc-phase-loop.local.md confirmed gone — arc has ended or was deleted"
+                    );
+                    if let Some(checkpoint) = read_cached_checkpoint(
+                        plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                    ) {
+                        if checkpoint.is_complete() {
+                            info!("Loop state gone + checkpoint complete → success");
+                            let _ = kill_session(session_name);
+                            return Ok(SessionOutcome::Completed);
+                        }
+                        let current = checkpoint.current_phase().unwrap_or("unknown");
+                        warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
+                        let _ = kill_session(session_name);
+                        return Ok(SessionOutcome::Crashed {
+                            reason: format!(
+                                "arc-phase-loop.local.md deleted during phase '{}' after {}s",
+                                current, session_age.as_secs(),
+                            ),
+                        });
+                    }
+                    // No checkpoint at all — treat as completion (Rune cleaned up everything)
+                    info!("Loop state gone, no checkpoint found — assuming clean completion");
+                    let _ = kill_session(session_name);
+                    return Ok(SessionOutcome::Completed);
+                }
+            } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
+                // File never appeared within warmup window → Rune failed to start arc
+                warn!(
+                    warmup_secs = wd.loop_state_warmup_secs,
+                    elapsed_secs = session_age.as_secs(),
+                    "arc-phase-loop.local.md never appeared — arc failed to initialize"
+                );
+                println!(
+                    "[gw] arc-phase-loop.local.md not found after {}s — restarting session",
+                    session_age.as_secs(),
+                );
+                kill_session(session_name)?;
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s)",
+                        session_age.as_secs(), wd.loop_state_warmup_secs,
+                    ),
+                });
+            }
+        }
+
+        // DELAYED ARCHIVE: After 2 successful checkpoint polls, archive stale
+        // checkpoint dirs from previous crash/restart cycles. We wait for the
+        // 2nd poll to ensure the current checkpoint is the one Rune is actively
+        // using (not a leftover that Rune hasn't replaced yet).
+        if !stale_archive_done && successful_checkpoint_polls >= 2 {
+            stale_archive_done = true;
+            if let Some(ref cp_path) = cached_checkpoint_path {
+                if let Err(e) = archive_stale_checkpoints(cp_path, plan_path, &config.working_dir) {
+                    debug!(error = %e, "Failed to archive stale checkpoints (non-fatal)");
+                }
+            }
+        }
+
+        // ARTIFACT DIR SCAN: Check if agents are writing output files.
+        // This catches activity that neither screen nor checkpoint reflect —
+        // e.g., review agents writing TOME fragments, workers creating files.
+        if last_artifact_scan.elapsed() >= Duration::from_secs(wd.artifact_scan_interval_secs) {
+            last_artifact_scan = Instant::now();
+            if let Some(artifact_dir) = find_artifact_dir_cached(&cached_checkpoint_path, &config.working_dir) {
+                if let Some(snapshot) = scan_artifact_dir(&artifact_dir) {
+                    if last_artifact_snapshot.map_or(true, |prev| prev != snapshot) {
+                        debug!(
+                            files = snapshot.file_count,
+                            bytes = snapshot.total_bytes,
+                            dir = %artifact_dir.display(),
+                            "Artifact dir activity detected"
+                        );
+                        last_artifact_activity = Instant::now();
+                        last_artifact_snapshot = Some(snapshot);
+                    }
+                }
             }
         }
 
@@ -618,48 +869,97 @@ fn run_session_attempt(
             None
         };
 
+        // Check if swarm teammates are running (lightweight: one tmux call)
+        let swarm = check_swarm_activity(pid);
+        let swarm_active = swarm.map_or(false, |s| s.active_count > 0);
+
         let evidence = ErrorEvidence {
             keyword_match,
             screen_stall_secs,
             checkpoint_stale_secs: Some(last_checkpoint_activity.elapsed().as_secs()),
             process_alive: crate::cleanup::process::is_pid_alive(pid),
+            artifacts_active: last_artifact_activity.elapsed().as_secs() < wd.error_stall_threshold_secs,
+            swarm_active,
         };
 
         if let Some(error_class) = evidence.classify() {
-            warn!(
-                error_class = ?error_class,
-                confidence = evidence.confidence(),
-                screen_stall_secs = screen_stall_secs,
-                checkpoint_stale_secs = last_checkpoint_activity.elapsed().as_secs(),
-                keyword = ?evidence.keyword_match,
-                process_alive = evidence.process_alive,
-                "Error evidence threshold reached — multiple signals confirm error"
-            );
-            println!(
-                "[gw] Error detected: {:?} (confidence={:.1}, stall={}s) — killing session",
-                error_class,
-                evidence.confidence(),
-                screen_stall_secs,
-            );
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::ErrorDetected {
-                reason: format!(
-                    "Error pattern detected: {:?} (confidence={:.1}, stall={}s, checkpoint_stale={}s)",
-                    error_class,
-                    evidence.confidence(),
-                    screen_stall_secs,
-                    last_checkpoint_activity.elapsed().as_secs(),
-                ),
-                error_class,
-            });
-        } else if evidence.keyword_match.is_some() {
-            // Keyword matched but confidence too low — log and continue monitoring
-            debug!(
-                keyword = ?evidence.keyword_match,
-                confidence = evidence.confidence(),
-                screen_stall_secs = screen_stall_secs,
-                "Error keyword found but confidence too low — Claude likely still active"
-            );
+            let conf = evidence.confidence();
+
+            // Confirmation period: don't kill immediately. Start a timer and
+            // wait for confirmation_secs. If activity resumes, cancel the kill.
+            let confirmation_secs = if conf >= 0.8 {
+                error_confirm_high_secs  // 5 min for high confidence
+            } else {
+                error_confirm_medium_secs // 15 min for medium confidence
+            };
+
+            if let Some((started, prev_class, _prev_conf)) = &error_confirm_since {
+                // Already in confirmation period — check if time to act
+                let elapsed_confirm = started.elapsed().as_secs();
+                if elapsed_confirm >= confirmation_secs {
+                    // Confirmation period expired — act now
+                    warn!(
+                        error_class = ?error_class,
+                        confidence = conf,
+                        screen_stall_secs = screen_stall_secs,
+                        confirmation_secs = elapsed_confirm,
+                        "Error confirmed after {}s observation — killing session",
+                        elapsed_confirm,
+                    );
+                    println!(
+                        "[gw] Error confirmed: {:?} (confidence={:.1}, observed for {}s) — killing session",
+                        error_class, conf, elapsed_confirm,
+                    );
+                    kill_session(session_name)?;
+                    return Ok(SessionOutcome::ErrorDetected {
+                        reason: format!(
+                            "Error pattern confirmed: {:?} (confidence={:.1}, observed={}s, stall={}s)",
+                            error_class, conf, elapsed_confirm, screen_stall_secs,
+                        ),
+                        error_class,
+                    });
+                } else {
+                    // Still in confirmation period — log and continue
+                    debug!(
+                        error_class = ?prev_class,
+                        confidence = conf,
+                        remaining_secs = confirmation_secs - elapsed_confirm,
+                        "Error confirmation in progress — {}s remaining",
+                        confirmation_secs - elapsed_confirm,
+                    );
+                }
+            } else {
+                // Start confirmation period
+                warn!(
+                    error_class = ?error_class,
+                    confidence = conf,
+                    confirmation_secs = confirmation_secs,
+                    "Error detected — starting {}s confirmation period before killing",
+                    confirmation_secs,
+                );
+                println!(
+                    "[gw] Error signal: {:?} (confidence={:.1}) — watching for {}m before killing",
+                    error_class, conf, confirmation_secs / 60,
+                );
+                error_confirm_since = Some((Instant::now(), error_class, conf));
+            }
+        } else {
+            // No error detected — cancel any pending confirmation
+            if error_confirm_since.is_some() {
+                info!("Error signals cleared — cancelling pending confirmation");
+                println!("[gw] Error signals cleared — system recovered, cancelling pending kill");
+                error_confirm_since = None;
+            }
+
+            if evidence.keyword_match.is_some() {
+                // Keyword matched but confidence too low — log and continue monitoring
+                debug!(
+                    keyword = ?evidence.keyword_match,
+                    confidence = evidence.confidence(),
+                    screen_stall_secs = screen_stall_secs,
+                    "Error keyword found but confidence too low — Claude likely still active"
+                );
+            }
         }
 
         // Check if Claude process is still alive (tmux session may exist but process dead).
@@ -705,7 +1005,9 @@ fn run_session_attempt(
 
             // Process ran for a while then died — verify via checkpoint before
             // assuming success. If checkpoint says incomplete, it's a crash.
-            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+            if let Some(checkpoint) = read_cached_checkpoint(
+                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+            ) {
                 if checkpoint.is_complete() {
                     info!("Process died but checkpoint confirms completion");
                     return Ok(SessionOutcome::Completed);
@@ -750,7 +1052,7 @@ fn run_session_attempt(
         // Idle detection
         let idle_duration = last_activity.elapsed();
 
-        if idle_duration > Duration::from_secs(IDLE_KILL_SECS) {
+        if idle_duration > Duration::from_secs(wd.idle_kill_secs) {
             warn!(
                 idle_secs = idle_duration.as_secs(),
                 "Session stuck (idle too long), killing"
@@ -758,13 +1060,13 @@ fn run_session_attempt(
             println!(
                 "[gw] Session stuck (idle {}s > {}s limit), killing...",
                 idle_duration.as_secs(),
-                IDLE_KILL_SECS,
+                wd.idle_kill_secs,
             );
             kill_session(session_name)?;
             return Ok(SessionOutcome::Stuck);
         }
 
-        if idle_duration > Duration::from_secs(IDLE_NUDGE_SECS) && !nudged {
+        if idle_duration > Duration::from_secs(wd.idle_nudge_secs) && !nudged {
             info!(
                 idle_secs = idle_duration.as_secs(),
                 "Session idle, sending nudge"
@@ -798,27 +1100,72 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("arc result: success")
 }
 
-/// Try to read the checkpoint for a given plan.
+/// Read checkpoint using `arc-phase-loop.local.md` as the single source of truth.
 ///
-/// Returns `None` if no checkpoint exists yet or if it can't be read.
-/// This is a non-fatal operation — the monitor loop should continue
-/// even if the checkpoint is temporarily unreadable.
-fn try_read_plan_checkpoint(plan_path: &Path, working_dir: &Path) -> Option<Checkpoint> {
-    match find_checkpoint_for_plan(plan_path, working_dir) {
-        Ok(Some(cp_path)) => {
-            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+/// Resolution order:
+/// 1. Return from cache if path still exists
+/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md`
+///
+/// Returns `None` if the loop state file doesn't exist yet (early arc init).
+/// Once resolved, the path is cached for the rest of the session.
+fn read_cached_checkpoint(
+    _plan_path: &Path,
+    working_dir: &Path,
+    cached_path: &mut Option<PathBuf>,
+) -> Option<Checkpoint> {
+    // If we have a cached path, try reading directly — O(1)
+    if let Some(cp_path) = cached_path.as_ref() {
+        if cp_path.exists() {
+            return match crate::checkpoint::reader::read_checkpoint(cp_path) {
                 Ok(cp) => Some(cp),
                 Err(e) => {
-                    debug!(error = %e, "Could not read checkpoint (transient)");
+                    debug!(error = %e, "Could not read cached checkpoint (transient)");
                     None
                 }
-            }
+            };
         }
-        Ok(None) => None,
+        // Cached path no longer exists — invalidate and re-discover
+        debug!("Cached checkpoint path disappeared, re-discovering");
+        *cached_path = None;
+    }
+
+    // Read from arc-phase-loop.local.md — Rune's single source of truth.
+    let loop_state = crate::monitor::loop_state::read_arc_loop_state(working_dir)?;
+    let cp_path = loop_state.resolve_checkpoint_path(working_dir);
+    if !cp_path.exists() {
+        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
+        return None;
+    }
+
+    info!(
+        checkpoint = %cp_path.display(),
+        arc_id = ?loop_state.arc_id(),
+        iteration = loop_state.iteration,
+        "Resolved checkpoint from arc-phase-loop.local.md"
+    );
+    match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+        Ok(cp) => {
+            *cached_path = Some(cp_path);
+            Some(cp)
+        }
         Err(e) => {
-            debug!(error = %e, "Could not find checkpoint for plan");
+            debug!(error = %e, "Could not read checkpoint (transient)");
             None
         }
+    }
+}
+
+/// Find artifact dir using the cached checkpoint path (avoids re-scanning).
+fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working_dir: &Path) -> Option<PathBuf> {
+    let cp_path = cached_cp_path.as_ref()?;
+    // checkpoint.json is at .rune/arc/arc-{id}/checkpoint.json
+    // artifact dir is at   tmp/arc/arc-{id}/
+    let arc_id = cp_path.parent()?.file_name()?;
+    let artifact_dir = working_dir.join("tmp").join("arc").join(arc_id);
+    if artifact_dir.is_dir() {
+        Some(artifact_dir)
+    } else {
+        None
     }
 }
 
@@ -890,6 +1237,124 @@ pub fn run_single_session_batch(
 
     Ok(results)
 }
+
+/// Swarm activity snapshot — number of active Claude teammates.
+///
+/// Claude Code spawns `tmux -L claude-swarm-{lead_pid}` for agent teams.
+/// Each pane runs a teammate. If teammates are running, the system is working
+/// even if the main screen is stalled (team lead waiting for agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwarmSnapshot {
+    /// Number of tmux panes in the swarm server.
+    pane_count: u32,
+    /// Number of panes with a live Claude child process.
+    active_count: u32,
+}
+
+/// Check swarm activity for a Claude Code process.
+///
+/// Looks for `claude-swarm-{pid}` tmux server and counts active panes.
+/// Returns `None` if no swarm server exists (not running agent teams).
+///
+/// Lightweight: one `tmux list-panes` call + one `ps` per pane.
+fn check_swarm_activity(claude_pid: u32) -> Option<SwarmSnapshot> {
+    use std::process::Command;
+
+    let socket_name = format!("claude-swarm-{}", claude_pid);
+
+    // Check if the swarm server exists by listing panes
+    let output = Command::new("tmux")
+        .args(["-L", &socket_name, "list-panes", "-a", "-F", "#{pane_pid}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None; // No swarm server for this PID
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane_pids: Vec<u32> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    if pane_pids.is_empty() {
+        return None;
+    }
+
+    // Count panes with active Claude child processes
+    // Each pane runs a shell → claude child. Check if claude child is alive.
+    let mut active_count = 0u32;
+    for &shell_pid in &pane_pids {
+        // Check if shell has a claude child via pgrep
+        let child_check = Command::new("pgrep")
+            .args(["-P", &shell_pid.to_string(), "-x", "claude"])
+            .output();
+        if let Ok(out) = child_check {
+            if out.status.success() {
+                active_count += 1;
+            }
+        }
+    }
+
+    Some(SwarmSnapshot {
+        pane_count: pane_pids.len() as u32,
+        active_count,
+    })
+}
+
+/// Lightweight snapshot of an artifact directory — file count and total size.
+///
+/// Used as an activity signal: if file_count or total_bytes changes between
+/// poll cycles, agents are actively writing output (review files, TOME,
+/// worker reports, etc.) even if the screen is stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactSnapshot {
+    file_count: u64,
+    total_bytes: u64,
+}
+
+/// Scan a directory recursively for file count and total size.
+///
+/// Lightweight: only calls `metadata()` per file, never reads content.
+/// Returns `None` if the directory doesn't exist (normal for early phases).
+fn scan_artifact_dir(dir: &Path) -> Option<ArtifactSnapshot> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    // Use a stack-based walk to avoid recursion depth issues
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                dirs_to_visit.push(entry.path());
+            } else if ft.is_file() {
+                file_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    Some(ArtifactSnapshot {
+        file_count,
+        total_bytes,
+    })
+}
+
 
 #[cfg(test)]
 mod tests {

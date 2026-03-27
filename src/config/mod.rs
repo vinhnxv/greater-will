@@ -6,4 +6,5 @@
 
 pub mod cli_args;
 pub mod phase_config;
+pub mod watchdog;
 

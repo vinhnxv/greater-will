@@ -52,7 +52,7 @@ use std::time::Duration;
 /// Set to 60s because Claude routinely "thinks" for 30-45s without screen
 /// updates. A 30s threshold caused false-positive kills during normal
 /// thinking pauses.
-const ERROR_STALL_THRESHOLD_SECS: u64 = 60;
+pub const ERROR_STALL_THRESHOLD_SECS: u64 = 60;
 
 /// Grace period before declaring a process crash (D7).
 ///
@@ -70,10 +70,13 @@ pub const CRASH_GRACE_SECS: u64 = 60;
 ///
 /// | Signal | Weight | Rationale |
 /// |--------|--------|-----------|
-/// | Keyword match | 0.2 | Lowest — Claude often writes about errors in code/plans |
-/// | Screen stall (>30s) | 0.3 | Medium — could be "thinking" or real stall |
-/// | Checkpoint stale | 0.3 | Medium — no heartbeat from Claude Code |
-/// | Process dead | 0.5 | High — strong evidence of real failure |
+/// | Keyword match | +0.2 | Lowest — Claude often writes about errors in code/plans |
+/// | Screen stall (>60s) | +0.3 | Medium — could be "thinking" or real stall |
+/// | Checkpoint stale (>60s) | +0.3 | Medium — no heartbeat from Claude Code |
+/// | Process dead | +0.5 | High — strong evidence of real failure |
+/// | Checkpoint fresh (<60s) | -0.2 | Negative — system is making progress |
+/// | Artifacts active (<60s) | -0.2 | Negative — agents writing output files |
+/// | Swarm active            | -0.3 | Strongest negative — teammates are running |
 ///
 /// Action thresholds:
 /// - `>= 0.5` → Classify error and act (kill/retry/skip)
@@ -88,6 +91,13 @@ pub struct ErrorEvidence {
     pub checkpoint_stale_secs: Option<u64>,
     /// Whether the Claude process is still alive.
     pub process_alive: bool,
+    /// Whether artifact directory has changed recently (files being written).
+    /// When true, agents are actively producing output — strong negative signal.
+    pub artifacts_active: bool,
+    /// Whether claude-swarm teammates are running (agent team execution).
+    /// When true, the main process may appear idle but teammates are working.
+    /// Strongest negative signal — active teammates mean the system is healthy.
+    pub swarm_active: bool,
 }
 
 impl ErrorEvidence {
@@ -95,13 +105,15 @@ impl ErrorEvidence {
     ///
     /// Positive signals increase confidence:
     /// - Keyword match: +0.2 (lowest — Claude often writes about errors)
-    /// - Screen stall (>30s): +0.3 (medium)
-    /// - Checkpoint stale (>30s): +0.3 (medium)
+    /// - Screen stall (>60s): +0.3 (medium)
+    /// - Checkpoint stale (>60s): +0.3 (medium)
     /// - Process dead: +0.5 (high)
     ///
     /// Negative signals decrease confidence:
     /// - Checkpoint fresh (still updating): -0.2 (system is making progress,
     ///   e.g., Claude waiting for teammates while checkpoint advances)
+    /// - Artifacts active (files changing): -0.2 (agents writing output,
+    ///   e.g., review agents writing TOME fragments)
     pub fn confidence(&self) -> f64 {
         let mut score: f64 = 0.0;
 
@@ -123,6 +135,20 @@ impl ErrorEvidence {
                 // updates prove work is happening.
                 score -= 0.2;
             }
+        }
+
+        // Artifact directory is actively changing — agents writing output.
+        // Similar to checkpoint freshness: even if screen is stalled,
+        // file I/O proves work is happening.
+        if self.artifacts_active {
+            score -= 0.2;
+        }
+
+        // Swarm teammates are running — strongest negative signal.
+        // The main process appears idle because it's waiting for agent results,
+        // but the actual work is happening in claude-swarm-{pid} panes.
+        if self.swarm_active {
+            score -= 0.3;
         }
 
         if !self.process_alive {
@@ -156,12 +182,21 @@ impl ErrorEvidence {
     ///
     /// Returns the keyword-matched error class only when combined evidence
     /// supports it. If no keyword matched but confidence is high (e.g.,
-    /// process dead + stall), returns `ErrorClass::Unknown`.
+    /// process dead + stall), returns `ErrorClass::Crash` — a dead process
+    /// with no specific error pattern is a crash by definition.
+    ///
+    /// Aligned with torrent's philosophy: unclassified = healthy when process
+    /// is alive. Only process death without a keyword produces a non-keyword
+    /// classification (Crash).
     pub fn classify(&self) -> Option<ErrorClass> {
         if !self.should_act() {
             return None;
         }
-        Some(self.keyword_match.unwrap_or(ErrorClass::Unknown))
+        // If keyword matched, use that classification.
+        // If no keyword but we got here, process must be dead (should_act gate
+        // ensures keyword_match.is_some() || !process_alive). Dead process
+        // without specific error = Crash.
+        Some(self.keyword_match.unwrap_or(ErrorClass::Crash))
     }
 }
 
@@ -204,9 +239,9 @@ pub enum ErrorClass {
     /// → Skip plan entirely (no retry, won't get smaller).
     RequestTooLarge,
 
-    /// Unclassified error.
-    /// → Retry once with 60s backoff.
-    Unknown,
+    /// Bootstrap error — plan not found, plugin missing, etc.
+    /// → Skip plan entirely (no retry, need user intervention).
+    BootstrapError,
 }
 
 impl ErrorClass {
@@ -224,7 +259,7 @@ impl ErrorClass {
             ErrorClass::NetworkError => Duration::from_secs(30),
             ErrorClass::PermissionBlocked => Duration::from_secs(30),
             ErrorClass::RequestTooLarge => Duration::ZERO,
-            ErrorClass::Unknown => Duration::from_secs(60),
+            ErrorClass::BootstrapError => Duration::ZERO,
         }
     }
 
@@ -239,7 +274,7 @@ impl ErrorClass {
             ErrorClass::NetworkError => 3,
             ErrorClass::PermissionBlocked => 2,
             ErrorClass::RequestTooLarge => 0,
-            ErrorClass::Unknown => 1,
+            ErrorClass::BootstrapError => 0, // terminal — skip plan
         }
     }
 
@@ -263,7 +298,7 @@ impl ErrorClass {
 
     /// Check if this error class should skip the entire plan.
     pub fn skips_plan(&self) -> bool {
-        matches!(self, ErrorClass::AuthError | ErrorClass::RequestTooLarge)
+        matches!(self, ErrorClass::AuthError | ErrorClass::RequestTooLarge | ErrorClass::BootstrapError)
     }
 
     /// Classify error patterns found in pane output.
@@ -359,7 +394,7 @@ impl ErrorClass {
                 || tail.contains("plan file not found")
                 || tail.contains("plan does not exist")
             {
-                return Some(ErrorClass::Unknown);
+                return Some(ErrorClass::BootstrapError);
             }
             if tail.contains("plugin not found")
                 || tail.contains("plugin not installed")
@@ -711,7 +746,7 @@ mod tests {
         assert_eq!(ErrorClass::Stuck.max_retries(), 2);
         assert_eq!(ErrorClass::ApiOverload.max_retries(), 4);
         assert_eq!(ErrorClass::AuthError.max_retries(), 0);
-        assert_eq!(ErrorClass::Unknown.max_retries(), 1);
+        assert_eq!(ErrorClass::BootstrapError.max_retries(), 0);
     }
 
     #[test]
@@ -820,7 +855,7 @@ mod tests {
     #[test]
     fn test_plan_not_found_detected_in_bootstrap() {
         let output = "Error: plan not found at plans/missing.md";
-        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::Unknown));
+        assert_eq!(ErrorClass::from_pane_output(output, false), Some(ErrorClass::BootstrapError));
     }
 
     #[test]
@@ -971,6 +1006,8 @@ mod tests {
             screen_stall_secs: 0,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 0.0);
         assert!(!evidence.should_act());
@@ -986,6 +1023,8 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert!(evidence.confidence() < 0.5);
         assert!(!evidence.should_act());
@@ -1000,6 +1039,8 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert!(evidence.confidence() < 0.5);
         assert!(!evidence.should_act());
@@ -1014,6 +1055,8 @@ mod tests {
             screen_stall_secs: 60,
             checkpoint_stale_secs: Some(60),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 0.8);
         assert!(evidence.should_act());
@@ -1030,6 +1073,8 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: Some(120),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 0.6);
         assert!(!evidence.should_act()); // No error indicator → idle, not error
@@ -1045,10 +1090,12 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: Some(120),
             process_alive: false,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert!(evidence.confidence() >= 0.5);
         assert!(evidence.should_act());
-        assert_eq!(evidence.classify(), Some(ErrorClass::Unknown));
+        assert_eq!(evidence.classify(), Some(ErrorClass::Crash));
     }
 
     #[test]
@@ -1059,6 +1106,8 @@ mod tests {
             screen_stall_secs: 0,
             checkpoint_stale_secs: Some(0),
             process_alive: false,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert!(evidence.confidence() >= 0.5);
         assert!(evidence.should_act());
@@ -1072,6 +1121,8 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: Some(120),
             process_alive: false,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 1.0);
         assert!(evidence.should_act());
@@ -1086,6 +1137,8 @@ mod tests {
             screen_stall_secs: 0,
             checkpoint_stale_secs: Some(0),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 0.0);
         assert!(!evidence.should_act());
@@ -1101,6 +1154,8 @@ mod tests {
             screen_stall_secs: 120,
             checkpoint_stale_secs: None,
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert_eq!(evidence.confidence(), 0.5);
         assert!(evidence.should_act());
@@ -1116,6 +1171,8 @@ mod tests {
             screen_stall_secs: 120, // 2 min stall
             checkpoint_stale_secs: Some(5), // checkpoint updated 5s ago (fresh)
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
         };
         assert!(evidence.confidence() < 0.5);
         assert!(!evidence.should_act());
@@ -1129,6 +1186,42 @@ mod tests {
             screen_stall_secs: 15,
             checkpoint_stale_secs: Some(10),
             process_alive: true,
+            artifacts_active: false,
+            swarm_active: false,
+        };
+        assert!(evidence.confidence() < 0.5);
+        assert!(!evidence.should_act());
+    }
+
+    #[test]
+    fn test_evidence_artifacts_active_reduces_confidence() {
+        // Keyword + stall + stale checkpoint = 0.8, but artifacts active = -0.2 → 0.6
+        // Still above threshold, but demonstrates the artifact signal works
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 60,
+            checkpoint_stale_secs: Some(60),
+            process_alive: true,
+            artifacts_active: true,
+            swarm_active: false,
+        };
+        let conf = evidence.confidence();
+        assert!(conf > 0.5 && conf < 0.7, "expected ~0.6, got {}", conf);
+        assert!(evidence.should_act()); // keyword present → should_act gate passes
+    }
+
+    #[test]
+    fn test_evidence_artifacts_active_prevents_action() {
+        // Keyword + stall + fresh checkpoint + artifacts active
+        // = 0.2 + 0.3 - 0.2 - 0.2 = 0.1 → NOT enough
+        // Agents writing files + checkpoint updating = definitely still working
+        let evidence = ErrorEvidence {
+            keyword_match: Some(ErrorClass::AuthError),
+            screen_stall_secs: 120,
+            checkpoint_stale_secs: Some(5),
+            process_alive: true,
+            artifacts_active: true,
+            swarm_active: false,
         };
         assert!(evidence.confidence() < 0.5);
         assert!(!evidence.should_act());

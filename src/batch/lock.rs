@@ -1,25 +1,32 @@
 //! Instance lock to prevent concurrent gw executions.
 //!
-//! Uses a PID-based lock file at `.gw/gw.lock` with stale detection —
-//! if the PID in the lock file is no longer running, the lock is considered
-//! stale and can be reclaimed.
+//! Uses an advisory file lock via `fs2` at `.gw/gw.lock` — the OS kernel
+//! guarantees mutual exclusion, eliminating TOCTOU races that a
+//! check-then-write PID scheme would have.
 
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
-use std::fs;
+use fs2::FileExt;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 
-/// Lock file content: the PID of the holding process.
+/// Advisory file lock guard for single-instance enforcement.
+///
+/// The lock is held for the lifetime of this struct. Dropping it
+/// releases the advisory lock and removes the lock file.
 #[derive(Debug)]
 pub struct InstanceLock {
     lock_path: PathBuf,
+    #[allow(dead_code)]
+    lock_file: File,
 }
 
 impl InstanceLock {
     /// Acquire the instance lock.
     ///
-    /// If a lock file exists, checks if the holding PID is still alive.
-    /// Stale locks (dead PIDs) are automatically reclaimed.
+    /// Uses `fs2::try_lock_exclusive()` for atomic, race-free locking.
+    /// The PID is written to the file for debugging purposes only.
     pub fn acquire() -> Result<Self> {
         let lock_path = PathBuf::from(".gw/gw.lock");
 
@@ -29,44 +36,43 @@ impl InstanceLock {
                 .wrap_err("Failed to create .gw directory")?;
         }
 
-        // Check for existing lock
-        if lock_path.exists() {
-            let content = fs::read_to_string(&lock_path)
-                .wrap_err("Failed to read lock file")?;
+        // Open/create the lock file and attempt an exclusive advisory lock
+        let mut lock_file = File::create(&lock_path)
+            .wrap_err("Failed to create lock file")?;
 
-            if let Ok(pid) = content.trim().parse::<u32>() {
-                if is_process_alive(pid) {
-                    eyre::bail!(
-                        "Another gw instance is running (PID {}). \
-                         If this is stale, remove {}",
-                        pid,
-                        lock_path.display()
-                    );
-                } else {
-                    tracing::info!(
-                        stale_pid = pid,
-                        "Reclaiming stale lock from dead process"
-                    );
-                }
-            }
-            // Lock file exists but is invalid or stale — reclaim it
-        }
+        lock_file.try_lock_exclusive().map_err(|_| {
+            // Read existing PID for a helpful error message
+            let pid_info = fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|pid| format!(" (PID {pid})"))
+                .unwrap_or_default();
+            eyre::eyre!(
+                "Another gw instance is running{pid_info}. \
+                 If this is stale, remove {}",
+                lock_path.display()
+            )
+        })?;
 
-        // Write our PID
+        // Write our PID for debugging (lock is already held)
         let our_pid = std::process::id();
-        fs::write(&lock_path, our_pid.to_string())
-            .wrap_err("Failed to write lock file")?;
+        write!(lock_file, "{our_pid}")
+            .wrap_err("Failed to write PID to lock file")?;
 
         tracing::info!(pid = our_pid, "Acquired instance lock");
 
-        Ok(Self { lock_path })
+        Ok(Self {
+            lock_path,
+            lock_file,
+        })
     }
 
     /// Release the instance lock.
     pub fn release(&self) -> Result<()> {
         if self.lock_path.exists() {
-            fs::remove_file(&self.lock_path)
-                .wrap_err("Failed to remove lock file")?;
+            if let Err(e) = fs::remove_file(&self.lock_path) {
+                eprintln!("Warning: failed to remove lock file: {e}");
+            }
             tracing::info!("Released instance lock");
         }
         Ok(())
@@ -75,15 +81,12 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        // Best-effort cleanup on drop
+        // Best-effort cleanup on drop — advisory lock auto-releases
+        // when File is dropped, but remove the file for tidiness.
         if self.lock_path.exists() {
-            let _ = fs::remove_file(&self.lock_path);
+            if let Err(e) = fs::remove_file(&self.lock_path) {
+                eprintln!("Warning: failed to remove lock file on drop: {e}");
+            }
         }
     }
-}
-
-/// Check if a process with the given PID is still alive.
-fn is_process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if process exists without sending a signal
-    unsafe { libc::kill(pid as i32, 0) == 0 }
 }

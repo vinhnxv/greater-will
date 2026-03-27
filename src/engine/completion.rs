@@ -384,6 +384,10 @@ impl CompletionDetector {
             // Process liveness is checked by the caller (single_session/phase_executor).
             // CompletionDetector doesn't have access to the PID.
             process_alive: true,
+            // CompletionDetector doesn't have artifact dir or swarm access.
+            // These are monitored in single_session's outer loop.
+            artifacts_active: false,
+            swarm_active: false,
         };
 
         if let Some(error_class) = evidence.classify() {

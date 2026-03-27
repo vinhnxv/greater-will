@@ -251,6 +251,9 @@ fn start_claude(
         }
     }
 
+    // Validate claude_path before interpolation to prevent command injection
+    validate_executable_path(claude_path)?;
+
     // Add claude command with skip permissions
     // Note: don't shell_escape the claude path — it's sent via tmux send-keys
     // which interprets literally. Escaping wraps it in quotes that break execution.
@@ -403,6 +406,27 @@ pub fn shell_escape(s: &str) -> String {
     } else {
         format!("'{}'", s)
     }
+}
+
+/// Validate that an executable path contains only safe characters.
+///
+/// Prevents command injection when the path is interpolated into
+/// shell commands (e.g., tmux send-keys). Only alphanumeric characters,
+/// hyphens, underscores, forward slashes, and dots are permitted.
+fn validate_executable_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(eyre!("executable path is empty"));
+    }
+    if !path
+        .chars()
+        .all(|c| c.is_alphanumeric() || "-_/.".contains(c))
+    {
+        return Err(eyre!(
+            "executable path contains unsafe characters: {}",
+            path
+        ));
+    }
+    Ok(())
 }
 
 /// Wait for the Claude Code prompt to appear.

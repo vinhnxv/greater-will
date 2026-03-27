@@ -261,7 +261,16 @@ pub fn resolve_config(cli_path: Option<&Path>, cwd: &Path) -> color_eyre::Result
                 p.display()
             );
         }
-        return Ok(Some(p.to_path_buf()));
+        if p.is_dir() {
+            // cli_path is a directory (e.g., CLAUDE_CONFIG_DIR) — look for config inside it
+            let file_in_dir = p.join("greater-will.toml");
+            if file_in_dir.exists() {
+                return Ok(Some(file_in_dir));
+            }
+            // Directory exists but no config file inside — fall through to other sources
+        } else {
+            return Ok(Some(p.to_path_buf()));
+        }
     }
 
     // 2. Check for project-local override
