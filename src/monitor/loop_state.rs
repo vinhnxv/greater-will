@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Parsed state from `.rune/arc-phase-loop.local.md`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArcLoopState {
     pub active: bool,
     pub checkpoint_path: String,
@@ -23,7 +23,93 @@ pub struct ArcLoopState {
     pub max_iterations: u32,
 }
 
+/// A single field change between two `ArcLoopState` snapshots.
+#[derive(Debug, Clone)]
+pub struct LoopStateChange {
+    pub field: &'static str,
+    pub old_value: String,
+    pub new_value: String,
+    /// Whether this change is unexpected during a normal arc run.
+    pub anomalous: bool,
+}
+
 impl ArcLoopState {
+    /// Compare two states and return all field-level differences.
+    ///
+    /// Fields are classified as normal (iteration increment) or anomalous
+    /// (branch change, pid change, plan change mid-run).
+    pub fn diff(&self, new: &ArcLoopState) -> Vec<LoopStateChange> {
+        let mut changes = Vec::new();
+
+        if self.active != new.active {
+            changes.push(LoopStateChange {
+                field: "active",
+                old_value: self.active.to_string(),
+                new_value: new.active.to_string(),
+                anomalous: false, // active → false is expected on shutdown
+            });
+        }
+        if self.iteration != new.iteration {
+            changes.push(LoopStateChange {
+                field: "iteration",
+                old_value: self.iteration.to_string(),
+                new_value: new.iteration.to_string(),
+                anomalous: new.iteration < self.iteration, // decrement is anomalous
+            });
+        }
+        if self.checkpoint_path != new.checkpoint_path {
+            changes.push(LoopStateChange {
+                field: "checkpoint_path",
+                old_value: self.checkpoint_path.clone(),
+                new_value: new.checkpoint_path.clone(),
+                anomalous: true, // shouldn't change during a run
+            });
+        }
+        if self.plan_file != new.plan_file {
+            changes.push(LoopStateChange {
+                field: "plan_file",
+                old_value: self.plan_file.clone(),
+                new_value: new.plan_file.clone(),
+                anomalous: true, // should never change
+            });
+        }
+        if self.branch != new.branch {
+            changes.push(LoopStateChange {
+                field: "branch",
+                old_value: self.branch.clone(),
+                new_value: new.branch.clone(),
+                anomalous: true, // should never change mid-run
+            });
+        }
+        if self.owner_pid != new.owner_pid {
+            changes.push(LoopStateChange {
+                field: "owner_pid",
+                old_value: self.owner_pid.clone(),
+                new_value: new.owner_pid.clone(),
+                anomalous: true, // implies session restart from outside gw
+            });
+        }
+        if self.session_id != new.session_id {
+            changes.push(LoopStateChange {
+                field: "session_id",
+                old_value: self.session_id.clone(),
+                new_value: new.session_id.clone(),
+                anomalous: true,
+            });
+        }
+        if self.max_iterations != new.max_iterations {
+            changes.push(LoopStateChange {
+                field: "max_iterations",
+                old_value: self.max_iterations.to_string(),
+                new_value: new.max_iterations.to_string(),
+                anomalous: true, // shouldn't change mid-run
+            });
+        }
+        // config_dir changes are not tracked — it's immutable and not interesting.
+
+        changes
+    }
+
     /// Resolve `checkpoint_path` to an absolute path relative to `working_dir`.
     pub fn resolve_checkpoint_path(&self, working_dir: &Path) -> PathBuf {
         if self.checkpoint_path.starts_with('/') {
@@ -205,5 +291,80 @@ plan_file: plans/test.md
         };
         let resolved = state.resolve_checkpoint_path(Path::new("/project"));
         assert_eq!(resolved, PathBuf::from("/abs/path/checkpoint.json"));
+    }
+
+    fn make_state(iteration: u32) -> ArcLoopState {
+        ArcLoopState {
+            active: true,
+            checkpoint_path: ".rune/arc/arc-123/checkpoint.json".into(),
+            plan_file: "plans/test.md".into(),
+            config_dir: "/home/user/.claude".into(),
+            owner_pid: "1234".into(),
+            session_id: "sess-abc".into(),
+            branch: "rune/arc-test".into(),
+            iteration,
+            max_iterations: 50,
+        }
+    }
+
+    #[test]
+    fn test_diff_no_changes() {
+        let a = make_state(1);
+        let b = make_state(1);
+        assert!(a.diff(&b).is_empty());
+    }
+
+    #[test]
+    fn test_diff_iteration_increment() {
+        let a = make_state(1);
+        let b = make_state(2);
+        let changes = a.diff(&b);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "iteration");
+        assert_eq!(changes[0].old_value, "1");
+        assert_eq!(changes[0].new_value, "2");
+        assert!(!changes[0].anomalous);
+    }
+
+    #[test]
+    fn test_diff_iteration_decrement_is_anomalous() {
+        let a = make_state(5);
+        let b = make_state(3);
+        let changes = a.diff(&b);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].anomalous);
+    }
+
+    #[test]
+    fn test_diff_branch_change_is_anomalous() {
+        let a = make_state(1);
+        let mut b = make_state(1);
+        b.branch = "rune/arc-other".into();
+        let changes = a.diff(&b);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "branch");
+        assert!(changes[0].anomalous);
+    }
+
+    #[test]
+    fn test_diff_multiple_changes() {
+        let a = make_state(1);
+        let mut b = make_state(3);
+        b.owner_pid = "5678".into();
+        let changes = a.diff(&b);
+        assert_eq!(changes.len(), 2);
+        let fields: Vec<&str> = changes.iter().map(|c| c.field).collect();
+        assert!(fields.contains(&"iteration"));
+        assert!(fields.contains(&"owner_pid"));
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        let a = make_state(1);
+        let b = make_state(1);
+        assert_eq!(a, b);
+
+        let c = make_state(2);
+        assert_ne!(a, c);
     }
 }

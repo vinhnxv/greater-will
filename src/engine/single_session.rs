@@ -137,16 +137,62 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     // Startup cleanup
     startup_cleanup()?;
 
+    // --- SESSION OWNER CHECK ---
+    // Use gw's own PID (from session-owner.json) to detect orphaned sessions,
+    // NOT Claude's owner_pid from loop state (which is always alive if Claude is running).
+    use crate::monitor::session_owner::{self, OwnerCheck};
+    let owner_check = session_owner::check_previous_owner(&config.working_dir);
+    let adopt_session: Option<(String, u32)> = match &owner_check {
+        OwnerCheck::NoPrevious => None,
+        OwnerCheck::OrphanedDead { .. } => None, // stale file already cleaned up
+        OwnerCheck::OrphanedStaleClaude { owner } => {
+            // Tmux alive but Claude dead — kill the stale session
+            println!(
+                "[gw] Previous gw (pid {}) died. Session '{}' alive but Claude (pid {}) dead — killing stale session",
+                owner.gw_pid, owner.session_name, owner.claude_pid,
+            );
+            let _ = kill_session(&owner.session_name);
+            session_owner::remove_session_owner(&config.working_dir);
+            None
+        }
+        OwnerCheck::OrphanedAlive { owner } => {
+            // Previous gw dead, but tmux + Claude still running!
+            // Verify the plan matches before adopting.
+            let normalize = |p: &str| p.trim_start_matches("./").to_string();
+            let owner_plan = normalize(&owner.plan_file);
+            let our_plan = normalize(plan_str);
+
+            if owner_plan == our_plan {
+                println!(
+                    "[gw] Previous gw (pid {}) died — adopting live session '{}' (Claude pid {})",
+                    owner.gw_pid, owner.session_name, owner.claude_pid,
+                );
+                Some((owner.session_name.clone(), owner.claude_pid))
+            } else {
+                // Different plan — can't adopt. Kill and start fresh.
+                warn!(
+                    owner_plan = %owner.plan_file,
+                    our_plan = %plan_str,
+                    "Orphaned session is for a different plan — killing"
+                );
+                println!(
+                    "[gw] Orphaned session '{}' is for '{}', not '{}' — killing",
+                    owner.session_name, owner.plan_file, plan_str,
+                );
+                let _ = kill_session(&owner.session_name);
+                session_owner::remove_session_owner(&config.working_dir);
+                None
+            }
+        }
+    };
+
     // Pre-flight: Check for existing arc-phase-loop.local.md.
-    // If a loop state file already exists, it could be from:
-    //   (a) A previous gw run for the SAME plan (resume scenario)
-    //   (b) A different plan's arc session (conflict)
-    //   (c) An orphaned file from a crashed session
+    // Now that we use session-owner.json for gw-level orphan detection,
+    // this check only handles the loop state file consistency.
     if let Some(existing_state) = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir) {
         let existing_plan = existing_state.plan_file.clone();
         let our_plan = plan_str.to_string();
 
-        // Normalize for comparison: strip leading "./" and compare
         let normalize = |p: &str| p.trim_start_matches("./").to_string();
         let existing_normalized = normalize(&existing_plan);
         let our_normalized = normalize(&our_plan);
@@ -158,44 +204,21 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 "Found existing loop state for same plan — will resume"
             );
             println!("[gw] Found existing arc session for this plan (iteration {})", existing_state.iteration);
-        } else {
-            warn!(
+        } else if adopt_session.is_none() {
+            // Different plan and we're not adopting — check if it's truly orphaned.
+            // Use session-owner.json's gw_pid (already checked above) as authoritative.
+            // If we got here without adopting, the previous session is already killed.
+            info!(
                 existing_plan = %existing_plan,
                 our_plan = %our_plan,
-                owner_pid = %existing_state.owner_pid,
-                "Loop state exists for a DIFFERENT plan"
+                "Cleaning up loop state from different plan (previous gw already handled)"
             );
-
-            // Check if the owner process is still alive
-            let owner_alive = existing_state.owner_pid.parse::<u32>()
-                .map(|pid| crate::cleanup::process::is_pid_alive(pid))
-                .unwrap_or(false);
-
-            if owner_alive {
-                eyre::bail!(
-                    "Another arc session is actively running for '{}' (pid {}). \
-                     Cannot run '{}' concurrently in the same project directory. \
-                     Wait for it to finish or kill it first.",
-                    existing_plan,
-                    existing_state.owner_pid,
-                    our_plan,
-                );
-            } else {
-                // Owner is dead — orphaned loop state. Clean it up.
-                info!(
-                    owner_pid = %existing_state.owner_pid,
-                    "Owner process is dead — cleaning up orphaned loop state"
-                );
-                println!(
-                    "[gw] Stale loop state from '{}' (dead pid {}) — cleaning up",
-                    existing_plan, existing_state.owner_pid,
-                );
-                let loop_file = config.working_dir.join(".rune").join("arc-phase-loop.local.md");
-                if let Err(e) = std::fs::remove_file(&loop_file) {
-                    warn!(error = %e, "Failed to remove orphaned loop state (non-fatal)");
-                }
+            let loop_file = config.working_dir.join(".rune").join("arc-phase-loop.local.md");
+            if let Err(e) = std::fs::remove_file(&loop_file) {
+                warn!(error = %e, "Failed to remove orphaned loop state (non-fatal)");
             }
         }
+        // If adopting + same plan: loop state is valid, keep it.
     }
 
     // Build session name from plan filename
@@ -225,9 +248,13 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     println!("Tip: use -v for detailed monitoring logs, -vv for debug output");
     println!();
 
-    // Crash-recovery loop
+    // Crash-recovery loop — load history from previous gw if it crashed
     let mut crash_detector = CrashLoopDetector::from_watchdog(&config.watchdog);
+    crash_detector.load_history(&config.working_dir);
     let mut is_first_run = true;
+
+    // If we're adopting an orphaned session, use it on the first attempt.
+    let mut pending_adopt = adopt_session;
 
     loop {
         // Check total timeout
@@ -239,6 +266,62 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 message: "Pipeline timeout exceeded".to_string(),
                 session_name: session_name.clone(),
             });
+        }
+
+        // ADOPT PATH: Reuse an existing orphaned session instead of spawning.
+        // This only happens on the first iteration when a previous gw crashed
+        // but tmux + Claude are still alive and running the same plan.
+        if let Some((ref adopt_name, adopt_pid)) = pending_adopt.take() {
+            info!(
+                session = %adopt_name,
+                claude_pid = adopt_pid,
+                "Adopting orphaned session — skipping spawn and dispatch"
+            );
+            println!("[gw] Adopting session '{}' (pid {}) — entering monitor loop", adopt_name, adopt_pid);
+
+            // Write new owner file with our gw pid
+            if let Err(e) = session_owner::write_session_owner(
+                &config.working_dir, adopt_name, plan_str, adopt_pid,
+            ) {
+                warn!(error = %e, "Failed to write session owner during adopt (non-fatal)");
+            }
+
+            // Go straight to monitoring — no spawn, no dispatch
+            let attempt_start = Instant::now();
+            let attempt_result = monitor_session(
+                adopt_name,
+                adopt_pid,
+                config,
+                start,
+                plan_path,
+            )?;
+
+            let attempt_duration = attempt_start.elapsed();
+            if attempt_duration >= Duration::from_secs(config.watchdog.crash_stability_secs) {
+                crash_detector.record_healthy_tick();
+            }
+
+            // Handle outcome same as normal attempt
+            match attempt_result {
+                SessionOutcome::Completed => {
+                    session_owner::remove_session_owner(&config.working_dir);
+                    CrashLoopDetector::clear_history(&config.working_dir);
+                    return Ok(PipelineResult {
+                        success: true,
+                        duration: start.elapsed(),
+                        crash_restarts: crash_detector.total_restarts(),
+                        message: "Pipeline completed successfully (adopted session)".to_string(),
+                        session_name: session_name.clone(),
+                    });
+                }
+                // On any non-completion, fall through to the normal crash-recovery loop
+                // which will spawn a fresh session with --resume.
+                _ => {
+                    is_first_run = false;
+                    warn!("Adopted session ended with {:?} — will restart with --resume", attempt_result);
+                    continue;
+                }
+            }
         }
 
         // Build command — use --resume after first crash
@@ -267,6 +350,8 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
         match attempt_result {
             SessionOutcome::Completed => {
+                session_owner::remove_session_owner(&config.working_dir);
+                CrashLoopDetector::clear_history(&config.working_dir);
                 return Ok(PipelineResult {
                     success: true,
                     duration: start.elapsed(),
@@ -280,6 +365,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
                 match crash_detector.record_restart() {
                     CrashLoopDecision::StopCrashLoop => {
+                        CrashLoopDetector::clear_history(&config.working_dir);
                         return Ok(PipelineResult {
                             success: false,
                             duration: start.elapsed(),
@@ -411,6 +497,10 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     backoff.as_secs(),
                 );
 
+                // Persist crash history before sleeping — if gw is killed during
+                // backoff, the next gw run will inherit the crash count.
+                crash_detector.persist(&config.working_dir);
+
                 std::thread::sleep(backoff);
             }
         }
@@ -475,6 +565,14 @@ fn run_session_attempt(
         }
     };
 
+    // Write session owner file so next gw run can adopt if we crash
+    let plan_str = plan_path.to_str().unwrap_or("unknown");
+    if let Err(e) = crate::monitor::session_owner::write_session_owner(
+        &config.working_dir, session_name, plan_str, pid,
+    ) {
+        warn!(error = %e, "Failed to write session owner (non-fatal)");
+    }
+
     info!(session = %session_name, pid = pid, "Session spawned, waiting for Claude Code init");
     println!("[gw] Session spawned (pid={}), waiting 12s for Claude Code init...", pid);
     std::thread::sleep(Duration::from_secs(12));
@@ -488,6 +586,23 @@ fn run_session_attempt(
             reason: format!("Failed to send command: {}", e),
         });
     }
+
+    // Delegate to the shared monitor loop
+    monitor_session(session_name, pid, config, pipeline_start, plan_path)
+}
+
+/// Monitor an active session (shared between spawn and adopt paths).
+///
+/// This is the core monitor loop extracted from `run_session_attempt`.
+/// Both the normal spawn path and the adopt-orphaned-session path
+/// converge here.
+fn monitor_session(
+    session_name: &str,
+    pid: u32,
+    config: &SingleSessionConfig,
+    pipeline_start: Instant,
+    plan_path: &Path,
+) -> Result<SessionOutcome> {
 
     // Monitor loop
     let dispatch_time = Instant::now();
@@ -524,6 +639,11 @@ fn run_session_attempt(
     // to avoid false positives from Rune briefly rewriting the file.
     let mut loop_state_gone_since: Option<Instant> = None;
     const LOOP_STATE_GONE_GRACE_SECS: u64 = 15;
+
+    // Content change tracking: detect field-level changes in the loop state file.
+    // Tracks iteration progression, anomalous field mutations, and content stall.
+    let mut prev_loop_state: Option<crate::monitor::loop_state::ArcLoopState> = None;
+    let mut last_loop_state_change = Instant::now();
 
     // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
     // we start a confirmation timer. If the timer expires without new activity,
@@ -725,14 +845,74 @@ fn run_session_attempt(
             }
         }
 
-        // LOOP STATE WARMUP: Detect when arc-phase-loop.local.md hasn't appeared
-        // or has been deleted after appearing. This file is Rune's heartbeat — its
-        // absence after the warmup period means the arc failed to initialize, and
-        // its disappearance after existing means the arc completed or crashed.
-        let loop_state_exists = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir).is_some();
-        if loop_state_exists {
+        // LOOP STATE TRACKING: Monitor arc-phase-loop.local.md for existence,
+        // content changes, and stall detection. This file is Rune's heartbeat.
+        let current_loop_state = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir);
+        let loop_state_exists = current_loop_state.is_some();
+
+        if let Some(ref current) = current_loop_state {
+            if !loop_state_ever_seen {
+                // First time seeing the file — log initial state
+                info!(
+                    iteration = current.iteration,
+                    max_iterations = current.max_iterations,
+                    plan = %current.plan_file,
+                    branch = %current.branch,
+                    "Loop state appeared — arc initialized"
+                );
+                println!(
+                    "[gw] Arc initialized: iteration {}/{}, plan={}",
+                    current.iteration, current.max_iterations, current.plan_file,
+                );
+            }
+
             loop_state_ever_seen = true;
             loop_state_gone_since = None; // Reset grace timer — file is back
+
+            // Content change detection: compare all fields with previous snapshot
+            if let Some(ref prev) = prev_loop_state {
+                if prev != current {
+                    let changes = prev.diff(current);
+                    last_loop_state_change = Instant::now();
+
+                    for change in &changes {
+                        if change.anomalous {
+                            warn!(
+                                field = change.field,
+                                old = %change.old_value,
+                                new = %change.new_value,
+                                "Anomalous loop state change detected"
+                            );
+                            println!(
+                                "[gw] ⚠ Loop state anomaly: {} changed '{}' → '{}'",
+                                change.field, change.old_value, change.new_value,
+                            );
+                        } else {
+                            info!(
+                                field = change.field,
+                                old = %change.old_value,
+                                new = %change.new_value,
+                                "Loop state field changed"
+                            );
+                            if change.field == "iteration" {
+                                println!(
+                                    "[gw] Arc iteration: {} → {} (max {})",
+                                    change.old_value, change.new_value, current.max_iterations,
+                                );
+                            }
+                        }
+                    }
+
+                    // Any content change is activity — reset idle-adjacent timers
+                    last_activity = Instant::now();
+                }
+            }
+
+            // Update snapshot for next poll
+            prev_loop_state = Some(current.clone());
+        } else if loop_state_ever_seen {
+            // File gone — clear previous state (will be set again if file returns)
+            prev_loop_state = None;
         }
 
         if !loop_state_exists {
@@ -1034,18 +1214,51 @@ fn run_session_attempt(
             let elapsed = dispatch_time.elapsed();
             let idle_secs = last_activity.elapsed().as_secs();
             let remaining = config.pipeline_timeout.saturating_sub(pipeline_start.elapsed());
+            let loop_stall_secs = last_loop_state_change.elapsed().as_secs();
+
+            // Include loop state info if available
+            let loop_info = prev_loop_state.as_ref().map(|s| {
+                format!("iter={}/{}, stale={}s", s.iteration, s.max_iterations, loop_stall_secs)
+            }).unwrap_or_else(|| "no loop state".to_string());
+
             info!(
                 elapsed_secs = elapsed.as_secs(),
                 idle_secs = idle_secs,
                 remaining_secs = remaining.as_secs(),
+                loop_stall_secs = loop_stall_secs,
                 poll_count = poll_count,
                 nudged = nudged,
-                "Monitor status: running for {}m{}s, idle {}s, {}m remaining",
+                "Monitor status: running {}m{}s, idle {}s, {}m left, {}",
                 elapsed.as_secs() / 60,
                 elapsed.as_secs() % 60,
                 idle_secs,
                 remaining.as_secs() / 60,
+                loop_info,
             );
+
+            // Log stall warning if loop state hasn't changed for a long time
+            // (10 min threshold — convergence loops typically complete in 5-8 min)
+            const LOOP_STALL_WARN_SECS: u64 = 600;
+            if loop_state_ever_seen && loop_stall_secs > LOOP_STALL_WARN_SECS {
+                let cp_stale = last_checkpoint_activity.elapsed().as_secs();
+                if cp_stale > LOOP_STALL_WARN_SECS {
+                    warn!(
+                        loop_stall_secs = loop_stall_secs,
+                        checkpoint_stale_secs = cp_stale,
+                        "Loop state AND checkpoint both stale — arc may be stuck"
+                    );
+                    println!(
+                        "[gw] Loop state unchanged for {}m, checkpoint stale for {}m — possible stall",
+                        loop_stall_secs / 60, cp_stale / 60,
+                    );
+                } else {
+                    debug!(
+                        loop_stall_secs = loop_stall_secs,
+                        "Loop state stale but checkpoint still updating — phase in progress"
+                    );
+                }
+            }
+
             last_status_log = Instant::now();
         }
 

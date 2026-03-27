@@ -4,8 +4,10 @@
 //! Crashes outside the window are forgotten, and a stability period of healthy
 //! running resets the crash history entirely.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Decision from the crash loop detector after recording a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,117 @@ impl CrashLoopDetector {
 
     /// Crashes within the current window.
     pub fn crashes_in_window(&self) -> usize { self.crash_times.len() }
+
+    /// Persist crash history to disk so it survives gw restarts.
+    ///
+    /// Converts `Instant` timestamps to Unix epoch seconds for serialization.
+    /// Only crashes within the current window are persisted.
+    pub fn persist(&self, working_dir: &Path) {
+        let now_instant = Instant::now();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Convert Instants to epoch seconds
+        let crash_epochs: Vec<u64> = self.crash_times.iter().map(|&t| {
+            let age_secs = now_instant.duration_since(t).as_secs();
+            now_epoch.saturating_sub(age_secs)
+        }).collect();
+
+        let record = CrashHistoryRecord {
+            crash_epochs,
+            total_restarts: self.total_restarts,
+            window_secs: self.window.as_secs(),
+        };
+
+        let path = Self::history_path(working_dir);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match serde_json::to_string_pretty(&record) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!(error = %e, "Failed to persist crash history");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "Failed to serialize crash history"),
+        }
+    }
+
+    /// Load crash history from a previous gw run.
+    ///
+    /// Converts persisted epoch timestamps back to `Instant` (approximate).
+    /// Crashes older than the window are automatically pruned.
+    pub fn load_history(&mut self, working_dir: &Path) {
+        let path = Self::history_path(working_dir);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return, // No history file — first run
+        };
+
+        let record: CrashHistoryRecord = match serde_json::from_str(&contents) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to parse crash history — starting fresh");
+                return;
+            }
+        };
+
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let now_instant = Instant::now();
+        let window_secs = self.window.as_secs();
+
+        // Restore crashes that are still within our window
+        let mut restored = 0u32;
+        for epoch in &record.crash_epochs {
+            let age_secs = now_epoch.saturating_sub(*epoch);
+            if age_secs < window_secs {
+                // Reconstruct approximate Instant
+                let crash_instant = now_instant - Duration::from_secs(age_secs);
+                self.crash_times.push_back(crash_instant);
+                restored += 1;
+            }
+        }
+
+        self.total_restarts = record.total_restarts;
+
+        if restored > 0 {
+            tracing::info!(
+                restored = restored,
+                total_restarts = record.total_restarts,
+                "Loaded crash history from previous gw run"
+            );
+        }
+
+        // Clean up the history file after loading
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Remove persisted crash history (call on clean completion).
+    pub fn clear_history(working_dir: &Path) {
+        let path = Self::history_path(working_dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn history_path(working_dir: &Path) -> std::path::PathBuf {
+        working_dir.join(".gw").join("crash-history.json")
+    }
+}
+
+/// Serializable crash history for persistence across gw restarts.
+#[derive(Debug, Serialize, Deserialize)]
+struct CrashHistoryRecord {
+    /// Crash timestamps as Unix epoch seconds.
+    crash_epochs: Vec<u64>,
+    /// Total lifetime restarts.
+    total_restarts: u32,
+    /// Window size used when this history was written.
+    window_secs: u64,
 }
 
 #[cfg(test)]
@@ -161,5 +274,81 @@ mod tests {
         let cfg = crate::config::watchdog::WatchdogConfig::from_env();
         let d = CrashLoopDetector::from_watchdog(&cfg);
         assert_eq!(d.max_crashes, cfg.max_crash_retries);
+    }
+
+    #[test]
+    fn test_persist_and_load_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Create a detector with some crashes
+        let mut d1 = CrashLoopDetector::new(5, 900, 1800);
+        d1.record_restart();
+        d1.record_restart();
+        assert_eq!(d1.total_restarts(), 2);
+        assert_eq!(d1.crashes_in_window(), 2);
+
+        // Persist
+        d1.persist(dir.path());
+        assert!(dir.path().join(".gw").join("crash-history.json").exists());
+
+        // Load into a fresh detector
+        let mut d2 = CrashLoopDetector::new(5, 900, 1800);
+        d2.load_history(dir.path());
+        assert_eq!(d2.total_restarts(), 2);
+        assert_eq!(d2.crashes_in_window(), 2);
+
+        // History file should be cleaned up after load
+        assert!(!dir.path().join(".gw").join("crash-history.json").exists());
+    }
+
+    #[test]
+    fn test_load_missing_history_is_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.load_history(dir.path()); // no file — should not panic
+        assert_eq!(d.total_restarts(), 0);
+    }
+
+    #[test]
+    fn test_clear_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.record_restart();
+        d.persist(dir.path());
+        assert!(dir.path().join(".gw").join("crash-history.json").exists());
+
+        CrashLoopDetector::clear_history(dir.path());
+        assert!(!dir.path().join(".gw").join("crash-history.json").exists());
+    }
+
+    #[test]
+    fn test_persisted_crashes_respect_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Manually write a history with an old crash (expired) and a recent one
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = CrashHistoryRecord {
+            crash_epochs: vec![
+                now_epoch - 2000, // older than 900s window → should be pruned
+                now_epoch - 10,   // recent → should be kept
+            ],
+            total_restarts: 5,
+            window_secs: 900,
+        };
+
+        let gw_dir = dir.path().join(".gw");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        std::fs::write(
+            gw_dir.join("crash-history.json"),
+            serde_json::to_string(&record).unwrap(),
+        ).unwrap();
+
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.load_history(dir.path());
+        assert_eq!(d.total_restarts(), 5); // total preserved
+        assert_eq!(d.crashes_in_window(), 1); // only recent one survives window
     }
 }
