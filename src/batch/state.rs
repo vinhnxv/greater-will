@@ -118,9 +118,10 @@ impl BatchState {
             .wrap_err_with(|| format!("Failed to write tmp state: {}", tmp_path.display()))?;
 
         // Fsync to ensure data is on disk before rename
-        if let Ok(f) = fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
-        }
+        let f = fs::File::open(&tmp_path)
+            .wrap_err_with(|| format!("Failed to open tmp file for fsync: {}", tmp_path.display()))?;
+        f.sync_all()
+            .wrap_err("Failed to fsync batch state to disk")?;
 
         // Atomic rename
         fs::rename(&tmp_path, &state_path)

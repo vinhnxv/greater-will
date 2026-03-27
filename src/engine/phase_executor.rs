@@ -304,7 +304,7 @@ impl PhaseGroupExecutor {
         }
 
         // Execute with retry
-        let mut retries;
+        let mut retry_count: u32 = 0;
         loop {
             let result = self.execute_group_once(
                 group,
@@ -319,18 +319,17 @@ impl PhaseGroupExecutor {
                 PhaseGroupState::Succeeded => {
                     return Ok(result);
                 }
-                PhaseGroupState::Failed { error, retries: r } => {
-                    retries = r;
-
+                PhaseGroupState::Failed { error, .. } => {
                     // Check retry decision
                     let decision = self.retry_coordinator.should_retry(&group.name, error);
 
                     match decision {
                         RetryDecision::Retry { after } => {
+                            retry_count += 1;
                             info!(
                                 group = %group.name,
                                 after_secs = after.as_secs(),
-                                retry = retries,
+                                retry = retry_count,
                                 "Retrying group after backoff"
                             );
                             std::thread::sleep(after);
@@ -343,11 +342,11 @@ impl PhaseGroupExecutor {
                             );
                             return Ok(PhaseGroupResult {
                                 group_name: group.name.clone(),
-                                state: PhaseGroupState::Failed { retries, error },
+                                state: PhaseGroupState::Failed { retries: retry_count, error },
                                 session_id: Some(session_id),
                                 pid: None,
                                 duration: start.elapsed(),
-                                retries,
+                                retries: retry_count,
                                 error_message: Some(format!("Fatal error: {:?}", error)),
                                 phases: group.phases.clone(),
                             });
@@ -355,10 +354,14 @@ impl PhaseGroupExecutor {
                         RetryDecision::Exhausted => {
                             error!(
                                 group = %group.name,
-                                retries = retries,
+                                retries = retry_count,
                                 "Group failed after max retries"
                             );
-                            return Ok(result);
+                            return Ok(PhaseGroupResult {
+                                retries: retry_count,
+                                state: PhaseGroupState::Failed { retries: retry_count, error },
+                                ..result
+                            });
                         }
                     }
                 }
@@ -514,11 +517,21 @@ impl PhaseGroupExecutor {
         let mut nudge_sent = false;
         let mut tick_count: u64 = 0;
         let monitor_start = Instant::now();
+        let mut last_pane_content = String::new();
 
         loop {
             tick_count += 1;
             // Get pane content
             let pane_content = capture_pane(session_id)?;
+
+            // Reset nudge state when pane content changes (session recovered from stall)
+            if pane_content != last_pane_content {
+                if nudge_sent {
+                    debug!(group = %group.name, "Pane content changed after nudge, re-enabling nudge");
+                    nudge_sent = false;
+                }
+                last_pane_content = pane_content.clone();
+            }
 
             // Check completion
             match detector.tick(&pane_content)? {

@@ -43,6 +43,8 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::checkpoint::phase_order::PHASE_ORDER;
+
 // ─── Session ID Management ──────────────────────────────────────────
 
 /// File where session UUID is persisted for cross-hook access.
@@ -84,7 +86,7 @@ fn resolve_session_id(hook_input: &Option<HookInput>) -> String {
     "unknown".to_string()
 }
 
-/// Persist session ID to file and env var.
+/// Persist session ID to file.
 ///
 /// Called by SessionStart hook so subsequent hooks (Stop, StopFailure, etc.)
 /// can find the session ID without needing stdin JSON.
@@ -96,8 +98,8 @@ fn persist_session_id(session_id: &str) {
     let content = format!("{}\n{}\n", session_id, Utc::now().to_rfc3339());
     let _ = std::fs::write(SESSION_ID_FILE, content);
 
-    // Set env var for child processes
-    std::env::set_var("GW_SESSION_ID", session_id);
+    // Note: env var intentionally not set — std::env::set_var is unsound in
+    // multi-threaded Rust. Session ID is persisted to file above instead.
 }
 
 /// Read the persisted session ID (for use by monitor loop).
@@ -447,7 +449,7 @@ pub fn install() -> Result<()> {
     }
     let hooks = obj
         .get_mut("hooks")
-        .unwrap()
+        .ok_or_else(|| eyre::eyre!("hooks key missing after insert"))?
         .as_object_mut()
         .ok_or_else(|| eyre::eyre!("\"hooks\" is not an object"))?;
 
@@ -541,8 +543,10 @@ fn install_hook(hooks: &mut serde_json::Map<String, Value>, event: &str, command
 
     match hooks.get_mut(event) {
         Some(existing) if existing.is_array() => {
-            // Append to existing array
-            existing.as_array_mut().unwrap().push(new_entry);
+            // Append to existing array — is_array() guard ensures as_array_mut() succeeds
+            if let Some(arr) = existing.as_array_mut() {
+                arr.push(new_entry);
+            }
         }
         _ => {
             // Create new array with our entry
@@ -857,15 +861,17 @@ fn detect_arc_checkpoint_in(arc_dir: &Path) -> Option<ArcCheckpointInfo> {
         })
         .count();
 
-    // Find first pending/in_progress phase
-    // Use a simple heuristic: find phases that aren't completed/skipped
-    let current_phase = phases
+    // Find first pending/in_progress phase using canonical PHASE_ORDER
+    // (serde_json::Map iteration order is not guaranteed to match execution order)
+    let current_phase = PHASE_ORDER
         .iter()
-        .find(|(_, v)| {
-            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            status != "completed" && status != "skipped"
+        .find(|&phase_name| {
+            phases.get(*phase_name).map_or(false, |v| {
+                let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                status != "completed" && status != "skipped"
+            })
         })
-        .map(|(name, _)| name.clone())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| "all_complete".to_string());
 
     Some(ArcCheckpointInfo {

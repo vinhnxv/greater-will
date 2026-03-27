@@ -259,6 +259,19 @@ pub fn save_crash_dump(session_id: &str, working_dir: &std::path::Path, reason: 
         return None;
     }
 
+    // Restrict directory permissions so only the owner can list/enter it
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&dump_dir) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            if let Err(e) = std::fs::set_permissions(&dump_dir, perms) {
+                tracing::warn!(error = %e, "Failed to set crash-dumps directory permissions");
+            }
+        }
+    }
+
     // Capture full scrollback
     let scrollback = match capture_full_scrollback(session_id) {
         Ok(content) => content,
@@ -294,6 +307,19 @@ pub fn save_crash_dump(session_id: &str, working_dir: &std::path::Path, reason: 
 
     match std::fs::write(&dump_path, &content) {
         Ok(()) => {
+            // Restrict file permissions so only the owner can read/write it
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(&dump_path) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o600);
+                    if let Err(e) = std::fs::set_permissions(&dump_path, perms) {
+                        tracing::warn!(error = %e, "Failed to set crash dump file permissions");
+                    }
+                }
+            }
+
             tracing::info!(
                 path = %dump_path.display(),
                 bytes = content.len(),

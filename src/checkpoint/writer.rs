@@ -23,7 +23,7 @@
 //! ```
 
 use crate::checkpoint::schema::Checkpoint;
-use color_eyre::eyre::{self, Context};
+use color_eyre::eyre::Context;
 use color_eyre::Result;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -152,27 +152,10 @@ fn fsync_file<P: AsRef<Path>>(path: P) -> Result<()> {
 
     let file = File::open(path).wrap_err_with(|| format!("Failed to open file for fsync: {}", path.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
+    file.sync_all()
+        .wrap_err_with(|| format!("Failed to sync file: {}", path.display()))?;
 
-        // Use fsync on Unix
-        let fd = file.as_raw_fd();
-        let result = unsafe { libc::fsync(fd) };
-        if result != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(eyre::eyre!("fsync failed for {}: {}", path.display(), err));
-        } else {
-            debug!("fsync completed for {}", path.display());
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        // On non-Unix, flush the file handle
-        file.sync_all()
-            .wrap_err_with(|| format!("Failed to sync file: {}", path.display()))?;
-    }
+    debug!("fsync completed for {}", path.display());
 
     Ok(())
 }

@@ -28,7 +28,9 @@ impl InstanceLock {
     /// Uses `fs2::try_lock_exclusive()` for atomic, race-free locking.
     /// The PID is written to the file for debugging purposes only.
     pub fn acquire() -> Result<Self> {
-        let lock_path = PathBuf::from(".gw/gw.lock");
+        let lock_path = std::env::current_dir()
+            .wrap_err("Failed to determine current directory for lock path")?
+            .join(".gw/gw.lock");
 
         // Ensure .gw directory exists
         if let Some(parent) = lock_path.parent() {

@@ -72,15 +72,15 @@ impl WatchdogConfig {
     /// Load configuration from environment variables with defaults.
     pub fn from_env() -> Self {
         Self {
-            idle_nudge_secs: env_or("GW_IDLE_NUDGE_SECS", 300),      // 5 min
-            idle_kill_secs: env_or("GW_IDLE_KILL_SECS", 1800),       // 30 min
+            idle_nudge_secs: env_or("GW_IDLE_NUDGE_SECS", 300).clamp(30, 3600),   // 5 min
+            idle_kill_secs: env_or("GW_IDLE_KILL_SECS", 1800).clamp(60, 86400), // 30 min
             error_stall_threshold_secs: env_or("GW_ERROR_STALL_THRESHOLD_SECS", 60),
             artifact_scan_interval_secs: env_or("GW_ARTIFACT_SCAN_INTERVAL_SECS", 15),
             pipeline_timeout: Duration::from_secs(
                 env_or("GW_PIPELINE_TIMEOUT_SECS", 6 * 3600),
             ),
             checkpoint_poll_interval_secs: env_or("GW_CHECKPOINT_POLL_INTERVAL_SECS", 10),
-            max_crash_retries: env_or("GW_MAX_CRASH_RETRIES", 5) as u32,
+            max_crash_retries: env_or("GW_MAX_CRASH_RETRIES", 5).clamp(1, 20) as u32,
             error_confirm_medium_secs: env_or("GW_ERROR_CONFIRM_MEDIUM_SECS", 15 * 60),
             error_confirm_high_secs: env_or("GW_ERROR_CONFIRM_HIGH_SECS", 5 * 60),
             prompt_accept_enabled: env_or("GW_PROMPT_ACCEPT", 1) != 0,
@@ -100,10 +100,19 @@ impl Default for WatchdogConfig {
 }
 
 fn env_or(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(val) => match val.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "[gw] warning: invalid value for {}: {:?}, using default {}",
+                    key, val, default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 #[cfg(test)]

@@ -165,27 +165,23 @@ pub fn read_arc_loop_state(working_dir: &Path) -> Option<ArcLoopState> {
 /// Extract YAML frontmatter content between `---` markers.
 fn extract_frontmatter(content: &str) -> Option<String> {
     let trimmed = content.trim();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-    let after_first = &trimmed[3..];
+    let after_first = trimmed.strip_prefix("---")?;
     let end = after_first.find("---")?;
     Some(after_first[..end].to_string())
 }
 
 /// Parse a simple `key: value` from YAML content.
 fn parse_yaml_str(yaml: &str, key: &str) -> Option<String> {
+    let prefix = format!("{}:", key);
     for line in yaml.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix(key) {
-            if let Some(value) = rest.strip_prefix(':') {
-                let val = value.trim();
-                let val = val.trim_matches('"').trim_matches('\'');
-                if val.is_empty() || val == "null" {
-                    return None;
-                }
-                return Some(val.to_string());
+        if let Some(value) = line.strip_prefix(&prefix) {
+            let val = value.trim();
+            let val = val.trim_matches('"').trim_matches('\'');
+            if val.is_empty() || val == "null" {
+                return None;
             }
+            return Some(val.to_string());
         }
     }
     None

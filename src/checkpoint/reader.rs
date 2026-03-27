@@ -493,9 +493,11 @@ pub fn validate_before_resume(
 /// * `checkpoint` - Mutable reference to the checkpoint to modify
 /// * `target_phase` - Name of the phase to resume at
 ///
-/// # Panics
+/// # Unknown Phases
 ///
-/// Panics if `target_phase` is not in `PHASE_ORDER`.
+/// If `target_phase` is not in `PHASE_ORDER`, logs a warning and returns
+/// without modifying the checkpoint. This handles forward-compatibility
+/// when a checkpoint contains phase names from a newer version.
 ///
 /// # Example
 ///
@@ -507,8 +509,16 @@ pub fn validate_before_resume(
 /// // Now forge, forge_qa, plan_review, etc. are marked "completed"
 /// ```
 pub fn mark_phases_completed_before(checkpoint: &mut Checkpoint, target_phase: &str) {
-    let target_idx = phase_index(target_phase)
-        .expect("target_phase must be in PHASE_ORDER");
+    let target_idx = match phase_index(target_phase) {
+        Some(idx) => idx,
+        None => {
+            warn!(
+                "Unknown phase '{}' not in PHASE_ORDER — skipping mark_phases_completed_before",
+                target_phase
+            );
+            return;
+        }
+    };
 
     info!(
         "Marking phases before {} (index {}) as completed",
