@@ -409,6 +409,9 @@ fn run_session_attempt(
     let mut last_checkpoint_poll = Instant::now();
     let mut last_checkpoint_activity = Instant::now();
     let mut last_checkpoint_hash: Option<u64> = None;
+    // Cache the resolved checkpoint path to avoid re-scanning all arc-* dirs every poll.
+    // Once found, the checkpoint path doesn't change during a session.
+    let mut cached_checkpoint_path: Option<PathBuf> = None;
     let mut last_process_gone_at: Option<Instant> = None;
     let mut last_artifact_scan = Instant::now();
     let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
@@ -522,7 +525,9 @@ fn run_session_attempt(
 
             // Session ran for a meaningful time — verify via checkpoint
             if !crate::cleanup::process::is_pid_alive(pid) {
-                if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+                if let Some(checkpoint) = read_cached_checkpoint(
+                    plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                ) {
                     if checkpoint.is_complete() {
                         info!("Session ended, checkpoint confirms completion");
                         return Ok(SessionOutcome::Completed);
@@ -583,7 +588,9 @@ fn run_session_attempt(
         // Only poll every CHECKPOINT_POLL_INTERVAL_SECS to avoid excessive file I/O.
         if last_checkpoint_poll.elapsed() >= Duration::from_secs(wd.checkpoint_poll_interval_secs) {
             last_checkpoint_poll = Instant::now();
-            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+            if let Some(checkpoint) = read_cached_checkpoint(
+                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+            ) {
                 if checkpoint.is_complete() {
                     let elapsed = dispatch_time.elapsed();
                     info!("Pipeline completion detected via checkpoint.json");
@@ -616,7 +623,7 @@ fn run_session_attempt(
         // e.g., review agents writing TOME fragments, workers creating files.
         if last_artifact_scan.elapsed() >= Duration::from_secs(wd.artifact_scan_interval_secs) {
             last_artifact_scan = Instant::now();
-            if let Some(artifact_dir) = find_artifact_dir(plan_path, &config.working_dir) {
+            if let Some(artifact_dir) = find_artifact_dir_cached(&cached_checkpoint_path, &config.working_dir) {
                 if let Some(snapshot) = scan_artifact_dir(&artifact_dir) {
                     if last_artifact_snapshot.map_or(true, |prev| prev != snapshot) {
                         debug!(
@@ -800,7 +807,9 @@ fn run_session_attempt(
 
             // Process ran for a while then died — verify via checkpoint before
             // assuming success. If checkpoint says incomplete, it's a crash.
-            if let Some(checkpoint) = try_read_plan_checkpoint(plan_path, &config.working_dir) {
+            if let Some(checkpoint) = read_cached_checkpoint(
+                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+            ) {
                 if checkpoint.is_complete() {
                     info!("Process died but checkpoint confirms completion");
                     return Ok(SessionOutcome::Completed);
@@ -914,6 +923,69 @@ fn try_read_plan_checkpoint(plan_path: &Path, working_dir: &Path) -> Option<Chec
             debug!(error = %e, "Could not find checkpoint for plan");
             None
         }
+    }
+}
+
+/// Read checkpoint using a cached path, avoiding repeated directory scans.
+///
+/// On first call (or if cache is None), discovers the checkpoint path via
+/// `find_checkpoint_for_plan` and caches it. Subsequent calls read directly
+/// from the cached path — only re-scanning if the cached file disappears.
+fn read_cached_checkpoint(
+    plan_path: &Path,
+    working_dir: &Path,
+    cached_path: &mut Option<PathBuf>,
+) -> Option<Checkpoint> {
+    // If we have a cached path, try reading directly
+    if let Some(cp_path) = cached_path.as_ref() {
+        if cp_path.exists() {
+            return match crate::checkpoint::reader::read_checkpoint(cp_path) {
+                Ok(cp) => Some(cp),
+                Err(e) => {
+                    debug!(error = %e, "Could not read cached checkpoint (transient)");
+                    None
+                }
+            };
+        }
+        // Cached path no longer exists — invalidate and re-discover
+        debug!("Cached checkpoint path disappeared, re-discovering");
+        *cached_path = None;
+    }
+
+    // Discover checkpoint path (scans all arc-* dirs)
+    match find_checkpoint_for_plan(plan_path, working_dir) {
+        Ok(Some(cp_path)) => {
+            info!("Discovered checkpoint: {}", cp_path.display());
+            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+                Ok(cp) => {
+                    *cached_path = Some(cp_path);
+                    Some(cp)
+                }
+                Err(e) => {
+                    debug!(error = %e, "Could not read checkpoint (transient)");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            debug!(error = %e, "Could not find checkpoint for plan");
+            None
+        }
+    }
+}
+
+/// Find artifact dir using the cached checkpoint path (avoids re-scanning).
+fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working_dir: &Path) -> Option<PathBuf> {
+    let cp_path = cached_cp_path.as_ref()?;
+    // checkpoint.json is at .rune/arc/arc-{id}/checkpoint.json
+    // artifact dir is at   tmp/arc/arc-{id}/
+    let arc_id = cp_path.parent()?.file_name()?;
+    let artifact_dir = working_dir.join("tmp").join("arc").join(arc_id);
+    if artifact_dir.is_dir() {
+        Some(artifact_dir)
+    } else {
+        None
     }
 }
 
@@ -1103,23 +1175,8 @@ fn scan_artifact_dir(dir: &Path) -> Option<ArtifactSnapshot> {
     })
 }
 
-/// Find the arc artifact directory for a plan.
-///
-/// Pattern: `{working_dir}/tmp/arc/arc-{id}/` — the same `arc-{id}` that holds
-/// the checkpoint. Returns `None` if no matching directory exists yet.
-fn find_artifact_dir(plan_path: &Path, working_dir: &Path) -> Option<PathBuf> {
-    // Reuse checkpoint discovery to find the arc-{id}
-    let cp_path = find_checkpoint_for_plan(plan_path, working_dir).ok()??;
-    // checkpoint.json is at .rune/arc/arc-{id}/checkpoint.json
-    // artifact dir is at   tmp/arc/arc-{id}/
-    let arc_id = cp_path.parent()?.file_name()?;
-    let artifact_dir = working_dir.join("tmp").join("arc").join(arc_id);
-    if artifact_dir.is_dir() {
-        Some(artifact_dir)
-    } else {
-        None
-    }
-}
+// NOTE: find_artifact_dir(plan_path, working_dir) was removed — replaced by
+// find_artifact_dir_cached() which uses the cached checkpoint path.
 
 #[cfg(test)]
 mod tests {

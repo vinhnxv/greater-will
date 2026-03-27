@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Read a checkpoint from a file path.
 ///
@@ -39,7 +39,7 @@ use tracing::{info, warn};
 /// ```
 pub fn read_checkpoint<P: AsRef<Path>>(path: P) -> Result<Checkpoint> {
     let path = path.as_ref();
-    info!("Reading checkpoint from: {}", path.display());
+    debug!("Reading checkpoint from: {}", path.display());
 
     // Check file exists
     if !path.exists() {
@@ -79,7 +79,7 @@ pub fn read_checkpoint<P: AsRef<Path>>(path: P) -> Result<Checkpoint> {
         return Err(eyre!("Checkpoint missing required field: plan_file"));
     }
 
-    info!(
+    debug!(
         "Loaded checkpoint {} (schema v{:?})",
         checkpoint.id, checkpoint.schema_version
     );
