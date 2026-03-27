@@ -383,4 +383,98 @@ mod tests {
         assert_eq!(profile.category, PhaseCategory::Planning);
         assert!(profile_for_phase("nonexistent").is_none());
     }
+
+    #[test]
+    fn test_all_profiles_have_grace_buffer() {
+        // Every profile's timeout should include the grace buffer
+        for cat in &[
+            PhaseCategory::Planning, PhaseCategory::Work, PhaseCategory::Quality,
+            PhaseCategory::Remediation, PhaseCategory::Testing, PhaseCategory::Deploy,
+            PhaseCategory::Ship,
+        ] {
+            let profile = cat.profile();
+            assert!(
+                profile.phase_timeout_secs >= GRACE_BUFFER_SECS,
+                "{:?} timeout {}s is less than grace buffer {}s",
+                cat, profile.phase_timeout_secs, GRACE_BUFFER_SECS,
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_phase_timeout_from_phase_times() {
+        use crate::checkpoint::schema::Checkpoint;
+        use serde_json::json;
+
+        let mut cp = Checkpoint::default();
+        cp.totals = Some(json!({
+            "phase_times": {
+                "forge": 420000,   // 420s = 7 min
+                "work": 1800000,   // 1800s = 30 min
+            }
+        }));
+
+        // forge: 420s + 300s grace = 720s
+        assert_eq!(resolve_phase_timeout("forge", &cp, 9999), 720);
+        // work: 1800s + 300s grace = 2100s
+        assert_eq!(resolve_phase_timeout("work", &cp, 9999), 2100);
+        // unknown phase: falls back to provided fallback
+        assert_eq!(resolve_phase_timeout("nonexistent", &cp, 600), 600);
+    }
+
+    #[test]
+    fn test_resolve_phase_timeout_no_totals() {
+        use crate::checkpoint::schema::Checkpoint;
+
+        let cp = Checkpoint::default(); // no totals
+        // Should fall back to provided fallback
+        assert_eq!(resolve_phase_timeout("forge", &cp, 1200), 1200);
+    }
+
+    #[test]
+    fn test_resolve_phase_timeout_full_from_reactions() {
+        use crate::checkpoint::schema::Checkpoint;
+        use serde_json::json;
+
+        let mut cp = Checkpoint::default();
+        // No phase_times, but reactions has escalation timeout
+        cp.reactions = Some(json!({
+            "work_incomplete": {
+                "action": "retry",
+                "retries": 1,
+                "escalate_after_ms": 1800000  // 30 min
+            }
+        }));
+
+        let profile = PhaseCategory::Work.profile();
+        // work: 1800s + 300s grace = 2100s (from reactions)
+        assert_eq!(resolve_phase_timeout_full("work", &cp, &profile), 2100);
+        // forge: no reaction mapping → fallback to profile default
+        let forge_profile = PhaseCategory::Planning.profile();
+        assert_eq!(
+            resolve_phase_timeout_full("forge", &cp, &forge_profile),
+            forge_profile.phase_timeout_secs,
+        );
+    }
+
+    #[test]
+    fn test_resolve_phase_timeout_full_priority() {
+        use crate::checkpoint::schema::Checkpoint;
+        use serde_json::json;
+
+        let mut cp = Checkpoint::default();
+        // Both phase_times AND reactions available — phase_times should win
+        cp.totals = Some(json!({
+            "phase_times": { "work": 600000 } // 10 min
+        }));
+        cp.reactions = Some(json!({
+            "work_incomplete": {
+                "escalate_after_ms": 1800000  // 30 min
+            }
+        }));
+
+        let profile = PhaseCategory::Work.profile();
+        // phase_times wins: 600s + 300s = 900s (not 1800s + 300s from reactions)
+        assert_eq!(resolve_phase_timeout_full("work", &cp, &profile), 900);
+    }
 }

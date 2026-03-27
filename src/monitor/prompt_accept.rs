@@ -236,4 +236,23 @@ mod tests {
         assert!(!detects_prompt("Building project...\nCompilation succeeded"));
         assert!(!detects_prompt("Running tests\n42 passed, 0 failed"));
     }
+
+    #[test]
+    fn test_max_accepts_cap() {
+        let mut acceptor = PromptAcceptor::new(true, 0);
+        // Simulate hitting the cap
+        acceptor.accept_count = MAX_AUTO_ACCEPTS;
+        // Should be blocked by the cap (check_and_accept returns false before
+        // even checking patterns, so no tmux call needed)
+        let result = acceptor.check_and_accept("Allow tool? (y/n)", "fake-session");
+        assert!(!result, "Should be blocked by max accepts cap");
+        assert!(acceptor.limit_logged, "Should have logged the limit warning");
+    }
+
+    #[test]
+    fn test_under_max_accepts_not_blocked() {
+        let acceptor = PromptAcceptor::new(true, 0);
+        // Fresh acceptor should not be blocked by cap
+        assert!(acceptor.accept_count < MAX_AUTO_ACCEPTS);
+    }
 }

@@ -372,4 +372,11 @@ mod tests {
         // The actual result depends on system state
         assert!(result.is_ok() || result.is_err());
     }
+
+    #[test]
+    fn test_check_disk_space_does_not_panic() {
+        // Just verify it runs without panicking on any system
+        let result = check_disk_space();
+        assert!(result.is_ok() || result.is_err());
+    }
 }

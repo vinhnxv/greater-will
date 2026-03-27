@@ -187,6 +187,79 @@ impl BatchState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_result(plan: &str, outcome: PlanOutcome, transient: bool) -> PlanResult {
+        let error = if matches!(outcome, PlanOutcome::Failed) { Some("err".into()) } else { None };
+        PlanResult {
+            plan: plan.to_string(),
+            outcome,
+            duration_secs: 1.0,
+            completed_at: Utc::now(),
+            error,
+            transient,
+        }
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_on_deterministic_failures() {
+        let mut state = BatchState::new(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        state.record_result(make_result("a", PlanOutcome::Failed, false));
+        assert!(!state.is_circuit_broken());
+        state.record_result(make_result("b", PlanOutcome::Failed, false));
+        assert!(!state.is_circuit_broken());
+        state.record_result(make_result("c", PlanOutcome::Failed, false));
+        assert!(state.is_circuit_broken(), "3 deterministic failures should trip breaker");
+    }
+
+    #[test]
+    fn test_circuit_breaker_ignores_transient_failures() {
+        let mut state = BatchState::new(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        // 3 transient failures should NOT trip the breaker
+        state.record_result(make_result("a", PlanOutcome::Failed, true));
+        state.record_result(make_result("b", PlanOutcome::Failed, true));
+        state.record_result(make_result("c", PlanOutcome::Failed, true));
+        assert!(!state.is_circuit_broken(), "Transient failures should not trip breaker");
+    }
+
+    #[test]
+    fn test_circuit_breaker_mixed_transient_and_deterministic() {
+        let mut state = BatchState::new(vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]);
+        state.record_result(make_result("a", PlanOutcome::Failed, false)); // 1 det
+        state.record_result(make_result("b", PlanOutcome::Failed, true));  // transient — ignored
+        state.record_result(make_result("c", PlanOutcome::Failed, false)); // 2 det
+        assert!(!state.is_circuit_broken());
+        state.record_result(make_result("d", PlanOutcome::Failed, false)); // 3 det
+        assert!(state.is_circuit_broken());
+    }
+
+    #[test]
+    fn test_circuit_breaker_resets_on_success() {
+        let mut state = BatchState::new(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        state.record_result(make_result("a", PlanOutcome::Failed, false));
+        state.record_result(make_result("b", PlanOutcome::Failed, false));
+        state.record_result(make_result("c", PlanOutcome::Passed, false)); // resets
+        state.record_result(make_result("d", PlanOutcome::Failed, false));
+        assert!(!state.is_circuit_broken(), "Success should reset consecutive counter");
+    }
+
+    #[test]
+    fn test_transient_field_defaults_to_false() {
+        // Ensure old serialized state without transient field works
+        let json = r#"{
+            "plan": "test.md",
+            "outcome": "Failed",
+            "duration_secs": 1.0,
+            "completed_at": "2026-01-01T00:00:00Z",
+            "error": "some error"
+        }"#;
+        let result: PlanResult = serde_json::from_str(json).unwrap();
+        assert!(!result.transient, "Default should be false for backward compat");
+    }
+}
+
 impl std::fmt::Display for PlanOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
