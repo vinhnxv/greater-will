@@ -1733,37 +1733,40 @@ fn resolve_restart_command(
 ) -> RestartDecision {
     use crate::engine::phase_profile::{self, RecoveryStrategy};
 
-    // Find a checkpoint with progress
-    let arc_dir = working_dir.join(".rune").join("arc");
-    if !arc_dir.exists() {
-        info!(restart = restart_count, "No .rune/arc/ dir — fresh start");
-        println!("[gw] No checkpoint found — running fresh (not --resume)");
-        return RestartDecision::Fresh(arc_command.to_string());
-    }
-
-    // Scan for checkpoint with progress
-    let checkpoint = std::fs::read_dir(&arc_dir).ok().and_then(|entries| {
-        for entry in entries.flatten() {
-            let cp_path = entry.path().join("checkpoint.json");
-            if cp_path.exists() {
-                if let Ok(cp) = crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                    let has_progress = cp.phases.values().any(|p| {
-                        p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
-                    });
-                    if has_progress {
-                        return Some(cp);
-                    }
-                }
-            }
+    // Find a checkpoint that matches the current plan (plan-aware matching).
+    // BUG FIX: Previously scanned all checkpoints and picked the first with progress,
+    // ignoring plan_file — a completed checkpoint from a different plan would cause
+    // AlreadyDone, skipping the current plan entirely.
+    let plan_path = Path::new(plan_str);
+    let cp_path = match crate::checkpoint::reader::find_checkpoint_for_plan(plan_path, working_dir) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            info!(restart = restart_count, "No checkpoint for plan '{}' — fresh start", plan_str);
+            println!("[gw] No checkpoint found for this plan — running fresh (not --resume)");
+            return RestartDecision::Fresh(arc_command.to_string());
         }
-        None
-    });
+        Err(e) => {
+            warn!(error = %e, "Failed to scan checkpoints — fresh start");
+            println!("[gw] Checkpoint scan failed — running fresh (not --resume)");
+            return RestartDecision::Fresh(arc_command.to_string());
+        }
+    };
 
-    let checkpoint = match checkpoint {
-        Some(cp) => cp,
-        None => {
-            info!(restart = restart_count, "No checkpoint with progress — fresh start");
-            println!("[gw] No checkpoint with progress — running fresh (not --resume)");
+    let checkpoint = match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+        Ok(cp) => {
+            let has_progress = cp.phases.values().any(|p| {
+                p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
+            });
+            if !has_progress {
+                info!(restart = restart_count, "Checkpoint for plan '{}' has no progress — fresh start", plan_str);
+                println!("[gw] Checkpoint exists but no progress — running fresh (not --resume)");
+                return RestartDecision::Fresh(arc_command.to_string());
+            }
+            cp
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to read checkpoint — fresh start");
+            println!("[gw] Failed to read checkpoint — running fresh (not --resume)");
             return RestartDecision::Fresh(arc_command.to_string());
         }
     };
