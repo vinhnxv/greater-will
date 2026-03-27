@@ -412,6 +412,12 @@ fn run_session_attempt(
     // Cache the resolved checkpoint path to avoid re-scanning all arc-* dirs every poll.
     // Once found, the checkpoint path doesn't change during a session.
     let mut cached_checkpoint_path: Option<PathBuf> = None;
+    // Track whether we've archived stale checkpoints for this session.
+    // We delay archiving until the SECOND successful poll to ensure the
+    // checkpoint is stable (not a leftover from the previous session that
+    // Rune hasn't replaced yet).
+    let mut stale_archive_done = false;
+    let mut successful_checkpoint_polls: u32 = 0;
     let mut last_process_gone_at: Option<Instant> = None;
     let mut last_artifact_scan = Instant::now();
     let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
@@ -615,6 +621,22 @@ fn run_session_attempt(
                     last_checkpoint_activity = Instant::now();
                 }
                 last_checkpoint_hash = Some(cp_hash);
+
+                // Count successful checkpoint polls for delayed archive
+                successful_checkpoint_polls += 1;
+            }
+        }
+
+        // DELAYED ARCHIVE: After 2 successful checkpoint polls, archive stale
+        // checkpoint dirs from previous crash/restart cycles. We wait for the
+        // 2nd poll to ensure the current checkpoint is the one Rune is actively
+        // using (not a leftover that Rune hasn't replaced yet).
+        if !stale_archive_done && successful_checkpoint_polls >= 2 {
+            stale_archive_done = true;
+            if let Some(ref cp_path) = cached_checkpoint_path {
+                if let Err(e) = archive_stale_checkpoints(cp_path, plan_path, &config.working_dir) {
+                    debug!(error = %e, "Failed to archive stale checkpoints (non-fatal)");
+                }
             }
         }
 
@@ -902,30 +924,6 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("arc result: success")
 }
 
-/// Try to read the checkpoint for a given plan.
-///
-/// Returns `None` if no checkpoint exists yet or if it can't be read.
-/// This is a non-fatal operation — the monitor loop should continue
-/// even if the checkpoint is temporarily unreadable.
-fn try_read_plan_checkpoint(plan_path: &Path, working_dir: &Path) -> Option<Checkpoint> {
-    match find_checkpoint_for_plan(plan_path, working_dir) {
-        Ok(Some(cp_path)) => {
-            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                Ok(cp) => Some(cp),
-                Err(e) => {
-                    debug!(error = %e, "Could not read checkpoint (transient)");
-                    None
-                }
-            }
-        }
-        Ok(None) => None,
-        Err(e) => {
-            debug!(error = %e, "Could not find checkpoint for plan");
-            None
-        }
-    }
-}
-
 /// Read checkpoint using a cached path, avoiding repeated directory scans.
 ///
 /// On first call (or if cache is None), discovers the checkpoint path via
@@ -958,12 +956,6 @@ fn read_cached_checkpoint(
             info!("Discovered checkpoint: {}", cp_path.display());
             match crate::checkpoint::reader::read_checkpoint(&cp_path) {
                 Ok(cp) => {
-                    // Archive stale checkpoint dirs for the same plan.
-                    // This is safe: we've already found the newest, so older
-                    // ones are from previous crash/restart cycles.
-                    if let Err(e) = archive_stale_checkpoints(&cp_path, plan_path, working_dir) {
-                        debug!(error = %e, "Failed to archive stale checkpoints (non-fatal)");
-                    }
                     *cached_path = Some(cp_path);
                     Some(cp)
                 }
@@ -1181,8 +1173,6 @@ fn scan_artifact_dir(dir: &Path) -> Option<ArtifactSnapshot> {
     })
 }
 
-// NOTE: find_artifact_dir(plan_path, working_dir) was removed — replaced by
-// find_artifact_dir_cached() which uses the cached checkpoint path.
 
 #[cfg(test)]
 mod tests {

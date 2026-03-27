@@ -369,7 +369,21 @@ pub fn archive_stale_checkpoints(
             continue;
         }
 
-        let dest = archive_base.join(&dir_name);
+        let mut dest = archive_base.join(&dir_name);
+
+        // Handle dest collision: if _archived/arc-{id} already exists,
+        // remove it first (it's a leftover from a previous interrupted archive).
+        if dest.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dest) {
+                warn!(
+                    dest = %dest.display(),
+                    error = %e,
+                    "Failed to remove existing archive dest, skipping"
+                );
+                continue;
+            }
+        }
+
         match std::fs::rename(&dir_path, &dest) {
             Ok(()) => {
                 info!(
@@ -378,6 +392,24 @@ pub fn archive_stale_checkpoints(
                     "Archived stale checkpoint"
                 );
                 archived_count += 1;
+
+                // Also clean up the corresponding artifact dir (tmp/arc/arc-{id}).
+                // These are ephemeral build outputs, safe to remove entirely.
+                let artifact_dir = cwd.join("tmp").join("arc").join(&dir_name);
+                if artifact_dir.is_dir() {
+                    match std::fs::remove_dir_all(&artifact_dir) {
+                        Ok(()) => {
+                            info!(dir = %dir_name_str, "Removed stale artifact dir");
+                        }
+                        Err(e) => {
+                            debug!(
+                                dir = %artifact_dir.display(),
+                                error = %e,
+                                "Failed to remove stale artifact dir (non-fatal)"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -783,18 +815,21 @@ mod tests {
         let timestamps = ["2026-03-25T01:00:00Z", "2026-03-25T02:00:00Z", "2026-03-25T03:00:00Z"];
         let arc_ids = ["arc-1000", "arc-2000", "arc-3000"];
 
-        for (i, (ts, id)) in timestamps.iter().zip(arc_ids.iter()).enumerate() {
+        for (ts, id) in timestamps.iter().zip(arc_ids.iter()) {
             let arc_dir = arc_base.join(id);
             std::fs::create_dir_all(&arc_dir).unwrap();
 
             let mut cp = make_test_checkpoint();
             cp.id = id.to_string();
             cp.started_at = ts.to_string();
-            // All match the same plan
             cp.plan_file = "plans/test.md".to_string();
 
             write_checkpoint(&cp, arc_dir.join("checkpoint.json")).unwrap();
-            let _ = i; // suppress unused warning
+
+            // Also create corresponding artifact dirs
+            let artifact_dir = dir.path().join("tmp").join("arc").join(id);
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            std::fs::write(artifact_dir.join("some-output.md"), "test").unwrap();
         }
 
         // The newest checkpoint is arc-3000
@@ -812,11 +847,17 @@ mod tests {
         // Active dir still exists
         assert!(arc_base.join("arc-3000").exists());
 
-        // Stale dirs moved to _archived/
+        // Stale checkpoint dirs moved to _archived/
         assert!(!arc_base.join("arc-1000").exists());
         assert!(!arc_base.join("arc-2000").exists());
         assert!(arc_base.join("_archived").join("arc-1000").exists());
         assert!(arc_base.join("_archived").join("arc-2000").exists());
+
+        // Stale artifact dirs removed
+        assert!(!dir.path().join("tmp").join("arc").join("arc-1000").exists());
+        assert!(!dir.path().join("tmp").join("arc").join("arc-2000").exists());
+        // Active artifact dir preserved
+        assert!(dir.path().join("tmp").join("arc").join("arc-3000").exists());
 
         // Calling again is idempotent
         let archived_again = archive_stale_checkpoints(
@@ -825,6 +866,48 @@ mod tests {
             dir.path(),
         ).unwrap();
         assert_eq!(archived_again, 0);
+    }
+
+    #[test]
+    fn test_archive_handles_dest_collision() {
+        use crate::checkpoint::writer::write_checkpoint;
+
+        let dir = TempDir::new().unwrap();
+        let arc_base = dir.path().join(".rune").join("arc");
+
+        // Create stale checkpoint
+        let stale_dir = arc_base.join("arc-1000");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let mut cp = make_test_checkpoint();
+        cp.id = "arc-1000".to_string();
+        cp.started_at = "2026-03-25T01:00:00Z".to_string();
+        write_checkpoint(&cp, stale_dir.join("checkpoint.json")).unwrap();
+
+        // Create active checkpoint
+        let active_dir = arc_base.join("arc-2000");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let mut cp2 = make_test_checkpoint();
+        cp2.id = "arc-2000".to_string();
+        cp2.started_at = "2026-03-25T02:00:00Z".to_string();
+        write_checkpoint(&cp2, active_dir.join("checkpoint.json")).unwrap();
+
+        // Pre-create _archived/arc-1000 to simulate collision
+        let collision_dir = arc_base.join("_archived").join("arc-1000");
+        std::fs::create_dir_all(&collision_dir).unwrap();
+        std::fs::write(collision_dir.join("old-data.txt"), "leftover").unwrap();
+
+        let active_path = active_dir.join("checkpoint.json");
+        let archived = archive_stale_checkpoints(
+            &active_path,
+            Path::new("plans/test.md"),
+            dir.path(),
+        ).unwrap();
+
+        // Should succeed despite collision
+        assert_eq!(archived, 1);
+        assert!(!arc_base.join("arc-1000").exists());
+        // Old collision data replaced
+        assert!(arc_base.join("_archived").join("arc-1000").join("checkpoint.json").exists());
     }
 
     #[test]
