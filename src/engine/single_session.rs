@@ -215,31 +215,35 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 });
             }
             SessionOutcome::Crashed { reason } => {
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > config.watchdog.max_crash_retries {
-                    return Ok(PipelineResult {
-                        success: false,
-                        duration: start.elapsed(),
-                        crash_restarts,
-                        message: format!(
-                            "Pipeline failed after {} crash restarts. Last: {}",
-                            crash_restarts, reason
-                        ),
-                        session_name,
-                    });
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop: {} crashes in {}s window. Last: {}",
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                                reason
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
                 }
 
                 warn!(
-                    restart = crash_restarts,
+                    restart = crash_detector.total_restarts(),
                     max = config.watchdog.max_crash_retries,
                     reason = %reason,
                     "Session crashed, will restart with --resume"
                 );
                 println!(
                     "[gw] Session crashed ({}/{}): {}. Restarting in 5s...",
-                    crash_restarts, config.watchdog.max_crash_retries, reason,
+                    crash_detector.total_restarts(), config.watchdog.max_crash_retries, reason,
                 );
 
                 // Brief cooldown before restart
@@ -249,29 +253,35 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 return Ok(PipelineResult {
                     success: false,
                     duration: start.elapsed(),
-                    crash_restarts,
+                    crash_restarts: crash_detector.total_restarts(),
                     message: "Pipeline timeout exceeded".to_string(),
                     session_name,
                 });
             }
             SessionOutcome::Stuck => {
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > config.watchdog.max_crash_retries {
-                    return Ok(PipelineResult {
-                        success: false,
-                        duration: start.elapsed(),
-                        crash_restarts,
-                        message: "Pipeline stuck and max restarts exceeded".to_string(),
-                        session_name,
-                    });
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop (stuck): {} crashes in {}s window",
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
                 }
 
-                warn!(restart = crash_restarts, "Session stuck, restarting");
+                warn!(restart = crash_detector.total_restarts(), "Session stuck, restarting");
                 println!(
                     "[gw] Session stuck ({}/{}). Restarting in 5s...",
-                    crash_restarts, config.watchdog.max_crash_retries,
+                    crash_detector.total_restarts(), config.watchdog.max_crash_retries,
                 );
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -281,31 +291,50 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
-                        crash_restarts,
+                        crash_restarts: crash_detector.total_restarts(),
                         message: format!("Fatal error (no retry): {}", reason),
                         session_name,
                     });
                 }
 
-                crash_restarts += 1;
                 is_first_run = false;
 
-                if crash_restarts > error_class.max_retries() {
+                match crash_detector.record_restart() {
+                    CrashLoopDecision::StopCrashLoop => {
+                        return Ok(PipelineResult {
+                            success: false,
+                            duration: start.elapsed(),
+                            crash_restarts: crash_detector.total_restarts(),
+                            message: format!(
+                                "Crash loop ({:?}): {} crashes in {}s window. Last: {}",
+                                error_class,
+                                crash_detector.crashes_in_window(),
+                                config.watchdog.crash_window_secs,
+                                reason
+                            ),
+                            session_name,
+                        });
+                    }
+                    CrashLoopDecision::AllowRestart => {}
+                }
+
+                // Per-error-class max retries still applies
+                if crash_detector.total_restarts() > error_class.max_retries() {
                     return Ok(PipelineResult {
                         success: false,
                         duration: start.elapsed(),
-                        crash_restarts,
+                        crash_restarts: crash_detector.total_restarts(),
                         message: format!(
                             "Pipeline failed after {} retries for {:?}. Last: {}",
-                            crash_restarts, error_class, reason
+                            crash_detector.total_restarts(), error_class, reason
                         ),
                         session_name,
                     });
                 }
 
-                let backoff = error_class.backoff_for_attempt(crash_restarts - 1);
+                let backoff = error_class.backoff_for_attempt(crash_detector.total_restarts() - 1);
                 warn!(
-                    restart = crash_restarts,
+                    restart = crash_detector.total_restarts(),
                     max = error_class.max_retries(),
                     backoff_secs = backoff.as_secs(),
                     error_class = ?error_class,
@@ -315,7 +344,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 println!(
                     "[gw] {:?} error ({}/{}): {}. Waiting {}s before restart...",
                     error_class,
-                    crash_restarts,
+                    crash_detector.total_restarts(),
                     error_class.max_retries(),
                     reason,
                     backoff.as_secs(),
