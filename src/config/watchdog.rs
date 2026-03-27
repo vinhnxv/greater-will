@@ -59,7 +59,9 @@ pub struct WatchdogConfig {
     pub crash_stability_secs: u64,
     /// Max time to wait for `arc-phase-loop.local.md` to appear after session start.
     /// If the file doesn't appear within this window, the session is treated as crashed.
-    /// Default 180s (3 min) — Rune typically creates this file within 1-2 minutes.
+    /// Default 180s (3 min) — used as a soft deadline. The warmup timeout only
+    /// triggers if the session has exited or screen output is idle. While Claude
+    /// Code is still alive and producing output, we keep waiting indefinitely.
     pub loop_state_warmup_secs: u64,
     /// Cooldown between crash-recovery restarts (seconds). Default 60s (1 min).
     /// Gives Claude Code time to fully initialize before the next attempt.

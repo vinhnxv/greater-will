@@ -1135,29 +1135,55 @@ fn monitor_session(
                     return Ok(SessionOutcome::Crashed { reason });
                 }
             } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
-                // File never appeared within warmup window → Rune failed to start arc
-                warn!(
-                    warmup_secs = wd.loop_state_warmup_secs,
-                    elapsed_secs = session_age.as_secs(),
-                    "arc-phase-loop.local.md never appeared — arc failed to initialize"
-                );
-                let reason = format!(
-                    "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s) — Rune failed to initialize",
-                    session_age.as_secs(), wd.loop_state_warmup_secs,
-                );
-                println!(
-                    "[gw] arc-phase-loop.local.md not found after {}s — restarting session",
-                    session_age.as_secs(),
-                );
-                save_crash_dump(session_name, &config.working_dir, &reason);
-                kill_session(session_name)?;
-                // Classify as BootstrapError — Rune failed to initialize arc.
-                // This is likely a deterministic failure (plugin not loaded, bad
-                // command, config issue) that won't resolve by retrying.
-                return Ok(SessionOutcome::ErrorDetected {
-                    error_class: ErrorClass::BootstrapError,
-                    reason,
-                });
+                // Past the warmup deadline, but only act if Claude Code is
+                // truly stuck. If the screen is still changing (Claude is
+                // loading MCP servers, processing skills, etc.), keep waiting
+                // — the session is alive and making progress.
+                let screen_idle_secs = last_activity.elapsed().as_secs();
+                let screen_active = screen_idle_secs < wd.loop_state_warmup_secs;
+
+                if screen_active {
+                    // Claude Code is still producing output — likely still
+                    // initializing (loading plugins, MCP servers, etc.).
+                    // Don't kill it; just log periodically.
+                    if session_age.as_secs() % 60 < (wd.checkpoint_poll_interval_secs + 1) {
+                        info!(
+                            warmup_secs = wd.loop_state_warmup_secs,
+                            elapsed_secs = session_age.as_secs(),
+                            screen_idle_secs,
+                            "arc-phase-loop.local.md not yet created, but screen is active — waiting"
+                        );
+                        println!(
+                            "[gw] Warmup exceeded {}s but Claude Code still active (idle {}s) — waiting",
+                            wd.loop_state_warmup_secs, screen_idle_secs,
+                        );
+                    }
+                } else {
+                    // Screen is stale AND past warmup → Rune genuinely failed
+                    warn!(
+                        warmup_secs = wd.loop_state_warmup_secs,
+                        elapsed_secs = session_age.as_secs(),
+                        screen_idle_secs,
+                        "arc-phase-loop.local.md never appeared and screen is idle — arc failed to initialize"
+                    );
+                    let reason = format!(
+                        "arc-phase-loop.local.md never appeared after {}s (warmup {}s, screen idle {}s) — Rune failed to initialize",
+                        session_age.as_secs(), wd.loop_state_warmup_secs, screen_idle_secs,
+                    );
+                    println!(
+                        "[gw] arc-phase-loop.local.md not found after {}s (screen idle {}s) — restarting session",
+                        session_age.as_secs(), screen_idle_secs,
+                    );
+                    save_crash_dump(session_name, &config.working_dir, &reason);
+                    kill_session(session_name)?;
+                    // Classify as BootstrapError — Rune failed to initialize arc.
+                    // This is likely a deterministic failure (plugin not loaded, bad
+                    // command, config issue) that won't resolve by retrying.
+                    return Ok(SessionOutcome::ErrorDetected {
+                        error_class: ErrorClass::BootstrapError,
+                        reason,
+                    });
+                }
             }
         }
 
