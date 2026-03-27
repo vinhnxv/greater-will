@@ -23,6 +23,7 @@ use crate::checkpoint::reader::find_checkpoint_for_plan;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
 use crate::config::watchdog::WatchdogConfig;
+use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
@@ -164,7 +165,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     println!();
 
     // Crash-recovery loop
-    let mut crash_restarts: u32 = 0;
+    let mut crash_detector = CrashLoopDetector::from_watchdog(&config.watchdog);
     let mut is_first_run = true;
 
     loop {
@@ -173,7 +174,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             return Ok(PipelineResult {
                 success: false,
                 duration: start.elapsed(),
-                crash_restarts,
+                crash_restarts: crash_detector.total_restarts(),
                 message: "Pipeline timeout exceeded".to_string(),
                 session_name: session_name.clone(),
             });
@@ -183,11 +184,12 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
         let command = if is_first_run {
             arc_command.clone()
         } else {
-            info!(restart = crash_restarts, "Restarting with --resume after crash");
+            info!(restart = crash_detector.total_restarts(), "Restarting with --resume after crash");
             build_resume_command(plan_str, config)
         };
 
         // Run one session attempt
+        let attempt_start = Instant::now();
         let attempt_result = run_session_attempt(
             &session_name,
             &command,
@@ -196,12 +198,18 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             plan_path,
         )?;
 
+        // If the attempt ran long enough, record it as healthy
+        let attempt_duration = attempt_start.elapsed();
+        if attempt_duration >= Duration::from_secs(config.watchdog.crash_stability_secs) {
+            crash_detector.record_healthy_tick();
+        }
+
         match attempt_result {
             SessionOutcome::Completed => {
                 return Ok(PipelineResult {
                     success: true,
                     duration: start.elapsed(),
-                    crash_restarts,
+                    crash_restarts: crash_detector.total_restarts(),
                     message: "Pipeline completed successfully".to_string(),
                     session_name,
                 });
@@ -404,6 +412,10 @@ fn run_session_attempt(
     let mut last_process_gone_at: Option<Instant> = None;
     let mut last_artifact_scan = Instant::now();
     let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
+    let mut prompt_acceptor = crate::monitor::prompt_accept::PromptAcceptor::new(
+        config.watchdog.prompt_accept_enabled,
+        config.watchdog.prompt_accept_debounce_secs,
+    );
     let mut last_artifact_activity = Instant::now();
 
     // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
@@ -552,6 +564,13 @@ fn run_session_attempt(
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&pane_content, &mut hasher);
         let current_hash = std::hash::Hasher::finish(&hasher);
+
+        // Auto-accept permission prompts (y/n dialogs)
+        if prompt_acceptor.check_and_accept(&pane_content, session_name) {
+            last_activity = Instant::now();
+            last_output_hash = current_hash; // Prevent idle detection from also acting
+            continue; // Skip rest of loop — we just interacted
+        }
 
         if current_hash != last_output_hash {
             last_output_hash = current_hash;

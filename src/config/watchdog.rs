@@ -14,6 +14,10 @@
 //! | `GW_ARTIFACT_SCAN_INTERVAL_SECS` | 15 | seconds | How often to scan artifact directory |
 //! | `GW_PIPELINE_TIMEOUT_SECS` | 21600 | seconds | Total pipeline timeout (6 hours) |
 //! | `GW_CHECKPOINT_POLL_INTERVAL_SECS` | 10 | seconds | How often to check checkpoint file |
+//! | `GW_PROMPT_ACCEPT` | 1 | bool (0/1) | Enable auto-accept for permission prompts |
+//! | `GW_PROMPT_ACCEPT_DEBOUNCE_SECS` | 5 | seconds | Debounce between auto-accepts |
+//! | `GW_CRASH_WINDOW_SECS` | 900 | seconds | Rolling window for crash loop detection |
+//! | `GW_CRASH_STABILITY_SECS` | 1800 | seconds | Healthy running time to reset crash counters |
 
 use std::time::Duration;
 
@@ -43,6 +47,15 @@ pub struct WatchdogConfig {
     pub error_confirm_medium_secs: u64,
     /// Confirmation period for high-confidence errors (>= 0.8), in seconds.
     pub error_confirm_high_secs: u64,
+    /// Whether to auto-accept permission prompts (y/n dialogs).
+    /// Default: enabled. Set GW_PROMPT_ACCEPT=0 to disable.
+    pub prompt_accept_enabled: bool,
+    /// Debounce interval between auto-accepts (seconds).
+    pub prompt_accept_debounce_secs: u64,
+    /// Rolling window for crash loop detection (seconds). Default 900 (15 min).
+    pub crash_window_secs: u64,
+    /// How long healthy running resets crash counters (seconds). Default 1800 (30 min).
+    pub crash_stability_secs: u64,
 }
 
 impl WatchdogConfig {
@@ -60,6 +73,10 @@ impl WatchdogConfig {
             max_crash_retries: env_or("GW_MAX_CRASH_RETRIES", 5) as u32,
             error_confirm_medium_secs: env_or("GW_ERROR_CONFIRM_MEDIUM_SECS", 15 * 60),
             error_confirm_high_secs: env_or("GW_ERROR_CONFIRM_HIGH_SECS", 5 * 60),
+            prompt_accept_enabled: env_or("GW_PROMPT_ACCEPT", 1) != 0,
+            prompt_accept_debounce_secs: env_or("GW_PROMPT_ACCEPT_DEBOUNCE_SECS", 5),
+            crash_window_secs: env_or("GW_CRASH_WINDOW_SECS", 900),
+            crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800),
         }
     }
 }
@@ -94,5 +111,9 @@ mod tests {
         assert_eq!(config.max_crash_retries, 5);
         assert_eq!(config.error_confirm_medium_secs, 15 * 60);
         assert_eq!(config.error_confirm_high_secs, 5 * 60);
+        assert!(config.prompt_accept_enabled);
+        assert_eq!(config.prompt_accept_debounce_secs, 5);
+        assert_eq!(config.crash_window_secs, 900);
+        assert_eq!(config.crash_stability_secs, 1800);
     }
 }

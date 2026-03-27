@@ -41,6 +41,7 @@
 //! ```
 
 pub mod completion;
+pub mod crash_loop;
 pub mod phase_executor;
 pub mod retry;
 pub mod single_session;

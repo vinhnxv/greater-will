@@ -38,4 +38,5 @@
 
 pub mod checkpoint_poll;
 pub mod nudge;
+pub mod prompt_accept;
 
