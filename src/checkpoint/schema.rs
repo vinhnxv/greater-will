@@ -254,10 +254,20 @@ impl Checkpoint {
 
     /// Get the current phase name based on `phase_sequence`.
     ///
-    /// Returns `None` if `phase_sequence` is not set or out of bounds.
+    /// Returns `None` only if `phase_sequence` is not set.
+    /// When `phase_sequence` is past the end of PHASE_ORDER (arc completed),
+    /// returns the last phase in the pipeline instead of `None`.
     pub fn current_phase(&self) -> Option<&'static str> {
         let idx = self.phase_sequence? as usize;
-        crate::checkpoint::phase_order::phase_at(idx)
+        crate::checkpoint::phase_order::phase_at(idx).or_else(|| {
+            // phase_sequence past end means arc completed — return last phase
+            let count = crate::checkpoint::phase_order::PHASE_COUNT;
+            if count > 0 && idx >= count {
+                crate::checkpoint::phase_order::phase_at(count - 1)
+            } else {
+                None
+            }
+        })
     }
 
     /// Check if the arc has completed (all phases done).
@@ -611,7 +621,7 @@ mod tests {
         assert_eq!(cp.current_phase(), Some("work"));
 
         cp.phase_sequence = Some(41);
-        assert_eq!(cp.current_phase(), None);
+        assert_eq!(cp.current_phase(), Some("merge")); // past end → last phase
 
         cp.phase_sequence = None;
         assert_eq!(cp.current_phase(), None);
