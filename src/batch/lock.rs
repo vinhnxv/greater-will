@@ -69,11 +69,10 @@ impl InstanceLock {
 
     /// Release the instance lock.
     pub fn release(&self) -> Result<()> {
-        if self.lock_path.exists() {
-            if let Err(e) = fs::remove_file(&self.lock_path) {
-                eprintln!("Warning: failed to remove lock file: {e}");
-            }
-            tracing::info!("Released instance lock");
+        match fs::remove_file(&self.lock_path) {
+            Ok(()) => tracing::info!("Released instance lock"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "Failed to remove lock file"),
         }
         Ok(())
     }
@@ -83,10 +82,10 @@ impl Drop for InstanceLock {
     fn drop(&mut self) {
         // Best-effort cleanup on drop — advisory lock auto-releases
         // when File is dropped, but remove the file for tidiness.
-        if self.lock_path.exists() {
-            if let Err(e) = fs::remove_file(&self.lock_path) {
-                eprintln!("Warning: failed to remove lock file on drop: {e}");
-            }
+        match fs::remove_file(&self.lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "Failed to remove lock file on drop"),
         }
     }
 }

@@ -117,6 +117,11 @@ impl BatchState {
         fs::write(&tmp_path, &json)
             .wrap_err_with(|| format!("Failed to write tmp state: {}", tmp_path.display()))?;
 
+        // Fsync to ensure data is on disk before rename
+        if let Ok(f) = fs::File::open(&tmp_path) {
+            let _ = f.sync_all();
+        }
+
         // Atomic rename
         fs::rename(&tmp_path, &state_path)
             .wrap_err("Failed to atomically rename batch state")?;

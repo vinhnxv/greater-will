@@ -27,8 +27,8 @@ use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::capture_pane;
 use crate::session::spawn::{
-    has_session, kill_session, send_keys_with_workaround, spawn_claude_session,
-    SpawnConfig,
+    has_session, kill_session, send_keys_with_workaround, shell_escape,
+    spawn_claude_session, SpawnConfig,
 };
 use color_eyre::eyre::{self};
 use color_eyre::Result;
@@ -851,12 +851,17 @@ fn monitor_session(
                 // Short sessions crashed before creating a checkpoint.
                 const MIN_COMPLETION_AGE_SECS: u64 = 300;
                 if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
-                    info!(
+                    warn!(
                         age_secs = session_age.as_secs(),
-                        "Session ended, no checkpoint, but ran {}m — assuming completion",
+                        "Session ended, no checkpoint, ran {}m — no positive completion signal, treating as crash",
                         session_age.as_secs() / 60,
                     );
-                    return Ok(SessionOutcome::Completed);
+                    return Ok(SessionOutcome::Crashed {
+                        reason: format!(
+                            "Session ran {}m but produced no checkpoint — cannot confirm completion",
+                            session_age.as_secs() / 60,
+                        ),
+                    });
                 }
                 warn!(
                     age_secs = session_age.as_secs(),
@@ -1658,7 +1663,7 @@ fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working_dir: &Path
 
 /// Build the `/rune:arc` command string for initial run.
 fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
-    let mut cmd = format!("/rune:arc {}", plan_path);
+    let mut cmd = format!("/rune:arc {}", shell_escape(plan_path));
 
     if config.resume {
         cmd.push_str(" --resume");
@@ -1666,7 +1671,7 @@ fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
 
     for flag in &config.arc_flags {
         cmd.push(' ');
-        cmd.push_str(flag);
+        cmd.push_str(&shell_escape(flag));
     }
 
     cmd
@@ -1674,11 +1679,11 @@ fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
 
 /// Build the `/rune:arc --resume` command for crash recovery.
 fn build_resume_command(plan_path: &str, config: &SingleSessionConfig) -> String {
-    let mut cmd = format!("/rune:arc {} --resume", plan_path);
+    let mut cmd = format!("/rune:arc {} --resume", shell_escape(plan_path));
 
     for flag in &config.arc_flags {
         cmd.push(' ');
-        cmd.push_str(flag);
+        cmd.push_str(&shell_escape(flag));
     }
 
     cmd
@@ -2019,21 +2024,28 @@ mod tests {
     fn test_build_arc_command() {
         let config = SingleSessionConfig::new("/tmp");
         let cmd = build_arc_command("plans/test.md", &config);
-        assert_eq!(cmd, "/rune:arc plans/test.md");
+        assert_eq!(cmd, "/rune:arc 'plans/test.md'");
     }
 
     #[test]
     fn test_build_arc_command_with_resume() {
         let config = SingleSessionConfig::new("/tmp").with_resume();
         let cmd = build_arc_command("plans/test.md", &config);
-        assert_eq!(cmd, "/rune:arc plans/test.md --resume");
+        assert_eq!(cmd, "/rune:arc 'plans/test.md' --resume");
     }
 
     #[test]
     fn test_build_resume_command() {
         let config = SingleSessionConfig::new("/tmp");
         let cmd = build_resume_command("plans/test.md", &config);
-        assert_eq!(cmd, "/rune:arc plans/test.md --resume");
+        assert_eq!(cmd, "/rune:arc 'plans/test.md' --resume");
+    }
+
+    #[test]
+    fn test_build_arc_command_escapes_special_chars() {
+        let config = SingleSessionConfig::new("/tmp");
+        let cmd = build_arc_command("plans/test; rm -rf /.md", &config);
+        assert_eq!(cmd, "/rune:arc 'plans/test; rm -rf /.md'");
     }
 
     #[test]

@@ -86,7 +86,10 @@ pub fn write_session_owner(
     };
 
     let json = serde_json::to_string_pretty(&owner)?;
-    std::fs::write(&path, json)?;
+    // Atomic write: write to tmp, then rename (crash-safe)
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)?;
+    std::fs::rename(&tmp_path, &path)?;
 
     info!(
         gw_pid = owner.gw_pid,

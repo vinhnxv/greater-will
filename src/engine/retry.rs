@@ -400,7 +400,7 @@ impl ErrorClass {
                 || tail.contains("plugin not installed")
                 || tail.contains("skill not found")
             {
-                return Some(ErrorClass::AuthError); // terminal — stop batch
+                return Some(ErrorClass::BootstrapError); // terminal — missing plugin/skill
             }
         }
 
@@ -565,7 +565,10 @@ impl BackoffStrategy {
             }
 
             BackoffStrategy::Custom(durations) => {
-                let idx = (attempt as usize).min(durations.len().saturating_sub(1));
+                if durations.is_empty() {
+                    return Duration::from_secs(30);
+                }
+                let idx = (attempt as usize).min(durations.len() - 1);
                 durations[idx]
             }
         }

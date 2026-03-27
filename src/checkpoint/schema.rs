@@ -252,9 +252,10 @@ impl Checkpoint {
             return true;
         }
 
-        self.phases.values().all(|p| {
-            p.status == "completed" || p.status == "skipped"
-        })
+        !self.phases.is_empty()
+            && self.phases.values().all(|p| {
+                p.status == "completed" || p.status == "skipped"
+            })
     }
 
     /// Count phases by status.

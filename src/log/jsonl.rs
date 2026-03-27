@@ -112,7 +112,9 @@ fn rotate_log(log_path: &Path) -> Result<()> {
     // Delete the oldest if it exists
     let oldest = PathBuf::from(format!("{}.{}", base, MAX_ROTATED_FILES));
     if oldest.exists() {
-        fs::remove_file(&oldest).ok();
+        if let Err(e) = fs::remove_file(&oldest) {
+            tracing::warn!(error = %e, path = %oldest.display(), "Failed to remove oldest log");
+        }
     }
 
     // Shift existing rotated files
@@ -120,14 +122,18 @@ fn rotate_log(log_path: &Path) -> Result<()> {
         let from = PathBuf::from(format!("{}.{}", base, i));
         let to = PathBuf::from(format!("{}.{}", base, i + 1));
         if from.exists() {
-            fs::rename(&from, &to).ok();
+            if let Err(e) = fs::rename(&from, &to) {
+                tracing::warn!(error = %e, from = %from.display(), "Failed to rotate log file");
+            }
         }
     }
 
     // Rename current to .1
     let first = PathBuf::from(format!("{}.1", base));
     if log_path.exists() {
-        fs::rename(log_path, &first).ok();
+        if let Err(e) = fs::rename(log_path, &first) {
+            tracing::warn!(error = %e, "Failed to rotate current log file");
+        }
     }
 
     Ok(())

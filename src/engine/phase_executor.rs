@@ -48,9 +48,6 @@ use tracing::{debug, error, info, warn};
 /// Default prompt wait timeout (60 seconds).
 const DEFAULT_PROMPT_WAIT_SECS: u64 = 60;
 
-/// Default initialization wait (12 seconds).
-const CLAUDE_INIT_SECS: u64 = 12;
-
 /// Phase group state in the execution state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PhaseGroupState {
