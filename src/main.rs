@@ -22,6 +22,8 @@ mod config;
 #[allow(dead_code)]
 mod engine;
 #[allow(dead_code)]
+mod github;
+#[allow(dead_code)]
 mod log;
 #[allow(dead_code)]
 mod monitor;

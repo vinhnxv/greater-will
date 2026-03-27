@@ -39,10 +39,12 @@ pub enum Commands {
     /// Use `--multi-group` for the legacy mode that splits phases into
     /// groups (A-G), each in a separate tmux session.
     Run {
-        /// Plan files to execute (required, one or more).
+        /// Plan files or GitHub issue URLs to execute (one or more).
         ///
-        /// Each plan file should be a markdown file with YAML frontmatter.
-        /// Plans are executed in the order specified.
+        /// Accepts plan file paths, glob patterns, or GitHub issue URLs.
+        /// GitHub URLs (e.g. `https://github.com/owner/repo/issues/123`
+        /// or shorthand `owner/repo#123`) are automatically fetched via
+        /// `gh` CLI and converted into plan files under `plans/`.
         #[arg(required = true)]
         plans: Vec<String>,
 

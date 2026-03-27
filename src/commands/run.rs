@@ -56,6 +56,10 @@ pub fn execute(
         preflight_git_clean(&cwd)?;
     }
 
+    // Resolve any GitHub issue URLs into generated plan files
+    let plans = crate::github::resolve_github_urls(&plans, &cwd)
+        .wrap_err("Failed to resolve GitHub issue URL(s)")?;
+
     // Expand glob patterns in plans
     let expanded_plans = expand_plan_globs(&plans)?;
 
