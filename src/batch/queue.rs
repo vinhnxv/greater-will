@@ -188,6 +188,7 @@ impl BatchRunner {
                     duration_secs: 0.0,
                     completed_at: Utc::now(),
                     error: Some("Circuit breaker tripped".to_string()),
+                    transient: false,
                 };
                 self.batch_state.record_result(result);
                 self.batch_state.save()?;
@@ -199,6 +200,7 @@ impl BatchRunner {
                         duration_secs: 0.0,
                         completed_at: Utc::now(),
                         error: Some("Circuit breaker tripped".to_string()),
+                        transient: false,
                     };
                     self.batch_state.record_result(skip_result);
                 }
@@ -215,6 +217,7 @@ impl BatchRunner {
                     duration_secs: 0.0,
                     completed_at: Utc::now(),
                     error: Some(format!("Disk space check failed: {}", e)),
+                    transient: false,
                 };
                 self.batch_state.record_result(result);
                 self.batch_state.save()?;
@@ -263,6 +266,7 @@ impl BatchRunner {
                 duration_secs: 0.0,
                 completed_at: Utc::now(),
                 error: Some(format!("Plan file not found: {}", plan)),
+                transient: false,
             };
         }
 
@@ -280,12 +284,18 @@ impl BatchRunner {
                         .iter()
                         .filter_map(|r| r.error_message.clone())
                         .collect();
+                    // Check if any failure was a transient error (ApiOverload, NetworkError)
+                    let is_transient = results.iter().any(|r| {
+                        matches!(r.state, PhaseGroupState::Failed { error: crate::engine::retry::ErrorClass::ApiOverload, .. }
+                            | PhaseGroupState::Failed { error: crate::engine::retry::ErrorClass::NetworkError, .. })
+                    });
                     PlanResult {
                         plan: plan.to_string(),
                         outcome: PlanOutcome::Failed,
                         duration_secs: duration.as_secs_f64(),
                         completed_at: Utc::now(),
                         error: Some(errors.join("; ")),
+                        transient: is_transient,
                     }
                 } else {
                     tracing::info!(plan = %plan, duration_secs = duration.as_secs_f64(), "Plan completed successfully");
@@ -295,6 +305,7 @@ impl BatchRunner {
                         duration_secs: duration.as_secs_f64(),
                         completed_at: Utc::now(),
                         error: None,
+                        transient: false,
                     }
                 }
             }
@@ -315,6 +326,7 @@ impl BatchRunner {
                     duration_secs: duration.as_secs_f64(),
                     completed_at: Utc::now(),
                     error: Some(error_msg),
+                    transient: false,
                 }
             }
         }

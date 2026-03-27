@@ -134,6 +134,9 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
         eyre::bail!("Plan file not found: {}", plan_path.display());
     }
 
+    // Pre-flight: disk space check
+    crate::cleanup::health::check_disk_space()?;
+
     // Startup cleanup
     startup_cleanup()?;
 
@@ -314,22 +317,83 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                         session_name: session_name.clone(),
                     });
                 }
-                // On any non-completion, fall through to the normal crash-recovery loop
-                // which will spawn a fresh session with --resume.
-                _ => {
+                // Fatal errors — no retry, return immediately
+                SessionOutcome::ErrorDetected { error_class, ref reason } if error_class.skips_plan() => {
+                    return Ok(PipelineResult {
+                        success: false,
+                        duration: start.elapsed(),
+                        crash_restarts: crash_detector.total_restarts(),
+                        message: format!("Fatal error in adopted session (no retry): {}", reason),
+                        session_name: session_name.clone(),
+                    });
+                }
+                SessionOutcome::Timeout => {
+                    return Ok(PipelineResult {
+                        success: false,
+                        duration: start.elapsed(),
+                        crash_restarts: crash_detector.total_restarts(),
+                        message: "Pipeline timeout exceeded (adopted session)".to_string(),
+                        session_name: session_name.clone(),
+                    });
+                }
+                // Retryable errors — record restart and fall through to spawn a fresh session
+                other => {
                     is_first_run = false;
-                    warn!("Adopted session ended with {:?} — will restart with --resume", attempt_result);
+                    match crash_detector.record_restart() {
+                        CrashLoopDecision::StopCrashLoop => {
+                            return Ok(PipelineResult {
+                                success: false,
+                                duration: start.elapsed(),
+                                crash_restarts: crash_detector.total_restarts(),
+                                message: format!(
+                                    "Crash loop (adopted): {} crashes in {}s window. Last: {:?}",
+                                    crash_detector.crashes_in_window(),
+                                    config.watchdog.crash_window_secs,
+                                    other,
+                                ),
+                                session_name: session_name.clone(),
+                            });
+                        }
+                        CrashLoopDecision::AllowRestart => {}
+                    }
+                    warn!("Adopted session ended with {:?} — will restart with --resume", other);
+                    println!("[gw] Waiting {}s before restart...", config.watchdog.restart_cooldown_secs);
+                    std::thread::sleep(Duration::from_secs(config.watchdog.restart_cooldown_secs));
                     continue;
                 }
             }
         }
 
-        // Build command — use --resume after first crash
+        // Build command — phase-aware restart strategy:
+        // 1. No checkpoint → fresh start (Rune never initialized)
+        // 2. Checkpoint with progress → --resume (continue from last phase)
+        // 3. Ship/merge phase with PR → --resume but check PR state
         let command = if is_first_run {
             arc_command.clone()
         } else {
-            info!(restart = crash_detector.total_restarts(), "Restarting with --resume after crash");
-            build_resume_command(plan_str, config)
+            match resolve_restart_command(
+                &config.working_dir,
+                plan_str,
+                config,
+                &arc_command,
+                crash_detector.total_restarts(),
+            ) {
+                RestartDecision::Fresh(cmd) => cmd,
+                RestartDecision::Resume(cmd) => cmd,
+                RestartDecision::AlreadyDone => {
+                    info!("Checkpoint shows pipeline already complete — no restart needed");
+                    println!("[gw] Pipeline already complete (PR merged or arc done) — skipping restart");
+                    session_owner::remove_session_owner(&config.working_dir);
+                    CrashLoopDetector::clear_history(&config.working_dir);
+                    return Ok(PipelineResult {
+                        success: true,
+                        duration: start.elapsed(),
+                        crash_restarts: crash_detector.total_restarts(),
+                        message: "Pipeline already complete (detected on restart)".to_string(),
+                        session_name,
+                    });
+                }
+            }
         };
 
         // Run one session attempt
@@ -389,12 +453,13 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     "Session crashed, will restart with --resume"
                 );
                 println!(
-                    "[gw] Session crashed ({}/{}): {}. Restarting in 5s...",
+                    "[gw] Session crashed ({}/{}): {}. Restarting in {}s...",
                     crash_detector.total_restarts(), config.watchdog.max_crash_retries, reason,
+                    config.watchdog.restart_cooldown_secs,
                 );
 
-                // Brief cooldown before restart
-                std::thread::sleep(Duration::from_secs(5));
+                // Cooldown before restart — give system time to stabilize
+                std::thread::sleep(Duration::from_secs(config.watchdog.restart_cooldown_secs));
             }
             SessionOutcome::Timeout => {
                 return Ok(PipelineResult {
@@ -427,10 +492,11 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
                 warn!(restart = crash_detector.total_restarts(), "Session stuck, restarting");
                 println!(
-                    "[gw] Session stuck ({}/{}). Restarting in 5s...",
+                    "[gw] Session stuck ({}/{}). Restarting in {}s...",
                     crash_detector.total_restarts(), config.watchdog.max_crash_retries,
+                    config.watchdog.restart_cooldown_secs,
                 );
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(Duration::from_secs(config.watchdog.restart_cooldown_secs));
             }
             SessionOutcome::ErrorDetected { error_class, reason } => {
                 // Auth/billing errors are fatal — skip immediately, no retry
@@ -608,7 +674,7 @@ fn monitor_session(
     let dispatch_time = Instant::now();
     let mut last_output_hash: u64 = 0;
     let mut last_activity = Instant::now();
-    let mut nudged = false;
+    let mut nudge_count: u32 = 0;
     let mut last_status_log = Instant::now();
     let mut poll_count: u64 = 0;
     let mut last_checkpoint_poll = Instant::now();
@@ -661,7 +727,17 @@ fn monitor_session(
     let error_confirm_medium_secs = wd.error_confirm_medium_secs;
     let error_confirm_high_secs = wd.error_confirm_high_secs;
 
-    info!("Entering monitor loop (poll={}s, nudge={}s, kill={}s)",
+    // Phase-aware monitoring: track current phase and apply per-phase thresholds.
+    // When the phase is unknown (early in pipeline), use watchdog defaults.
+    use crate::engine::phase_profile::{self, PhaseProfile};
+    let mut current_phase_name: Option<String> = None;
+    let mut current_profile: PhaseProfile = phase_profile::default_profile();
+    let mut phase_started_at: Option<Instant> = None;
+    // Effective timeout for current phase — resolved from checkpoint.totals.phase_times
+    // or falls back to profile default. Reset on every phase transition.
+    let mut effective_phase_timeout: u64 = current_profile.phase_timeout_secs;
+
+    info!("Entering monitor loop (poll={}s, default nudge={}s, default kill={}s)",
         POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
     println!("[gw] Monitoring session (poll every {}s)...", POLL_INTERVAL_SECS);
 
@@ -701,15 +777,20 @@ fn monitor_session(
         // explicitly tells us the turn failed via the StopFailure hook.
         if let Some(_signal) = crate::commands::elden::read_stop_failure_signal() {
             info!("StopFailure signal detected — API error reported by Claude Code");
-            println!("[gw] API error detected via StopFailure hook — killing session");
             // Clear the signal so we don't re-detect on restart
             crate::commands::elden::clear_signals();
+            // Classify from pane output — StopFailure confirms a real error,
+            // so we can trust keyword matching without stall evidence.
+            // Fall back to ApiOverload if no specific pattern matches.
+            let pane_for_classify = capture_pane(session_name).unwrap_or_default();
+            let error_class = ErrorClass::from_pane_output(&pane_for_classify, true)
+                .unwrap_or(ErrorClass::ApiOverload);
+            let reason = format!("StopFailure hook — classified as {:?}", error_class);
+            println!("[gw] {} — killing session", reason);
             kill_session(session_name)?;
-            // Classify as ApiOverload — the most common StopFailure cause.
-            // The outer loop will apply exponential backoff (15→30→60→120 min).
             return Ok(SessionOutcome::ErrorDetected {
-                error_class: ErrorClass::ApiOverload,
-                reason: "API error reported via StopFailure hook".to_string(),
+                error_class,
+                reason,
             });
         }
 
@@ -765,9 +846,29 @@ fn monitor_session(
                         ),
                     });
                 }
-                // No checkpoint — fall back to old heuristic
-                info!("Session ended, process dead, no checkpoint — assuming completion");
-                return Ok(SessionOutcome::Completed);
+                // No checkpoint found. Use session age to disambiguate:
+                // Long-running sessions (>5 min) likely completed and Rune cleaned up.
+                // Short sessions crashed before creating a checkpoint.
+                const MIN_COMPLETION_AGE_SECS: u64 = 300;
+                if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
+                    info!(
+                        age_secs = session_age.as_secs(),
+                        "Session ended, no checkpoint, but ran {}m — assuming completion",
+                        session_age.as_secs() / 60,
+                    );
+                    return Ok(SessionOutcome::Completed);
+                }
+                warn!(
+                    age_secs = session_age.as_secs(),
+                    "Session ended after only {}s with no checkpoint — treating as crash",
+                    session_age.as_secs(),
+                );
+                return Ok(SessionOutcome::Crashed {
+                    reason: format!(
+                        "Session ended after {}s with no checkpoint (too short for completion)",
+                        session_age.as_secs(),
+                    ),
+                });
             }
 
             // Session gone but process alive? Unusual — treat as crash.
@@ -804,7 +905,7 @@ fn monitor_session(
         if current_hash != last_output_hash {
             last_output_hash = current_hash;
             last_activity = Instant::now();
-            nudged = false; // Reset nudge on new activity
+            nudge_count = 0; // Reset nudge on new activity
         }
 
         // PRIMARY: Check checkpoint.json for arc completion.
@@ -839,6 +940,49 @@ fn monitor_session(
                     last_checkpoint_activity = Instant::now();
                 }
                 last_checkpoint_hash = Some(cp_hash);
+
+                // PHASE TRACKING: detect phase transitions and update profile.
+                let new_phase = checkpoint.current_phase().map(|s| s.to_string());
+                if new_phase != current_phase_name {
+                    let prev = current_phase_name.as_deref().unwrap_or("none");
+                    let curr = new_phase.as_deref().unwrap_or("unknown");
+
+                    if let Some(profile) = new_phase.as_deref().and_then(phase_profile::profile_for_phase) {
+                        let completed = checkpoint.count_by_status("completed");
+                        let skipped = checkpoint.count_by_status("skipped");
+                        let total = checkpoint.phases.len();
+
+                        // Resolve timeout from checkpoint data (phase_times + reactions)
+                        let timeout = phase_profile::resolve_phase_timeout_full(
+                            curr, &checkpoint, &profile,
+                        );
+                        effective_phase_timeout = timeout;
+
+                        info!(
+                            from = prev,
+                            to = curr,
+                            category = ?profile.category,
+                            idle_nudge = profile.idle_nudge_secs,
+                            idle_kill = profile.idle_kill_secs,
+                            phase_timeout = timeout,
+                            has_agents = profile.has_agent_teams,
+                            progress = format!("{}/{} done", completed + skipped, total),
+                            "Phase transition — applying {} profile (timeout={}m from checkpoint)",
+                            profile.description, timeout / 60,
+                        );
+                        println!(
+                            "[gw] Phase: {} → {} [{}] (nudge={}s, kill={}s, timeout={}m, {}/{})",
+                            prev, curr, profile.description,
+                            profile.idle_nudge_secs, profile.idle_kill_secs,
+                            timeout / 60,
+                            completed + skipped, total,
+                        );
+                        current_profile = profile;
+                        phase_started_at = Some(Instant::now());
+                    }
+
+                    current_phase_name = new_phase;
+                }
 
                 // Count successful checkpoint polls for delayed archive
                 successful_checkpoint_polls += 1;
@@ -957,10 +1101,31 @@ fn monitor_session(
                             ),
                         });
                     }
-                    // No checkpoint at all — treat as completion (Rune cleaned up everything)
-                    info!("Loop state gone, no checkpoint found — assuming clean completion");
+                    // No checkpoint found. Disambiguate using session age:
+                    // - Long-running (>5 min): Rune ran and cleaned up after itself → Completed
+                    // - Short-running (<5 min): Rune failed early before creating checkpoint → Crashed
+                    const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
+                    if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
+                        info!(
+                            age_secs = session_age.as_secs(),
+                            "Loop state gone, no checkpoint, but session ran {}m — assuming Rune cleaned up after completion",
+                            session_age.as_secs() / 60,
+                        );
+                        let _ = kill_session(session_name);
+                        return Ok(SessionOutcome::Completed);
+                    }
+                    warn!(
+                        age_secs = session_age.as_secs(),
+                        "Loop state gone, no checkpoint, session only ran {}s — treating as crash",
+                        session_age.as_secs(),
+                    );
                     let _ = kill_session(session_name);
-                    return Ok(SessionOutcome::Completed);
+                    return Ok(SessionOutcome::Crashed {
+                        reason: format!(
+                            "arc-phase-loop.local.md gone after only {}s with no checkpoint",
+                            session_age.as_secs(),
+                        ),
+                    });
                 }
             } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
                 // File never appeared within warmup window → Rune failed to start arc
@@ -974,9 +1139,13 @@ fn monitor_session(
                     session_age.as_secs(),
                 );
                 kill_session(session_name)?;
-                return Ok(SessionOutcome::Crashed {
+                // Classify as BootstrapError — Rune failed to initialize arc.
+                // This is likely a deterministic failure (plugin not loaded, bad
+                // command, config issue) that won't resolve by retrying.
+                return Ok(SessionOutcome::ErrorDetected {
+                    error_class: ErrorClass::BootstrapError,
                     reason: format!(
-                        "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s)",
+                        "arc-phase-loop.local.md never appeared after {}s (warmup timeout {}s) — Rune failed to initialize",
                         session_age.as_secs(), wd.loop_state_warmup_secs,
                     ),
                 });
@@ -1074,6 +1243,33 @@ fn monitor_session(
             };
 
             if let Some((started, prev_class, _prev_conf)) = &error_confirm_since {
+                // If the error class changed, reset the confirmation timer.
+                // A new error type needs its own observation window.
+                // Exception: if the new class is fatal (skips_plan), act immediately.
+                if *prev_class != error_class {
+                    if error_class.skips_plan() {
+                        warn!(
+                            prev_class = ?prev_class,
+                            new_class = ?error_class,
+                            "Error class escalated to fatal — acting immediately"
+                        );
+                        kill_session(session_name)?;
+                        return Ok(SessionOutcome::ErrorDetected {
+                            reason: format!(
+                                "Fatal error detected during confirmation: {:?} (was {:?})",
+                                error_class, prev_class,
+                            ),
+                            error_class,
+                        });
+                    }
+                    info!(
+                        prev_class = ?prev_class,
+                        new_class = ?error_class,
+                        "Error class changed — resetting confirmation timer"
+                    );
+                    error_confirm_since = Some((Instant::now(), error_class, conf));
+                    continue;
+                }
                 // Already in confirmation period — check if time to act
                 let elapsed_confirm = started.elapsed().as_secs();
                 if elapsed_confirm >= confirmation_secs {
@@ -1203,10 +1399,29 @@ fn monitor_session(
                 });
             }
 
-            // No checkpoint found — fall back to assuming completion
-            // (old behavior, for cases where checkpoint wasn't created yet)
-            info!("Process died, no checkpoint found — assuming completion");
-            return Ok(SessionOutcome::Completed);
+            // No checkpoint found. Use session age to disambiguate:
+            // Long-running sessions (>5 min) likely completed and Rune cleaned up.
+            // Short sessions crashed before creating a checkpoint.
+            const MIN_COMPLETION_AGE_SECS: u64 = 300;
+            if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
+                info!(
+                    age_secs = session_age.as_secs(),
+                    "Process died, no checkpoint, but ran {}m — assuming completion",
+                    session_age.as_secs() / 60,
+                );
+                return Ok(SessionOutcome::Completed);
+            }
+            warn!(
+                age_secs = session_age.as_secs(),
+                "Process died after only {}s with no checkpoint — treating as crash",
+                session_age.as_secs(),
+            );
+            return Ok(SessionOutcome::Crashed {
+                reason: format!(
+                    "Claude process died after {}s with no checkpoint (too short for completion)",
+                    session_age.as_secs(),
+                ),
+            });
         }
 
         // Periodic status logging
@@ -1221,17 +1436,25 @@ fn monitor_session(
                 format!("iter={}/{}, stale={}s", s.iteration, s.max_iterations, loop_stall_secs)
             }).unwrap_or_else(|| "no loop state".to_string());
 
+            let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+            let phase_elapsed = phase_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             info!(
                 elapsed_secs = elapsed.as_secs(),
                 idle_secs = idle_secs,
                 remaining_secs = remaining.as_secs(),
                 loop_stall_secs = loop_stall_secs,
                 poll_count = poll_count,
-                nudged = nudged,
-                "Monitor status: running {}m{}s, idle {}s, {}m left, {}",
+                nudge_count = nudge_count,
+                phase = phase_name,
+                phase_category = ?current_profile.category,
+                phase_elapsed_secs = phase_elapsed,
+                "Monitor: {}m{}s, idle {}s, phase={} [{}] ({}s), {}m left, {}",
                 elapsed.as_secs() / 60,
                 elapsed.as_secs() % 60,
                 idle_secs,
+                phase_name,
+                current_profile.description,
+                phase_elapsed,
                 remaining.as_secs() / 60,
                 loop_info,
             );
@@ -1262,34 +1485,85 @@ fn monitor_session(
             last_status_log = Instant::now();
         }
 
-        // Idle detection
-        let idle_duration = last_activity.elapsed();
+        // PER-PHASE TIMEOUT: kill if current phase exceeds its budget.
+        // Timeout is resolved from checkpoint.totals.phase_times + 5 min grace,
+        // falling back to profile defaults when checkpoint data is unavailable.
+        // The timer resets on every phase transition (phase_started_at updated above).
+        if let Some(phase_start) = phase_started_at {
+            let phase_elapsed = phase_start.elapsed().as_secs();
+            if phase_elapsed > effective_phase_timeout {
+                let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+                warn!(
+                    phase = phase_name,
+                    elapsed_secs = phase_elapsed,
+                    timeout_secs = effective_phase_timeout,
+                    category = ?current_profile.category,
+                    "Phase timeout exceeded for {:?} phase '{}' ({}s > {}s budget)",
+                    current_profile.category, phase_name,
+                    phase_elapsed, effective_phase_timeout,
+                );
+                println!(
+                    "[gw] Phase '{}' timeout: {}m > {}m budget — killing session",
+                    phase_name,
+                    phase_elapsed / 60,
+                    effective_phase_timeout / 60,
+                );
+                kill_session(session_name)?;
+                return Ok(SessionOutcome::Stuck);
+            }
+        }
 
-        if idle_duration > Duration::from_secs(wd.idle_kill_secs) {
+        // Idle detection — uses phase-aware thresholds from current_profile.
+        // Work phases get longer idle tolerance (swarm workers cause screen silence).
+        // Planning phases get shorter tolerance (should be fast).
+        let idle_duration = last_activity.elapsed();
+        let effective_kill_secs = current_profile.idle_kill_secs;
+        let effective_nudge_secs = current_profile.idle_nudge_secs;
+
+        if idle_duration > Duration::from_secs(effective_kill_secs) {
             warn!(
                 idle_secs = idle_duration.as_secs(),
-                "Session stuck (idle too long), killing"
+                phase = current_phase_name.as_deref().unwrap_or("unknown"),
+                category = ?current_profile.category,
+                limit = effective_kill_secs,
+                "Session stuck (idle too long for {:?} phase), killing",
+                current_profile.category,
             );
             println!(
-                "[gw] Session stuck (idle {}s > {}s limit), killing...",
+                "[gw] Session stuck (idle {}s > {}s {:?} limit), killing...",
                 idle_duration.as_secs(),
-                wd.idle_kill_secs,
+                effective_kill_secs,
+                current_profile.category,
             );
             kill_session(session_name)?;
             return Ok(SessionOutcome::Stuck);
         }
 
-        if idle_duration > Duration::from_secs(wd.idle_nudge_secs) && !nudged {
+        // Escalating nudge strategy (intervals scale with phase profile):
+        //   Nudge 1 at effective_nudge_secs: "please continue"
+        //   Nudge 2 at 2x: "are you stuck? please continue working"
+        //   Nudge 3 at 3x: "/compact" to recover context
+        // After all nudges, effective_kill_secs still applies as hard kill.
+        let nudge_interval = effective_nudge_secs;
+        let next_nudge_at = nudge_interval * (nudge_count as u64 + 1);
+        if idle_duration.as_secs() > next_nudge_at && nudge_count < 3 {
+            nudge_count += 1;
+            let nudge_msg = match nudge_count {
+                1 => "please continue",
+                2 => "are you stuck? please continue working",
+                _ => "/compact",
+            };
             info!(
                 idle_secs = idle_duration.as_secs(),
-                "Session idle, sending nudge"
+                nudge = nudge_count,
+                message = nudge_msg,
+                "Session idle, sending escalating nudge"
             );
             println!(
-                "[gw] Session idle for {}s, sending nudge...",
-                idle_duration.as_secs(),
+                "[gw] Session idle for {}s, sending nudge {}/3: {}",
+                idle_duration.as_secs(), nudge_count, nudge_msg,
             );
-            let _ = send_keys_with_workaround(session_name, "please continue");
-            nudged = true;
+            let _ = send_keys_with_workaround(session_name, nudge_msg);
         }
     }
 }
@@ -1408,6 +1682,174 @@ fn build_resume_command(plan_path: &str, config: &SingleSessionConfig) -> String
     }
 
     cmd
+}
+
+/// Decision for how to restart after a crash.
+enum RestartDecision {
+    /// Run the original command (no --resume).
+    Fresh(String),
+    /// Run with --resume.
+    Resume(String),
+    /// Pipeline already complete — don't restart at all.
+    AlreadyDone,
+}
+
+/// Determine the correct restart command based on checkpoint state.
+///
+/// Phase-aware logic:
+/// - No checkpoint or no progress → fresh start
+/// - Mid-arc with progress → --resume
+/// - Ship phase with PR already merged → AlreadyDone
+/// - Ship phase with PR open → --resume
+fn resolve_restart_command(
+    working_dir: &Path,
+    plan_str: &str,
+    config: &SingleSessionConfig,
+    arc_command: &str,
+    restart_count: u32,
+) -> RestartDecision {
+    use crate::engine::phase_profile::{self, RecoveryStrategy};
+
+    // Find a checkpoint with progress
+    let arc_dir = working_dir.join(".rune").join("arc");
+    if !arc_dir.exists() {
+        info!(restart = restart_count, "No .rune/arc/ dir — fresh start");
+        println!("[gw] No checkpoint found — running fresh (not --resume)");
+        return RestartDecision::Fresh(arc_command.to_string());
+    }
+
+    // Scan for checkpoint with progress
+    let checkpoint = std::fs::read_dir(&arc_dir).ok().and_then(|entries| {
+        for entry in entries.flatten() {
+            let cp_path = entry.path().join("checkpoint.json");
+            if cp_path.exists() {
+                if let Ok(cp) = crate::checkpoint::reader::read_checkpoint(&cp_path) {
+                    let has_progress = cp.phases.values().any(|p| {
+                        p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
+                    });
+                    if has_progress {
+                        return Some(cp);
+                    }
+                }
+            }
+        }
+        None
+    });
+
+    let checkpoint = match checkpoint {
+        Some(cp) => cp,
+        None => {
+            info!(restart = restart_count, "No checkpoint with progress — fresh start");
+            println!("[gw] No checkpoint with progress — running fresh (not --resume)");
+            return RestartDecision::Fresh(arc_command.to_string());
+        }
+    };
+
+    // Check if already complete
+    if checkpoint.is_complete() {
+        return RestartDecision::AlreadyDone;
+    }
+
+    // Determine current phase and its recovery strategy
+    let current_phase = checkpoint.current_phase().unwrap_or("unknown");
+    let profile = phase_profile::profile_for_phase(current_phase)
+        .unwrap_or_else(phase_profile::default_profile);
+
+    let completed = checkpoint.count_by_status("completed");
+    let skipped = checkpoint.count_by_status("skipped");
+    let total = checkpoint.phases.len();
+
+    match profile.recovery {
+        RecoveryStrategy::FreshStart => {
+            info!(
+                restart = restart_count,
+                phase = current_phase,
+                "Recovery strategy: fresh start for {:?} phase",
+                profile.category,
+            );
+            println!("[gw] Phase '{}' recovery: fresh start", current_phase);
+            RestartDecision::Fresh(arc_command.to_string())
+        }
+        RecoveryStrategy::Resume => {
+            info!(
+                restart = restart_count,
+                phase = current_phase,
+                progress = format!("{}/{}", completed + skipped, total),
+                "Recovery strategy: --resume from {:?} phase",
+                profile.category,
+            );
+            println!(
+                "[gw] Phase '{}' ({}/{} done) — resuming with --resume",
+                current_phase, completed + skipped, total,
+            );
+            RestartDecision::Resume(build_resume_command(plan_str, config))
+        }
+        RecoveryStrategy::ResumeCheckPR => {
+            // Ship/merge phase — check if PR already exists and is merged
+            if let Some(pr_url) = &checkpoint.pr_url {
+                info!(
+                    restart = restart_count,
+                    phase = current_phase,
+                    pr_url = %pr_url,
+                    "Ship phase with existing PR — resuming to finish merge"
+                );
+                println!("[gw] Phase '{}' with PR {} — resuming", current_phase, pr_url);
+            } else {
+                info!(
+                    restart = restart_count,
+                    phase = current_phase,
+                    "Ship phase without PR — resuming to create PR"
+                );
+            }
+            RestartDecision::Resume(build_resume_command(plan_str, config))
+        }
+    }
+}
+
+/// Check if a checkpoint with real progress exists under `.rune/arc/`.
+///
+/// Returns true only if:
+/// 1. A checkpoint.json exists, AND
+/// 2. At least one phase has status "completed" or "in_progress"
+///
+/// This ensures `--resume` is only used when Rune actually made progress.
+/// A checkpoint that exists but has all phases "pending" means the arc was
+/// just initialized but never ran — a fresh start is more reliable.
+fn has_checkpoint(working_dir: &Path) -> bool {
+    let arc_dir = working_dir.join(".rune").join("arc");
+    if !arc_dir.exists() {
+        return false;
+    }
+    // Scan for any checkpoint.json with real progress
+    match std::fs::read_dir(&arc_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let cp_path = entry.path().join("checkpoint.json");
+                if cp_path.exists() {
+                    // Read and verify there's real progress
+                    if let Ok(cp) = crate::checkpoint::reader::read_checkpoint(&cp_path) {
+                        let has_progress = cp.phases.values().any(|p| {
+                            p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
+                        });
+                        if has_progress {
+                            debug!(
+                                path = %cp_path.display(),
+                                completed = cp.count_by_status("completed"),
+                                "Found checkpoint with progress — --resume is safe"
+                            );
+                            return true;
+                        }
+                        debug!(
+                            path = %cp_path.display(),
+                            "Checkpoint exists but no phases progressed — fresh start preferred"
+                        );
+                    }
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Run multiple plans sequentially in single-session mode.

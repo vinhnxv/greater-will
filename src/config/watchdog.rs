@@ -61,6 +61,9 @@ pub struct WatchdogConfig {
     /// If the file doesn't appear within this window, the session is treated as crashed.
     /// Default 180s (3 min) — Rune typically creates this file within 1-2 minutes.
     pub loop_state_warmup_secs: u64,
+    /// Cooldown between crash-recovery restarts (seconds). Default 60s (1 min).
+    /// Gives Claude Code time to fully initialize before the next attempt.
+    pub restart_cooldown_secs: u64,
 }
 
 impl WatchdogConfig {
@@ -83,6 +86,7 @@ impl WatchdogConfig {
             crash_window_secs: env_or("GW_CRASH_WINDOW_SECS", 900),
             crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800),
             loop_state_warmup_secs: env_or("GW_LOOP_STATE_WARMUP_SECS", 180), // 3 min
+            restart_cooldown_secs: env_or("GW_RESTART_COOLDOWN_SECS", 60), // 1 min
         }
     }
 }
@@ -122,5 +126,6 @@ mod tests {
         assert_eq!(config.crash_window_secs, 900);
         assert_eq!(config.crash_stability_secs, 1800);
         assert_eq!(config.loop_state_warmup_secs, 180);
+        assert_eq!(config.restart_cooldown_secs, 60);
     }
 }

@@ -41,6 +41,10 @@ const PROMPT_PATTERNS: &[&str] = &[
 /// terminal, not waiting for permission.
 const SHELL_PROMPTS: &[&str] = &["❯", "$ ", "# ", "% "];
 
+/// Maximum auto-accepts per session. Prevents infinite approval loops
+/// from a misconfigured session or unexpected prompt pattern.
+const MAX_AUTO_ACCEPTS: u32 = 50;
+
 /// Detects permission prompts in pane output and auto-sends Enter.
 #[derive(Debug)]
 pub struct PromptAcceptor {
@@ -52,6 +56,8 @@ pub struct PromptAcceptor {
     enabled: bool,
     /// Total number of prompts accepted this session.
     accept_count: u32,
+    /// Whether the max accepts limit has been logged (log once).
+    limit_logged: bool,
 }
 
 impl PromptAcceptor {
@@ -64,6 +70,7 @@ impl PromptAcceptor {
             debounce: Duration::from_secs(debounce_secs),
             enabled,
             accept_count: 0,
+            limit_logged: false,
         }
     }
 
@@ -76,6 +83,21 @@ impl PromptAcceptor {
         session_name: &str,
     ) -> bool {
         if !self.enabled {
+            return false;
+        }
+
+        // Safety cap: stop auto-accepting after MAX_AUTO_ACCEPTS to prevent
+        // infinite approval loops from unexpected prompt patterns.
+        if self.accept_count >= MAX_AUTO_ACCEPTS {
+            if !self.limit_logged {
+                tracing::warn!(
+                    count = self.accept_count,
+                    max = MAX_AUTO_ACCEPTS,
+                    "Auto-accept limit reached — stopping auto-accepts for this session"
+                );
+                println!("[gw] Auto-accept limit ({}) reached — manual intervention required", MAX_AUTO_ACCEPTS);
+                self.limit_logged = true;
+            }
             return false;
         }
 

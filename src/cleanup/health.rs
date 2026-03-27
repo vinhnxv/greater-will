@@ -293,6 +293,46 @@ pub fn quick_health_check() -> Result<SystemHealth> {
     checker.quick_check()
 }
 
+/// Minimum disk space required before starting a pipeline (2 GB).
+const MIN_DISK_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Check that minimum disk space is available.
+///
+/// Returns `Ok(())` if sufficient space, or `Err` if below threshold.
+/// Used by both single-session and batch modes as a pre-flight check.
+pub fn check_disk_space() -> Result<()> {
+    use sysinfo::Disks;
+
+    let disks = Disks::new_with_refreshed_list();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let available = disks
+        .iter()
+        .filter(|d| cwd.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space());
+
+    match available {
+        Some(space) if space < MIN_DISK_SPACE_BYTES => {
+            let gb = space as f64 / (1024.0 * 1024.0 * 1024.0);
+            Err(eyre!(
+                "Insufficient disk space: {:.2} GB available, {:.0} GB required",
+                gb,
+                MIN_DISK_SPACE_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
+            ))
+        }
+        Some(space) => {
+            let gb = space as f64 / (1024.0 * 1024.0 * 1024.0);
+            tracing::debug!(available_gb = format!("{:.2}", gb), "Disk space check passed");
+            Ok(())
+        }
+        None => {
+            tracing::warn!("Could not determine disk space — proceeding anyway");
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

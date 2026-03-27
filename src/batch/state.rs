@@ -43,6 +43,11 @@ pub struct PlanResult {
     pub completed_at: DateTime<Utc>,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Whether this failure was transient (API overload, network error).
+    /// Transient failures do NOT count toward the circuit breaker threshold,
+    /// since they may resolve on their own without indicating a systemic problem.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 /// Outcome of a single plan execution.
@@ -138,13 +143,23 @@ impl BatchState {
                 self.circuit_breaker.tripped = false;
             }
             PlanOutcome::Failed => {
-                self.circuit_breaker.consecutive_failures += 1;
-                if self.circuit_breaker.consecutive_failures >= self.circuit_breaker.max_failures {
-                    self.circuit_breaker.tripped = true;
-                    tracing::warn!(
-                        failures = self.circuit_breaker.consecutive_failures,
-                        "Circuit breaker tripped after {} consecutive failures",
-                        self.circuit_breaker.consecutive_failures
+                // Transient failures (API overload, network) don't count toward
+                // the circuit breaker — they may resolve without intervention.
+                // Only deterministic failures (auth, bootstrap, crashes) trip it.
+                if !result.transient {
+                    self.circuit_breaker.consecutive_failures += 1;
+                    if self.circuit_breaker.consecutive_failures >= self.circuit_breaker.max_failures {
+                        self.circuit_breaker.tripped = true;
+                        tracing::warn!(
+                            failures = self.circuit_breaker.consecutive_failures,
+                            "Circuit breaker tripped after {} consecutive deterministic failures",
+                            self.circuit_breaker.consecutive_failures
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        plan = %result.plan,
+                        "Transient failure — not counting toward circuit breaker"
                     );
                 }
             }
