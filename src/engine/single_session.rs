@@ -19,7 +19,7 @@
 //! | Crash recovery  | gw restarts + `--resume` | gw retries the group          |
 //! | Complexity      | Low                      | High                          |
 
-use crate::checkpoint::reader::{archive_stale_checkpoints, find_checkpoint_for_plan};
+use crate::checkpoint::reader::archive_stale_checkpoints;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
 use crate::config::watchdog::WatchdogConfig;
@@ -953,16 +953,16 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("arc result: success")
 }
 
-/// Read checkpoint using a cached path.
+/// Read checkpoint using `arc-phase-loop.local.md` as the single source of truth.
 ///
 /// Resolution order:
 /// 1. Return from cache if path still exists
-/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md` (Rune's pointer)
-/// 3. Fallback: scan `arc-*` dirs via `find_checkpoint_for_plan`
+/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md`
 ///
+/// Returns `None` if the loop state file doesn't exist yet (early arc init).
 /// Once resolved, the path is cached for the rest of the session.
 fn read_cached_checkpoint(
-    plan_path: &Path,
+    _plan_path: &Path,
     working_dir: &Path,
     cached_path: &mut Option<PathBuf>,
 ) -> Option<Checkpoint> {
@@ -982,51 +982,27 @@ fn read_cached_checkpoint(
         *cached_path = None;
     }
 
-    // PRIMARY: Read from arc-phase-loop.local.md — Rune's single source of truth.
-    // This file contains the active checkpoint_path, no directory scanning needed.
-    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
-        let cp_path = loop_state.resolve_checkpoint_path(working_dir);
-        if cp_path.exists() {
-            info!(
-                checkpoint = %cp_path.display(),
-                arc_id = ?loop_state.arc_id(),
-                iteration = loop_state.iteration,
-                "Resolved checkpoint from arc-phase-loop.local.md"
-            );
-            return match crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                Ok(cp) => {
-                    *cached_path = Some(cp_path);
-                    Some(cp)
-                }
-                Err(e) => {
-                    debug!(error = %e, "Could not read checkpoint from loop state (transient)");
-                    None
-                }
-            };
-        }
+    // Read from arc-phase-loop.local.md — Rune's single source of truth.
+    let loop_state = crate::monitor::loop_state::read_arc_loop_state(working_dir)?;
+    let cp_path = loop_state.resolve_checkpoint_path(working_dir);
+    if !cp_path.exists() {
         debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
+        return None;
     }
 
-    // FALLBACK: Scan arc-* dirs (for when arc-phase-loop.local.md doesn't exist yet,
-    // e.g., very early in the arc init before Rune writes the loop state file).
-    debug!("arc-phase-loop.local.md not available, falling back to directory scan");
-    match find_checkpoint_for_plan(plan_path, working_dir) {
-        Ok(Some(cp_path)) => {
-            info!("Discovered checkpoint via directory scan: {}", cp_path.display());
-            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                Ok(cp) => {
-                    *cached_path = Some(cp_path);
-                    Some(cp)
-                }
-                Err(e) => {
-                    debug!(error = %e, "Could not read checkpoint (transient)");
-                    None
-                }
-            }
+    info!(
+        checkpoint = %cp_path.display(),
+        arc_id = ?loop_state.arc_id(),
+        iteration = loop_state.iteration,
+        "Resolved checkpoint from arc-phase-loop.local.md"
+    );
+    match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+        Ok(cp) => {
+            *cached_path = Some(cp_path);
+            Some(cp)
         }
-        Ok(None) => None,
         Err(e) => {
-            debug!(error = %e, "Could not find checkpoint for plan");
+            debug!(error = %e, "Could not read checkpoint (transient)");
             None
         }
     }
