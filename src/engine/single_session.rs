@@ -953,17 +953,20 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("arc result: success")
 }
 
-/// Read checkpoint using a cached path, avoiding repeated directory scans.
+/// Read checkpoint using a cached path.
 ///
-/// On first call (or if cache is None), discovers the checkpoint path via
-/// `find_checkpoint_for_plan` and caches it. Subsequent calls read directly
-/// from the cached path — only re-scanning if the cached file disappears.
+/// Resolution order:
+/// 1. Return from cache if path still exists
+/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md` (Rune's pointer)
+/// 3. Fallback: scan `arc-*` dirs via `find_checkpoint_for_plan`
+///
+/// Once resolved, the path is cached for the rest of the session.
 fn read_cached_checkpoint(
     plan_path: &Path,
     working_dir: &Path,
     cached_path: &mut Option<PathBuf>,
 ) -> Option<Checkpoint> {
-    // If we have a cached path, try reading directly
+    // If we have a cached path, try reading directly — O(1)
     if let Some(cp_path) = cached_path.as_ref() {
         if cp_path.exists() {
             return match crate::checkpoint::reader::read_checkpoint(cp_path) {
@@ -979,10 +982,37 @@ fn read_cached_checkpoint(
         *cached_path = None;
     }
 
-    // Discover checkpoint path (scans all arc-* dirs)
+    // PRIMARY: Read from arc-phase-loop.local.md — Rune's single source of truth.
+    // This file contains the active checkpoint_path, no directory scanning needed.
+    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+        let cp_path = loop_state.resolve_checkpoint_path(working_dir);
+        if cp_path.exists() {
+            info!(
+                checkpoint = %cp_path.display(),
+                arc_id = ?loop_state.arc_id(),
+                iteration = loop_state.iteration,
+                "Resolved checkpoint from arc-phase-loop.local.md"
+            );
+            return match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+                Ok(cp) => {
+                    *cached_path = Some(cp_path);
+                    Some(cp)
+                }
+                Err(e) => {
+                    debug!(error = %e, "Could not read checkpoint from loop state (transient)");
+                    None
+                }
+            };
+        }
+        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
+    }
+
+    // FALLBACK: Scan arc-* dirs (for when arc-phase-loop.local.md doesn't exist yet,
+    // e.g., very early in the arc init before Rune writes the loop state file).
+    debug!("arc-phase-loop.local.md not available, falling back to directory scan");
     match find_checkpoint_for_plan(plan_path, working_dir) {
         Ok(Some(cp_path)) => {
-            info!("Discovered checkpoint: {}", cp_path.display());
+            info!("Discovered checkpoint via directory scan: {}", cp_path.display());
             match crate::checkpoint::reader::read_checkpoint(&cp_path) {
                 Ok(cp) => {
                     *cached_path = Some(cp_path);
