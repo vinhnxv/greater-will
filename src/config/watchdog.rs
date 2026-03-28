@@ -104,9 +104,11 @@ fn env_or(key: &str, default: u64) -> u64 {
         Ok(val) => match val.parse() {
             Ok(v) => v,
             Err(_) => {
-                eprintln!(
-                    "[gw] warning: invalid value for {}: {:?}, using default {}",
-                    key, val, default
+                tracing::warn!(
+                    key = %key,
+                    value = ?val,
+                    default = default,
+                    "Invalid env var value, using default"
                 );
                 default
             }

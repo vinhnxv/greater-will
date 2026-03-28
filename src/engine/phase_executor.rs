@@ -396,13 +396,30 @@ impl PhaseGroupExecutor {
                 max = exec_config.max_concurrent_sessions,
                 "Active sessions at budget limit, cleaning stale sessions first"
             );
+
+            // Attempt cleanup before proceeding
+            pre_phase_cleanup(plan_hash, &group.name)?;
+
+            // Re-check after cleanup — bail if still over budget
+            let remaining = crate::cleanup::tmux_cleanup::list_gw_sessions()
+                .unwrap_or_default()
+                .len() as u32;
+            if remaining >= exec_config.max_concurrent_sessions {
+                color_eyre::eyre::bail!(
+                    "Cannot start group '{}': {} active sessions >= max_concurrent_sessions ({}). \
+                     Kill stale sessions with `gw clean` first.",
+                    group.name, remaining, exec_config.max_concurrent_sessions
+                );
+            }
         }
 
         // Health check
         check_system_health().wrap_err("System health check failed")?;
 
-        // Cleanup previous sessions
-        pre_phase_cleanup(plan_hash, &group.name)?;
+        // Cleanup previous sessions (if not already done above)
+        if active_count < exec_config.max_concurrent_sessions {
+            pre_phase_cleanup(plan_hash, &group.name)?;
+        }
 
         // Dry run - skip actual execution
         if exec_config.dry_run {

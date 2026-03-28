@@ -29,6 +29,11 @@ pub struct SessionOwner {
     pub claude_pid: u32,
     /// Unix timestamp when the session was started.
     pub started_at: u64,
+    /// Process start time of the gw process (for PID recycling detection).
+    /// If a new process has the same PID but a different start time,
+    /// the PID was recycled and the session is orphaned.
+    #[serde(default)]
+    pub gw_start_time: u64,
 }
 
 /// Result of checking the previous session owner on startup.
@@ -58,6 +63,21 @@ fn owner_path(working_dir: &Path) -> PathBuf {
     working_dir.join(".gw").join("session-owner.json")
 }
 
+/// Get the start time of a process (Unix epoch seconds) via sysinfo.
+/// Returns 0 if the process cannot be found.
+fn get_process_start_time(pid: u32) -> u64 {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(Pid::from_u32(pid))
+        .map(|p| p.start_time())
+        .unwrap_or(0)
+}
+
 /// Write the session owner file.
 ///
 /// Called after spawning (or adopting) a tmux session.
@@ -83,6 +103,7 @@ pub fn write_session_owner(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        gw_start_time: get_process_start_time(std::process::id()),
     };
 
     let json = serde_json::to_string_pretty(&owner)?;
@@ -90,6 +111,16 @@ pub fn write_session_owner(
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &json)?;
     std::fs::rename(&tmp_path, &path)?;
+
+    // Restrict file permissions — contains PIDs and session metadata
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&path, perms) {
+            warn!(error = %e, "Failed to set session-owner.json permissions");
+        }
+    }
 
     info!(
         gw_pid = owner.gw_pid,
@@ -138,13 +169,25 @@ pub fn check_previous_owner(working_dir: &Path) -> OwnerCheck {
 
     // Check if previous gw process is alive
     if crate::cleanup::process::is_pid_alive(owner.gw_pid) {
-        // This should be impossible — InstanceLock blocks concurrent gw.
-        // But if we somehow get here, treat as fresh start with a warning.
-        warn!(
-            gw_pid = owner.gw_pid,
-            "Previous gw appears alive but we acquired InstanceLock — treating as stale"
-        );
-        // Fall through to orphan checks — the PID may have been recycled
+        // Verify it's the same process, not a recycled PID
+        let current_start = get_process_start_time(owner.gw_pid);
+        if owner.gw_start_time > 0 && current_start > 0 && current_start != owner.gw_start_time {
+            info!(
+                gw_pid = owner.gw_pid,
+                recorded_start = owner.gw_start_time,
+                current_start = current_start,
+                "PID recycled — previous gw is dead (different start time)"
+            );
+            // PID was recycled — fall through to orphan checks
+        } else {
+            // This should be impossible — InstanceLock blocks concurrent gw.
+            // But if we somehow get here, treat as stale with a warning.
+            warn!(
+                gw_pid = owner.gw_pid,
+                "Previous gw appears alive but we acquired InstanceLock — treating as stale"
+            );
+        }
+        // Fall through to orphan checks
     }
 
     // Previous gw is dead. Check tmux session state.

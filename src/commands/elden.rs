@@ -169,9 +169,18 @@ const SIGNAL_DIR: &str = ".gw/signals";
 ///
 /// Called via `gw elden --event <name>`.
 pub fn execute_event(event: &str) -> Result<()> {
-    // Ensure signal directory exists
+    // Ensure signal directory exists with restrictive permissions
     std::fs::create_dir_all(SIGNAL_DIR)
         .wrap_err_with(|| format!("Failed to create {}", SIGNAL_DIR))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        if let Err(e) = std::fs::set_permissions(SIGNAL_DIR, perms) {
+            tracing::warn!(error = %e, "Failed to set signal directory permissions");
+        }
+    }
 
     match event {
         "stop" => handle_stop_event(),
@@ -179,7 +188,7 @@ pub fn execute_event(event: &str) -> Result<()> {
         "session-end" => handle_session_end_event(),
         "permission" => handle_permission_event(),
         _ => {
-            eprintln!("[gw elden] Unknown event: {}", event);
+            tracing::warn!(event = %event, "Unknown elden event");
             Ok(())
         }
     }

@@ -30,8 +30,6 @@ mod monitor;
 #[allow(dead_code)]
 mod output;
 #[allow(dead_code)]
-mod scanner;
-#[allow(dead_code)]
 mod session;
 
 use clap::Parser;
