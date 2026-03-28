@@ -816,41 +816,15 @@ struct ArcCheckpointInfo {
     total: usize,
 }
 
-/// Detect the most recent arc checkpoint.
+/// Detect the active arc checkpoint via arc-phase-loop.local.md — no directory scanning.
 fn detect_arc_checkpoint() -> Option<ArcCheckpointInfo> {
-    // Look for checkpoint files in .rune/arc/*/checkpoint.json
-    let arc_dir = Path::new(".rune/arc");
-    if !arc_dir.exists() {
-        // Also check tmp/arc/ (Rune's default location)
-        return detect_arc_checkpoint_in(Path::new("tmp/arc"));
-    }
-    detect_arc_checkpoint_in(arc_dir)
-}
-
-fn detect_arc_checkpoint_in(arc_dir: &Path) -> Option<ArcCheckpointInfo> {
-    if !arc_dir.exists() {
+    let cwd = std::env::current_dir().ok()?;
+    let loop_state = crate::monitor::loop_state::read_arc_loop_state(&cwd)?;
+    let cp_path = loop_state.resolve_checkpoint_path(&cwd);
+    if !cp_path.exists() {
         return None;
     }
 
-    // Find most recent checkpoint by modification time
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-
-    if let Ok(entries) = std::fs::read_dir(arc_dir) {
-        for entry in entries.flatten() {
-            let cp_path = entry.path().join("checkpoint.json");
-            if cp_path.exists() {
-                if let Ok(meta) = cp_path.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
-                            newest = Some((modified, cp_path));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let (_, cp_path) = newest?;
     let content = std::fs::read_to_string(&cp_path).ok()?;
     let checkpoint: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -947,9 +921,4 @@ mod tests {
         let _ = result;
     }
 
-    #[test]
-    fn test_detect_arc_checkpoint_no_dir() {
-        let result = detect_arc_checkpoint_in(Path::new("/nonexistent/path"));
-        assert!(result.is_none());
-    }
 }

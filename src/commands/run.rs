@@ -111,13 +111,20 @@ fn run_single(
         ss_config = ss_config.with_resume();
     }
 
-    // --- Resume validation: auto-discover checkpoint and validate before resuming ---
+    // --- Resume validation: read checkpoint from loop state and validate ---
     if resume && plans.len() == 1 {
-        use crate::checkpoint::reader::{find_checkpoint_for_plan, validate_before_resume, read_checkpoint, next_pending_phase};
+        use crate::checkpoint::reader::{validate_before_resume, read_checkpoint, next_pending_phase};
 
-        let plan_path = Path::new(&plans[0]);
-        match find_checkpoint_for_plan(plan_path, cwd)? {
-            Some(cp_path) => {
+        let loop_state = crate::monitor::loop_state::read_arc_loop_state(cwd);
+        match loop_state {
+            Some(state) => {
+                let cp_path = state.resolve_checkpoint_path(cwd);
+                if !cp_path.exists() {
+                    eyre::bail!(
+                        "Loop state exists but checkpoint not written yet: {}\nRetry shortly or start fresh without --resume.",
+                        cp_path.display()
+                    );
+                }
                 let cp = read_checkpoint(&cp_path)?;
                 match next_pending_phase(&cp) {
                     Some(next_phase) => {
@@ -146,7 +153,7 @@ fn run_single(
             }
             None => {
                 eyre::bail!(
-                    "No checkpoint found for plan: {}\nStart a fresh run without --resume.",
+                    "No active arc state found for plan: {}\nStart a fresh run without --resume.",
                     plans[0]
                 );
             }

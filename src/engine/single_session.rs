@@ -19,7 +19,6 @@
 //! | Crash recovery  | gw restarts + `--resume` | gw retries the group          |
 //! | Complexity      | Low                      | High                          |
 
-use crate::checkpoint::reader::archive_stale_checkpoints;
 use crate::checkpoint::schema::Checkpoint;
 use crate::cleanup::{self, startup_cleanup};
 use crate::config::watchdog::WatchdogConfig;
@@ -296,7 +295,6 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 adopt_pid,
                 config,
                 start,
-                plan_path,
             )?;
 
             let attempt_duration = attempt_start.elapsed();
@@ -403,7 +401,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
             &command,
             config,
             start,
-            plan_path,
+            plan_str,
         )?;
 
         // If the attempt ran long enough, record it as healthy
@@ -597,7 +595,7 @@ fn run_session_attempt(
     command: &str,
     config: &SingleSessionConfig,
     pipeline_start: Instant,
-    plan_path: &Path,
+    plan_str: &str,
 ) -> Result<SessionOutcome> {
     // Kill any existing session with the same name
     if has_session(session_name) {
@@ -632,7 +630,6 @@ fn run_session_attempt(
     };
 
     // Write session owner file so next gw run can adopt if we crash
-    let plan_str = plan_path.to_str().unwrap_or("unknown");
     if let Err(e) = crate::monitor::session_owner::write_session_owner(
         &config.working_dir, session_name, plan_str, pid,
     ) {
@@ -654,7 +651,7 @@ fn run_session_attempt(
     }
 
     // Delegate to the shared monitor loop
-    monitor_session(session_name, pid, config, pipeline_start, plan_path)
+    monitor_session(session_name, pid, config, pipeline_start)
 }
 
 /// Monitor an active session (shared between spawn and adopt paths).
@@ -667,7 +664,6 @@ fn monitor_session(
     pid: u32,
     config: &SingleSessionConfig,
     pipeline_start: Instant,
-    plan_path: &Path,
 ) -> Result<SessionOutcome> {
 
     // Monitor loop
@@ -680,15 +676,10 @@ fn monitor_session(
     let mut last_checkpoint_poll = Instant::now();
     let mut last_checkpoint_activity = Instant::now();
     let mut last_checkpoint_hash: Option<u64> = None;
-    // Cache the resolved checkpoint path to avoid re-scanning all arc-* dirs every poll.
-    // Once found, the checkpoint path doesn't change during a session.
+    // Cache the resolved checkpoint path from loop state for O(1) reads each poll.
     let mut cached_checkpoint_path: Option<PathBuf> = None;
     // Track whether we've archived stale checkpoints for this session.
     // We delay archiving until the SECOND successful poll to ensure the
-    // checkpoint is stable (not a leftover from the previous session that
-    // Rune hasn't replaced yet).
-    let mut stale_archive_done = false;
-    let mut successful_checkpoint_polls: u32 = 0;
     let mut last_process_gone_at: Option<Instant> = None;
     let mut last_artifact_scan = Instant::now();
     let mut last_artifact_snapshot: Option<ArtifactSnapshot> = None;
@@ -833,7 +824,7 @@ fn monitor_session(
             // Session ran for a meaningful time — verify via checkpoint
             if !crate::cleanup::process::is_pid_alive(pid) {
                 if let Some(checkpoint) = read_cached_checkpoint(
-                    plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                    &config.working_dir, &mut cached_checkpoint_path,
                 ) {
                     if checkpoint.is_complete() {
                         info!("Session ended, checkpoint confirms completion");
@@ -921,7 +912,7 @@ fn monitor_session(
         if last_checkpoint_poll.elapsed() >= Duration::from_secs(wd.checkpoint_poll_interval_secs) {
             last_checkpoint_poll = Instant::now();
             if let Some(checkpoint) = read_cached_checkpoint(
-                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                &config.working_dir, &mut cached_checkpoint_path,
             ) {
                 if checkpoint.is_complete() {
                     let elapsed = dispatch_time.elapsed();
@@ -991,8 +982,6 @@ fn monitor_session(
                     current_phase_name = new_phase;
                 }
 
-                // Count successful checkpoint polls for delayed archive
-                successful_checkpoint_polls += 1;
             }
         }
 
@@ -1091,7 +1080,7 @@ fn monitor_session(
                         "arc-phase-loop.local.md confirmed gone — arc has ended or was deleted"
                     );
                     if let Some(checkpoint) = read_cached_checkpoint(
-                        plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                        &config.working_dir, &mut cached_checkpoint_path,
                     ) {
                         if checkpoint.is_complete() {
                             info!("Loop state gone + checkpoint complete → success");
@@ -1183,19 +1172,6 @@ fn monitor_session(
                         error_class: ErrorClass::BootstrapError,
                         reason,
                     });
-                }
-            }
-        }
-
-        // DELAYED ARCHIVE: After 2 successful checkpoint polls, archive stale
-        // checkpoint dirs from previous crash/restart cycles. We wait for the
-        // 2nd poll to ensure the current checkpoint is the one Rune is actively
-        // using (not a leftover that Rune hasn't replaced yet).
-        if !stale_archive_done && successful_checkpoint_polls >= 2 {
-            stale_archive_done = true;
-            if let Some(ref cp_path) = cached_checkpoint_path {
-                if let Err(e) = archive_stale_checkpoints(cp_path, plan_path, &config.working_dir) {
-                    debug!(error = %e, "Failed to archive stale checkpoints (non-fatal)");
                 }
             }
         }
@@ -1424,7 +1400,7 @@ fn monitor_session(
             // Process ran for a while then died — verify via checkpoint before
             // assuming success. If checkpoint says incomplete, it's a crash.
             if let Some(checkpoint) = read_cached_checkpoint(
-                plan_path, &config.working_dir, &mut cached_checkpoint_path,
+                &config.working_dir, &mut cached_checkpoint_path,
             ) {
                 if checkpoint.is_complete() {
                     info!("Process died but checkpoint confirms completion");
@@ -1644,12 +1620,9 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
 /// 3. Fall back to plan-based discovery (when loop state is absent or inactive)
 ///
 /// Returns `None` if no checkpoint can be resolved yet (early arc init).
-/// Once resolved, the path is cached until invalidated. Strategy 2 results
-/// are only cached when loop state is absent — never when loop state is active
-/// but its checkpoint file hasn't appeared yet, to avoid locking onto a stale
-/// prior-run checkpoint.
+/// Once resolved, the path is cached until invalidated.
+/// Only reads from arc-phase-loop.local.md — no directory scanning.
 fn read_cached_checkpoint(
-    plan_path: &Path,
     working_dir: &Path,
     cached_path: &mut Option<PathBuf>,
 ) -> Option<Checkpoint> {
@@ -1690,8 +1663,9 @@ fn read_cached_checkpoint(
         *cached_path = None;
     }
 
-    // Strategy 1: Read from arc-phase-loop.local.md — authoritative when active.
-    let loop_state_active = if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+    // Only source: arc-phase-loop.local.md — no directory scanning.
+    // All checkpoint reads go through arc-phase-loop.local.md — no directory scanning.
+    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
         let cp_path = loop_state.resolve_checkpoint_path(working_dir);
         if cp_path.exists() {
             info!(
@@ -1702,33 +1676,10 @@ fn read_cached_checkpoint(
             );
             return try_read_and_cache(&cp_path, cached_path, true, "Could not read checkpoint (transient)");
         }
-        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet — falling through");
-        true // loop state is active but checkpoint file not yet written
-    } else {
-        false
-    };
-
-    // Strategy 2: Fall back to plan-based discovery.
-    // This handles cases where arc-phase-loop.local.md is inactive (arc completed)
-    // or missing, but a checkpoint.json still exists from a prior/current arc run.
-    //
-    // IMPORTANT: Do NOT cache when loop_state is active — the discovered checkpoint
-    // may be from a prior run, and caching it would prevent the current run's
-    // checkpoint from ever being adopted once it appears.
-    match crate::checkpoint::reader::find_checkpoint_for_plan(plan_path, working_dir) {
-        Ok(Some(cp_path)) => {
-            debug!(path = %cp_path.display(), "Discovered checkpoint via plan-based search");
-            try_read_and_cache(&cp_path, cached_path, !loop_state_active, "Could not read discovered checkpoint")
-        }
-        Ok(None) => {
-            debug!("No checkpoint found for plan via discovery");
-            None
-        }
-        Err(e) => {
-            debug!(error = %e, "Plan-based checkpoint discovery failed");
-            None
-        }
+        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
     }
+
+    None
 }
 
 /// Find artifact dir using the cached checkpoint path (avoids re-scanning).
@@ -1799,21 +1750,21 @@ fn resolve_restart_command(
 ) -> RestartDecision {
     use crate::engine::phase_profile::{self, RecoveryStrategy};
 
-    // Find a checkpoint that matches the current plan (plan-aware matching).
-    // BUG FIX: Previously scanned all checkpoints and picked the first with progress,
-    // ignoring plan_file — a completed checkpoint from a different plan would cause
-    // AlreadyDone, skipping the current plan entirely.
-    let plan_path = Path::new(plan_str);
-    let cp_path = match crate::checkpoint::reader::find_checkpoint_for_plan(plan_path, working_dir) {
-        Ok(Some(path)) => path,
-        Ok(None) => {
-            info!(restart = restart_count, "No checkpoint for plan '{}' — fresh start", plan_str);
-            println!("[gw] No checkpoint found for this plan — running fresh (not --resume)");
-            return RestartDecision::Fresh(arc_command.to_string());
+    // Read checkpoint path from arc-phase-loop.local.md — no directory scanning.
+    let cp_path = match crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+        Some(loop_state) => {
+            let path = loop_state.resolve_checkpoint_path(working_dir);
+            if path.exists() {
+                path
+            } else {
+                info!(restart = restart_count, "Loop state exists but checkpoint not written yet — fresh start");
+                println!("[gw] Checkpoint not written yet — running fresh (not --resume)");
+                return RestartDecision::Fresh(arc_command.to_string());
+            }
         }
-        Err(e) => {
-            warn!(error = %e, "Failed to scan checkpoints — fresh start");
-            println!("[gw] Checkpoint scan failed — running fresh (not --resume)");
+        None => {
+            info!(restart = restart_count, "No loop state for plan '{}' — fresh start", plan_str);
+            println!("[gw] No active arc state found — running fresh (not --resume)");
             return RestartDecision::Fresh(arc_command.to_string());
         }
     };
@@ -1898,51 +1849,6 @@ fn resolve_restart_command(
     }
 }
 
-/// Check if a checkpoint with real progress exists under `.rune/arc/`.
-///
-/// Returns true only if:
-/// 1. A checkpoint.json exists, AND
-/// 2. At least one phase has status "completed" or "in_progress"
-///
-/// This ensures `--resume` is only used when Rune actually made progress.
-/// A checkpoint that exists but has all phases "pending" means the arc was
-/// just initialized but never ran — a fresh start is more reliable.
-fn has_checkpoint(working_dir: &Path) -> bool {
-    let arc_dir = working_dir.join(".rune").join("arc");
-    if !arc_dir.exists() {
-        return false;
-    }
-    // Scan for any checkpoint.json with real progress
-    match std::fs::read_dir(&arc_dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let cp_path = entry.path().join("checkpoint.json");
-                if cp_path.exists() {
-                    // Read and verify there's real progress
-                    if let Ok(cp) = crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                        let has_progress = cp.phases.values().any(|p| {
-                            p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
-                        });
-                        if has_progress {
-                            debug!(
-                                path = %cp_path.display(),
-                                completed = cp.count_by_status("completed"),
-                                "Found checkpoint with progress — --resume is safe"
-                            );
-                            return true;
-                        }
-                        debug!(
-                            path = %cp_path.display(),
-                            "Checkpoint exists but no phases progressed — fresh start preferred"
-                        );
-                    }
-                }
-            }
-            false
-        }
-        Err(_) => false,
-    }
-}
 
 /// Run multiple plans sequentially in single-session mode.
 ///
