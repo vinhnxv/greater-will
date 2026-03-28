@@ -90,6 +90,71 @@ impl SchemaCompat {
     }
 }
 
+/// Inferred position of the arc pipeline based on actual phase statuses.
+///
+/// This is the ground-truth phase position derived from scanning the `phases`
+/// map against `PHASE_ORDER`, rather than relying on `phase_sequence` which
+/// may be stale or not updated by Rune.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhasePosition {
+    /// A phase is actively running (`status: "in_progress"`).
+    Running {
+        phase: &'static str,
+        started_at: Option<String>,
+    },
+    /// Between phases — last phase completed, next phase is pending.
+    /// The `last_completed_at` timestamp is used to compute transition gap duration.
+    Transitioning {
+        last_completed: &'static str,
+        last_completed_at: Option<String>,
+        next_pending: &'static str,
+    },
+    /// No phases have started yet.
+    WaitingToStart {
+        first_pending: &'static str,
+    },
+    /// All phases are completed or skipped.
+    AllDone,
+    /// Cannot determine position (empty phases map).
+    Unknown,
+}
+
+impl PhasePosition {
+    /// Returns true if the pipeline is between phases (transition gap).
+    pub fn is_transitioning(&self) -> bool {
+        matches!(self, PhasePosition::Transitioning { .. })
+    }
+
+    /// Returns the effective phase name for display/profile lookup.
+    pub fn effective_phase(&self) -> Option<&'static str> {
+        match self {
+            PhasePosition::Running { phase, .. } => Some(phase),
+            PhasePosition::Transitioning { next_pending, .. } if !next_pending.is_empty() => {
+                Some(next_pending)
+            }
+            PhasePosition::WaitingToStart { first_pending } => Some(first_pending),
+            _ => None,
+        }
+    }
+
+    /// Compute the transition gap duration in seconds (time since last phase completed).
+    ///
+    /// Only meaningful for `Transitioning` state. Returns `None` for other states.
+    pub fn transition_gap_secs(&self) -> Option<u64> {
+        match self {
+            PhasePosition::Transitioning { last_completed_at: Some(ts), .. } => {
+                chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| {
+                    let now = chrono::Utc::now();
+                    now.signed_duration_since(dt.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                        .max(0) as u64
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Arc checkpoint — identity and phase progress.
 ///
 /// Read from: `.rune/arc/arc-{id}/checkpoint.json`
@@ -270,6 +335,102 @@ impl Checkpoint {
                 None
             }
         })
+    }
+
+    /// Infer the current phase by scanning the `phases` map against `PHASE_ORDER`.
+    ///
+    /// Unlike `current_phase()` which relies on the `phase_sequence` field
+    /// (often stale or not updated by Rune), this method looks at actual
+    /// phase statuses to determine where the pipeline is.
+    ///
+    /// Returns a [`PhasePosition`] describing current state:
+    /// - `Running { phase }` — a phase has `status: "in_progress"`
+    /// - `Transitioning { last_completed, next_pending }` — between phases
+    /// - `WaitingToStart { first_pending }` — nothing started yet
+    /// - `AllDone` — every phase is completed or skipped
+    /// - `Unknown` — no phases in map or can't determine
+    pub fn infer_phase_position(&self) -> PhasePosition {
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+
+        if self.phases.is_empty() {
+            return PhasePosition::Unknown;
+        }
+
+        // 1. Look for an in_progress phase (scan in canonical order)
+        for &phase_name in PHASE_ORDER {
+            if let Some(ps) = self.phases.get(phase_name) {
+                if ps.status == "in_progress" {
+                    return PhasePosition::Running {
+                        phase: phase_name,
+                        started_at: ps.started_at.clone(),
+                    };
+                }
+            }
+        }
+
+        // 2. No in_progress — find last completed and next pending in canonical order
+        let mut last_completed: Option<(&'static str, Option<String>)> = None;
+
+        for &phase_name in PHASE_ORDER {
+            if let Some(ps) = self.phases.get(phase_name) {
+                if ps.status == "completed" {
+                    last_completed = Some((phase_name, ps.completed_at.clone()));
+                }
+            }
+        }
+
+        // Find first pending after last completed
+        let search_start = last_completed.as_ref()
+            .and_then(|(name, _)| PHASE_ORDER.iter().position(|&p| p == *name))
+            .map_or(0, |i| i + 1);
+
+        let next_pending = PHASE_ORDER.iter().skip(search_start).find(|&&p| {
+            self.phases
+                .get(p)
+                .map_or(false, |ps| ps.status == "pending" || ps.status.is_empty())
+        }).copied();
+
+        match (last_completed, next_pending) {
+            (Some((last, completed_at)), Some(next)) => PhasePosition::Transitioning {
+                last_completed: last,
+                last_completed_at: completed_at,
+                next_pending: next,
+            },
+            (Some((last, _)), None) => {
+                // Last completed but no more pending — check if truly all done
+                if self.is_complete() {
+                    PhasePosition::AllDone
+                } else {
+                    // Some phases may be failed
+                    PhasePosition::Transitioning {
+                        last_completed: last,
+                        last_completed_at: self.phases.get(last).and_then(|p| p.completed_at.clone()),
+                        next_pending: "",
+                    }
+                }
+            }
+            (None, Some(first)) => PhasePosition::WaitingToStart {
+                first_pending: first,
+            },
+            (None, None) => PhasePosition::Unknown,
+        }
+    }
+
+    /// Convenience: get the effective current phase name from inferred position.
+    ///
+    /// For `Running` → the in_progress phase name.
+    /// For `Transitioning` → the next_pending phase name (what we're transitioning TO).
+    /// For `WaitingToStart` → the first pending phase.
+    /// For `AllDone` / `Unknown` → None.
+    pub fn inferred_phase_name(&self) -> Option<&'static str> {
+        match self.infer_phase_position() {
+            PhasePosition::Running { phase, .. } => Some(phase),
+            PhasePosition::Transitioning { next_pending, .. } if !next_pending.is_empty() => {
+                Some(next_pending)
+            }
+            PhasePosition::WaitingToStart { first_pending } => Some(first_pending),
+            _ => None,
+        }
     }
 
     /// Check if the arc has completed (all phases done).
@@ -633,6 +794,153 @@ mod tests {
 
         cp.phase_sequence = None;
         assert_eq!(cp.current_phase(), None);
+    }
+
+    #[test]
+    fn test_infer_phase_running() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:00:00Z".into()),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "in_progress".into(),
+            started_at: Some("2026-03-20T00:05:30Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        match cp.infer_phase_position() {
+            PhasePosition::Running { phase, .. } => assert_eq!(phase, "forge_qa"),
+            other => panic!("Expected Running, got {:?}", other),
+        }
+        assert_eq!(cp.inferred_phase_name(), Some("forge_qa"));
+    }
+
+    #[test]
+    fn test_infer_phase_transitioning() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:00:00Z".into()),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:05:00Z".into()),
+            completed_at: Some("2026-03-20T00:08:00Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        match cp.infer_phase_position() {
+            PhasePosition::Transitioning { last_completed, next_pending, .. } => {
+                assert_eq!(last_completed, "forge_qa");
+                assert_eq!(next_pending, "plan_review");
+            }
+            other => panic!("Expected Transitioning, got {:?}", other),
+        }
+        assert_eq!(cp.inferred_phase_name(), Some("plan_review"));
+    }
+
+    #[test]
+    fn test_infer_phase_with_stale_sequence() {
+        // Simulates the real bug: phase_sequence=1 but pipeline far ahead
+        let mut cp = Checkpoint::default();
+        cp.phase_sequence = Some(1); // stale!
+
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("plan_review".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("plan_refine".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("verification".into(), PhaseStatus {
+            status: "in_progress".into(),
+            started_at: Some("2026-03-20T00:13:00Z".into()),
+            ..Default::default()
+        });
+
+        // current_phase() returns forge_qa (stale!)
+        assert_eq!(cp.current_phase(), Some("forge_qa"));
+        // inferred_phase_name() returns verification (correct!)
+        assert_eq!(cp.inferred_phase_name(), Some("verification"));
+    }
+
+    #[test]
+    fn test_infer_phase_waiting_to_start() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus::pending());
+        cp.phases.insert("forge_qa".into(), PhaseStatus::pending());
+
+        match cp.infer_phase_position() {
+            PhasePosition::WaitingToStart { first_pending } => {
+                assert_eq!(first_pending, "forge");
+            }
+            other => panic!("Expected WaitingToStart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_infer_phase_all_done() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "skipped".into(),
+            ..Default::default()
+        });
+        // Only 2 phases for test simplicity — is_complete() checks all are done
+        assert!(cp.is_complete());
+        match cp.infer_phase_position() {
+            PhasePosition::AllDone => {}
+            other => panic!("Expected AllDone, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_infer_phase_empty() {
+        let cp = Checkpoint::default();
+        assert_eq!(cp.infer_phase_position(), PhasePosition::Unknown);
+    }
+
+    #[test]
+    fn test_infer_phase_skipped_phases_skipped() {
+        // forge completed, forge_qa skipped, plan_review pending → transitioning to plan_review
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "skipped".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        match cp.infer_phase_position() {
+            PhasePosition::Transitioning { last_completed, next_pending, .. } => {
+                assert_eq!(last_completed, "forge"); // not forge_qa (skipped)
+                assert_eq!(next_pending, "plan_review");
+            }
+            other => panic!("Expected Transitioning, got {:?}", other),
+        }
     }
 
     #[test]
