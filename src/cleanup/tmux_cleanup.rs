@@ -73,7 +73,10 @@ pub fn list_gw_sessions() -> Result<Vec<TmuxSession>> {
     // No sessions is not an error
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no server running") || stderr.contains("no sessions") {
+        if stderr.contains("no server running")
+            || stderr.contains("no sessions")
+            || stderr.contains("No such file or directory")
+        {
             return Ok(Vec::new());
         }
         return Err(eyre!("tmux list-sessions failed: {}", stderr));
