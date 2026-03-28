@@ -539,42 +539,6 @@ pub fn compute_pane_hash(content: &str) -> u64 {
     hasher.finish()
 }
 
-/// Capture pane content from tmux session.
-///
-/// Returns the visible text in the current pane.
-pub fn capture_pane_content(session_id: &str) -> Result<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
-        .output()?;
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Capture the last line from the tmux pane.
-///
-/// Skips empty lines.
-pub fn capture_last_line(session_id: &str) -> Result<Option<String>> {
-    let content = capture_pane_content(session_id)?;
-
-    let last_line = content
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .map(|s| s.to_string());
-
-    Ok(last_line)
-}
-
-/// Check if a prompt (❯) is present in the last line.
-pub fn has_prompt_in_last_line(session_id: &str) -> Result<bool> {
-    let last_line = capture_last_line(session_id)?;
-
-    match last_line {
-        Some(line) => Ok(line.contains('❯')),
-        None => Ok(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

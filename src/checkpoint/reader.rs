@@ -142,20 +142,7 @@ pub fn validate_artifact_hash<P: AsRef<Path>>(
     artifact_path: P,
     expected_hash: &str,
 ) -> Result<bool> {
-    let path = artifact_path.as_ref();
-
-    // Read file
-    let mut file = File::open(path)
-        .wrap_err_with(|| format!("Failed to open artifact: {}", path.display()))?;
-
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
-        .wrap_err_with(|| format!("Failed to read artifact: {}", path.display()))?;
-
-    // Compute hash
-    let hash = Sha256::digest(&contents);
-    let hash_hex = format!("{:x}", hash);
-
+    let hash_hex = compute_file_hash(artifact_path)?;
     Ok(hash_hex == expected_hash)
 }
 
@@ -172,17 +159,37 @@ pub fn validate_artifact_hash<P: AsRef<Path>>(
 /// println!("SHA256: {}", hash);
 /// ```
 pub fn compute_file_hash<P: AsRef<Path>>(path: P) -> Result<String> {
+    const MAX_ARTIFACT_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
+    const BUF_SIZE: usize = 64 * 1024; // 64 KB chunks
+
     let path = path.as_ref();
+
+    let metadata = std::fs::metadata(path)
+        .wrap_err_with(|| format!("Failed to stat file: {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE {
+        color_eyre::eyre::bail!(
+            "Artifact too large ({} bytes, max {}): {}",
+            metadata.len(),
+            MAX_ARTIFACT_SIZE,
+            path.display()
+        );
+    }
 
     let mut file = File::open(path)
         .wrap_err_with(|| format!("Failed to open file: {}", path.display()))?;
 
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
-        .wrap_err_with(|| format!("Failed to read file: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; BUF_SIZE];
+    loop {
+        let n = file.read(&mut buf)
+            .wrap_err_with(|| format!("Failed to read file: {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
 
-    let hash = Sha256::digest(&contents);
-    Ok(format!("{:x}", hash))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Validate all artifact hashes in a checkpoint.

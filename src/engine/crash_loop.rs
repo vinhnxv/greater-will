@@ -68,7 +68,7 @@ impl CrashLoopDetector {
             self.crash_times.pop_front();
         }
 
-        if self.crash_times.len() as u32 >= self.max_crashes {
+        if self.crash_times.len() >= self.max_crashes as usize {
             tracing::error!(
                 crashes_in_window = self.crash_times.len(),
                 window_secs = self.window.as_secs(),
@@ -170,6 +170,14 @@ impl CrashLoopDetector {
             .as_secs();
         let now_instant = Instant::now();
         let window_secs = self.window.as_secs();
+
+        if record.window_secs != window_secs {
+            tracing::info!(
+                persisted = record.window_secs,
+                current = window_secs,
+                "Crash history window size changed — pruning with current window"
+            );
+        }
 
         // Restore crashes that are still within our window
         let mut restored = 0u32;

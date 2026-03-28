@@ -201,11 +201,15 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
         return Ok(killed_count);
     }
 
-    // Force-kill remaining processes
+    // Force-kill remaining processes (ignore ESRCH — process may have exited between check and kill)
     tracing::warn!(pids = ?still_alive, "Force-killing remaining processes");
     for pid in &still_alive {
-        unsafe {
-            libc::kill(*pid as i32, libc::SIGKILL);
+        let ret = unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(pid = pid, error = %err, "SIGKILL failed for unexpected reason");
+            }
         }
     }
 

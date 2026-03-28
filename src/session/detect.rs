@@ -194,12 +194,18 @@ pub struct OutputVelocity {
 impl OutputVelocity {
     /// Check if the session is idle (content unchanged for threshold duration).
     pub fn is_idle(&self, threshold: Duration) -> bool {
-        self.current_hash == self.last_hash.unwrap_or(0) && self.idle_duration > threshold
+        match self.last_hash {
+            Some(last) => self.current_hash == last && self.idle_duration > threshold,
+            None => false, // No prior observation — cannot determine idle
+        }
     }
 
     /// Check if content is currently changing.
     pub fn is_active(&self) -> bool {
-        self.current_hash != self.last_hash.unwrap_or(0)
+        match self.last_hash {
+            Some(last) => self.current_hash != last,
+            None => true, // No prior observation — assume active
+        }
     }
 }
 

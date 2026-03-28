@@ -11,6 +11,10 @@
 
 use color_eyre::Result;
 use std::process::Command;
+use std::time::Duration;
+
+/// Timeout for tmux commands (10 seconds should be generous for any tmux op).
+const TMUX_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Tmux session manager.
 ///
@@ -56,11 +60,36 @@ impl Tmux {
     ///
     /// * `name` - Session name to check
     pub fn has_session(name: &str) -> bool {
-        Command::new("tmux")
-            .args(["has-session", "-t", name])
-            .output()
+        Self::run_tmux_cmd(&["has-session", "-t", name])
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// Run a tmux command with a timeout to prevent indefinite hangs.
+    fn run_tmux_cmd(args: &[&str]) -> Result<std::process::Output> {
+        let child = Command::new("tmux")
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = child.wait_with_output();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(TMUX_CMD_TIMEOUT) {
+            Ok(result) => {
+                let _ = thread.join();
+                Ok(result?)
+            }
+            Err(_) => {
+                // Timeout — try to kill via the PID we no longer own.
+                // The thread owns the child, so just let it clean up.
+                color_eyre::eyre::bail!("tmux command timed out after {:?}", TMUX_CMD_TIMEOUT)
+            }
+        }
     }
 
     /// Create a new detached tmux session.
@@ -71,15 +100,13 @@ impl Tmux {
     ///
     /// Returns an error if tmux is not available or session creation fails.
     pub fn create_session(&self) -> Result<()> {
-        let output = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",           // Detached
-                "-s", &self.name, // Session name
-                "-x", "200",    // Width (stable output, matches spawn.rs)
-                "-y", "50",     // Height
-            ])
-            .output()?;
+        let output = Self::run_tmux_cmd(&[
+            "new-session",
+            "-d",
+            "-s", &self.name,
+            "-x", "200",
+            "-y", "50",
+        ])?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -99,9 +126,7 @@ impl Tmux {
     ///
     /// Returns an error if the session doesn't exist or kill fails.
     pub fn kill_session(&self) -> Result<()> {
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
+        let output = Self::run_tmux_cmd(&["kill-session", "-t", &self.name])?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -117,9 +142,7 @@ impl Tmux {
     ///
     /// * `cmd` - Command to send (Enter key is appended automatically)
     pub fn send_command(&self, cmd: &str) -> Result<()> {
-        Command::new("tmux")
-            .args(["send-keys", "-t", &self.name, cmd, "Enter"])
-            .output()?;
+        Self::run_tmux_cmd(&["send-keys", "-t", &self.name, cmd, "Enter"])?;
 
         Ok(())
     }
@@ -128,9 +151,7 @@ impl Tmux {
     ///
     /// Returns the visible text in the current pane.
     pub fn capture_pane(&self) -> Result<String> {
-        let output = Command::new("tmux")
-            .args(["capture-pane", "-t", &self.name, "-p"])
-            .output()?;
+        let output = Self::run_tmux_cmd(&["capture-pane", "-t", &self.name, "-p"])?;
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }

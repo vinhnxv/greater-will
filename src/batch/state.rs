@@ -92,6 +92,13 @@ impl BatchState {
         }
     }
 
+    /// Set the maximum consecutive failures before the circuit breaker trips.
+    /// A value of 0 disables the circuit breaker.
+    pub fn with_max_failures(mut self, max_failures: u32) -> Self {
+        self.circuit_breaker.max_failures = max_failures;
+        self
+    }
+
     /// Path to the batch state file.
     pub fn state_path() -> PathBuf {
         PathBuf::from(".gw/batch-state.json")
@@ -154,7 +161,9 @@ impl BatchState {
                 // Only deterministic failures (auth, bootstrap, crashes) trip it.
                 if !result.transient {
                     self.circuit_breaker.consecutive_failures += 1;
-                    if self.circuit_breaker.consecutive_failures >= self.circuit_breaker.max_failures {
+                    if self.circuit_breaker.max_failures > 0
+                        && self.circuit_breaker.consecutive_failures >= self.circuit_breaker.max_failures
+                    {
                         self.circuit_breaker.tripped = true;
                         tracing::warn!(
                             failures = self.circuit_breaker.consecutive_failures,

@@ -234,7 +234,12 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .take(40)
         .collect();
-    let session_name = format!("gw-{}", sanitized);
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let short_id = epoch % 1_000_000; // 6 digits, unique per second
+    let session_name = format!("gw-{}-{}", sanitized, short_id);
 
     // Build the /rune:arc command
     let arc_command = build_arc_command(plan_str, config);
@@ -721,12 +726,16 @@ fn monitor_session(
     // Phase-aware monitoring: track current phase and apply per-phase thresholds.
     // When the phase is unknown (early in pipeline), use watchdog defaults.
     use crate::engine::phase_profile::{self, PhaseProfile};
+    use crate::monitor::phase_nav;
     let mut current_phase_name: Option<String> = None;
     let mut current_profile: PhaseProfile = phase_profile::default_profile();
     let mut phase_started_at: Option<Instant> = None;
     // Effective timeout for current phase — resolved from checkpoint.totals.phase_times
     // or falls back to profile default. Reset on every phase transition.
     let mut effective_phase_timeout: u64 = current_profile.phase_timeout_secs;
+    // Transition gap tracking: detect when arc is between phases (no in_progress)
+    // and apply a separate timeout for the transition gap.
+    let mut in_transition_since: Option<Instant> = None;
 
     info!("Entering monitor loop (poll={}s, default nudge={}s, default kill={}s)",
         POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
@@ -928,10 +937,16 @@ fn monitor_session(
                     return Ok(SessionOutcome::Completed);
                 }
 
-                // Track checkpoint heartbeat — hash the current phase to detect changes
+                // PHASE TRACKING: infer phase from phases map (not phase_sequence).
+                // phase_sequence is often stale/not updated by Rune.
+                let nav = phase_nav::compute_phase_navigation(&checkpoint);
+                let inferred_phase = nav.effective_phase_name().map(|s| s.to_string());
+
+                // Track checkpoint heartbeat — hash inferred phase + completed count
                 let mut cp_hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(&checkpoint.current_phase().unwrap_or("none"), &mut cp_hasher);
+                std::hash::Hash::hash(&inferred_phase, &mut cp_hasher);
                 std::hash::Hash::hash(&checkpoint.count_by_status("completed"), &mut cp_hasher);
+                std::hash::Hash::hash(&nav.is_transitioning(), &mut cp_hasher);
                 let cp_hash = std::hash::Hasher::finish(&cp_hasher);
 
                 if last_checkpoint_hash.map_or(true, |h| h != cp_hash) {
@@ -939,13 +954,12 @@ fn monitor_session(
                 }
                 last_checkpoint_hash = Some(cp_hash);
 
-                // PHASE TRACKING: detect phase transitions and update profile.
-                let new_phase = checkpoint.current_phase().map(|s| s.to_string());
-                if new_phase != current_phase_name {
+                // Detect phase transitions using inferred phase
+                if inferred_phase != current_phase_name {
                     let prev = current_phase_name.as_deref().unwrap_or("none");
-                    let curr = new_phase.as_deref().unwrap_or("unknown");
+                    let curr = inferred_phase.as_deref().unwrap_or("unknown");
 
-                    if let Some(profile) = new_phase.as_deref().and_then(phase_profile::profile_for_phase) {
+                    if let Some(profile) = inferred_phase.as_deref().and_then(phase_profile::profile_for_phase) {
                         let completed = checkpoint.count_by_status("completed");
                         let skipped = checkpoint.count_by_status("skipped");
                         let total = checkpoint.phases.len();
@@ -964,8 +978,9 @@ fn monitor_session(
                             idle_kill = profile.idle_kill_secs,
                             phase_timeout = timeout,
                             has_agents = profile.has_agent_teams,
+                            transitioning = nav.is_transitioning(),
                             progress = format!("{}/{} done", completed + skipped, total),
-                            "Phase transition — applying {} profile (timeout={}m from checkpoint)",
+                            "Phase transition (inferred) — applying {} profile (timeout={}m)",
                             profile.description, timeout / 60,
                         );
                         println!(
@@ -977,9 +992,30 @@ fn monitor_session(
                         );
                         current_profile = profile;
                         phase_started_at = Some(Instant::now());
+                        in_transition_since = None; // clear transition state on real phase change
                     }
 
-                    current_phase_name = new_phase;
+                    current_phase_name = inferred_phase;
+                }
+
+                // TRANSITION GAP DETECTION: if no phase is in_progress but
+                // completed phases exist, we're between phases. Track how long.
+                if nav.is_transitioning() {
+                    if in_transition_since.is_none() {
+                        let gap = nav.transition_gap_secs().unwrap_or(0);
+                        info!(
+                            last_completed = nav.prev.as_ref().map(|p| p.name).unwrap_or("?"),
+                            next_pending = nav.next.unwrap_or("?"),
+                            gap_secs = gap,
+                            "Transition gap detected — between phases",
+                        );
+                        in_transition_since = Some(Instant::now());
+                    }
+                } else {
+                    if in_transition_since.is_some() {
+                        debug!("Transition gap ended — phase now in_progress");
+                    }
+                    in_transition_since = None;
                 }
 
             }
@@ -1456,6 +1492,7 @@ fn monitor_session(
 
             let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
             let phase_elapsed = phase_started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            let transition_gap = in_transition_since.map(|t| t.elapsed().as_secs());
             info!(
                 elapsed_secs = elapsed.as_secs(),
                 idle_secs = idle_secs,
@@ -1466,7 +1503,8 @@ fn monitor_session(
                 phase = phase_name,
                 phase_category = ?current_profile.category,
                 phase_elapsed_secs = phase_elapsed,
-                "Monitor: {}m{}s, idle {}s, phase={} [{}] ({}s), {}m left, {}",
+                transition_gap_secs = transition_gap,
+                "Monitor: {}m{}s, idle {}s, phase={} [{}] ({}s), {}m left, {}{}",
                 elapsed.as_secs() / 60,
                 elapsed.as_secs() % 60,
                 idle_secs,
@@ -1475,6 +1513,7 @@ fn monitor_session(
                 phase_elapsed,
                 remaining.as_secs() / 60,
                 loop_info,
+                transition_gap.map_or(String::new(), |g| format!(", transition_gap={}s", g)),
             );
 
             // Log stall warning if loop state hasn't changed for a long time
@@ -1528,6 +1567,33 @@ fn monitor_session(
                 );
                 save_crash_dump(session_name, &config.working_dir, &format!(
                     "Phase '{}' timeout: {}s > {}s budget", phase_name, phase_elapsed, effective_phase_timeout,
+                ));
+                kill_session(session_name)?;
+                return Ok(SessionOutcome::Stuck);
+            }
+        }
+
+        // TRANSITION GAP TIMEOUT: if stuck between phases for too long, nudge/kill.
+        // This catches the case where Rune finishes one phase but never starts the next.
+        if let Some(transition_start) = in_transition_since {
+            let gap_secs = transition_start.elapsed().as_secs();
+            let transition_timeout = phase_nav::DEFAULT_TRANSITION_TIMEOUT_SECS;
+            if gap_secs > transition_timeout {
+                let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+                warn!(
+                    phase = phase_name,
+                    gap_secs = gap_secs,
+                    timeout_secs = transition_timeout,
+                    "Transition gap timeout — stuck between phases for {}s > {}s",
+                    gap_secs, transition_timeout,
+                );
+                println!(
+                    "[gw] Transition gap timeout: stuck between phases for {}m > {}m — killing session",
+                    gap_secs / 60,
+                    transition_timeout / 60,
+                );
+                save_crash_dump(session_name, &config.working_dir, &format!(
+                    "Transition gap timeout: {}s between phases (limit {}s)", gap_secs, transition_timeout,
                 ));
                 kill_session(session_name)?;
                 return Ok(SessionOutcome::Stuck);

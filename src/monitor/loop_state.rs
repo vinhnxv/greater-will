@@ -145,10 +145,18 @@ pub fn read_arc_loop_state(working_dir: &Path) -> Option<ArcLoopState> {
         return None;
     }
 
+    let checkpoint_path = parse_yaml_str(&yaml, "checkpoint_path")?;
+    let plan_file = parse_yaml_str(&yaml, "plan_file")?;
+
+    if checkpoint_path.is_empty() || plan_file.is_empty() {
+        debug!("arc-phase-loop state has empty checkpoint_path or plan_file");
+        return None;
+    }
+
     Some(ArcLoopState {
         active,
-        checkpoint_path: parse_yaml_str(&yaml, "checkpoint_path")?,
-        plan_file: parse_yaml_str(&yaml, "plan_file")?,
+        checkpoint_path,
+        plan_file,
         config_dir: parse_yaml_str(&yaml, "config_dir").unwrap_or_default(),
         owner_pid: parse_yaml_str(&yaml, "owner_pid").unwrap_or_default(),
         session_id: parse_yaml_str(&yaml, "session_id").unwrap_or_default(),

@@ -605,7 +605,7 @@ impl RetryState {
 
         // Check for rapid failure (3+ retries within 30 seconds)
         if let Some(last) = self.last_failure {
-            if now.duration_since(last) < Duration::from_secs(30) && self.attempts >= 2 {
+            if now.duration_since(last) < Duration::from_secs(30) && self.attempts >= 3 {
                 self.is_rapid_failure = true;
             }
         }

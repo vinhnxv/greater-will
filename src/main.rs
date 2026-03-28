@@ -9,27 +9,16 @@
 //! - `replay`: Resume from a checkpoint
 //! - `clean`: Clean up temporary files and sessions
 
-#[allow(dead_code)]
 mod batch;
-#[allow(dead_code)]
 mod checkpoint;
-#[allow(dead_code)]
 mod cleanup;
-#[allow(dead_code)]
 mod commands;
-#[allow(dead_code)]
 mod config;
-#[allow(dead_code)]
 mod engine;
-#[allow(dead_code)]
 mod github;
-#[allow(dead_code)]
 mod log;
-#[allow(dead_code)]
 mod monitor;
-#[allow(dead_code)]
 mod output;
-#[allow(dead_code)]
 mod session;
 
 use clap::Parser;
