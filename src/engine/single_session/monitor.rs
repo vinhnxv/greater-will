@@ -176,6 +176,14 @@ pub(crate) fn monitor_session(
     let mut in_failed_since: Option<Instant> = None;
     let mut failed_nudge_count: u32 = 0;
 
+    // Completion grace period: when arc completes, don't kill tmux immediately.
+    // Give user time to interact and Claude Code time to finalize.
+    // Kill only after 5 minutes of pane inactivity (no content changes).
+    // If pane content changes during grace, reset the idle timer.
+    let mut completion_detected_at: Option<Instant> = None;
+    let mut completion_idle_since: Option<Instant> = None;
+    const COMPLETION_GRACE_IDLE_SECS: u64 = 300; // 5 minutes of inactivity
+
     info!("Entering monitor loop (poll={}s, default nudge={}s, default kill={}s)",
         POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
     println!("[gw] Monitoring session (poll every {}s)...", POLL_INTERVAL_SECS);
@@ -195,17 +203,25 @@ pub(crate) fn monitor_session(
             info!(event = event, is_complete = is_complete, "Stop signal detected from hook");
 
             if is_complete {
-                let elapsed = dispatch_time.elapsed();
-                println!(
-                    "[gw] Session ended cleanly (signal: {}, {}m{}s elapsed)",
-                    event,
-                    elapsed.as_secs() / 60,
-                    elapsed.as_secs() % 60,
-                );
-                // Give a moment for final writes
-                std::thread::sleep(Duration::from_secs(3));
-                let _ = kill_session(session_name);
-                return Ok(SessionOutcome::Completed);
+                if completion_detected_at.is_none() {
+                    let elapsed = dispatch_time.elapsed();
+                    info!(
+                        event = event,
+                        elapsed_secs = elapsed.as_secs(),
+                        "Arc completed (hook signal) — entering grace period ({}s idle to kill)",
+                        COMPLETION_GRACE_IDLE_SECS,
+                    );
+                    println!(
+                        "[gw] Arc completed (signal: {}, {}m{}s elapsed) — grace period active (kill after {}m idle)",
+                        event,
+                        elapsed.as_secs() / 60,
+                        elapsed.as_secs() % 60,
+                        COMPLETION_GRACE_IDLE_SECS / 60,
+                    );
+                    completion_detected_at = Some(Instant::now());
+                    completion_idle_since = Some(Instant::now());
+                }
+                // Don't return — let the grace period handler (above) manage the kill
             }
             // Signal says not complete — let other checks determine what happened
             // (could be a stop mid-pipeline, will be caught by session-alive check)
@@ -356,6 +372,62 @@ pub(crate) fn monitor_session(
             nudge_count = 0; // Reset nudge on new activity
         }
 
+        // COMPLETION GRACE PERIOD: if arc completed, wait for pane inactivity
+        // before killing tmux. This gives user time to interact and Claude Code
+        // time to finalize writes.
+        if completion_detected_at.is_some() {
+            // Detect pane activity: last_activity was just updated above if hash changed.
+            // If it was updated within the last poll interval, pane is active.
+            let pane_active = last_activity.elapsed().as_secs() < POLL_INTERVAL_SECS + 1;
+            if pane_active {
+                // User or Claude is still active — reset idle timer
+                completion_idle_since = Some(Instant::now());
+                debug!("Completion grace: pane activity detected, resetting idle timer");
+            }
+
+            let idle_secs = completion_idle_since
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+
+            if idle_secs >= COMPLETION_GRACE_IDLE_SECS {
+                let total_grace = completion_detected_at.unwrap().elapsed();
+                info!(
+                    idle_secs = idle_secs,
+                    total_grace_secs = total_grace.as_secs(),
+                    "Completion grace period expired — session idle for {}m, killing tmux",
+                    idle_secs / 60,
+                );
+                println!(
+                    "[gw] Arc completed, session idle for {}m — killing tmux session",
+                    idle_secs / 60,
+                );
+                let _ = kill_session(session_name);
+                return Ok(SessionOutcome::Completed);
+            }
+
+            // Check if session died on its own during grace
+            if !has_session(session_name) {
+                let total_grace = completion_detected_at.unwrap().elapsed();
+                info!(
+                    total_grace_secs = total_grace.as_secs(),
+                    "Session exited on its own during completion grace period",
+                );
+                return Ok(SessionOutcome::Completed);
+            }
+
+            // Still in grace period — skip all other monitoring checks
+            // (no need to check for errors, idle, timeouts on a completed arc)
+            if last_status_log.elapsed() >= Duration::from_secs(STATUS_LOG_INTERVAL_SECS) {
+                last_status_log = Instant::now();
+                let remaining = COMPLETION_GRACE_IDLE_SECS.saturating_sub(idle_secs);
+                println!(
+                    "[gw] Arc completed — grace period active (idle {}s, kill after {}s of inactivity)",
+                    idle_secs, remaining,
+                );
+            }
+            continue;
+        }
+
         // PRIMARY: Check checkpoint.json for arc completion.
         // This is the most reliable signal — Rune writes structured state here.
         // Only poll every CHECKPOINT_POLL_INTERVAL_SECS to avoid excessive file I/O.
@@ -365,17 +437,23 @@ pub(crate) fn monitor_session(
                 &config.working_dir, &mut cached_checkpoint_path,
             ) {
                 if checkpoint.is_complete() {
-                    let elapsed = dispatch_time.elapsed();
-                    info!("Pipeline completion detected via checkpoint.json");
-                    println!(
-                        "[gw] Pipeline complete (checkpoint confirmed)! ({}m{}s elapsed)",
-                        elapsed.as_secs() / 60,
-                        elapsed.as_secs() % 60,
-                    );
-                    // Give it a moment to finish writing artifacts
-                    std::thread::sleep(Duration::from_secs(5));
-                    kill_session(session_name)?;
-                    return Ok(SessionOutcome::Completed);
+                    if completion_detected_at.is_none() {
+                        let elapsed = dispatch_time.elapsed();
+                        info!(
+                            elapsed_secs = elapsed.as_secs(),
+                            "Arc completed (checkpoint) — entering grace period ({}s idle to kill)",
+                            COMPLETION_GRACE_IDLE_SECS,
+                        );
+                        println!(
+                            "[gw] Pipeline complete (checkpoint confirmed, {}m{}s elapsed) — grace period active (kill after {}m idle)",
+                            elapsed.as_secs() / 60,
+                            elapsed.as_secs() % 60,
+                            COMPLETION_GRACE_IDLE_SECS / 60,
+                        );
+                        completion_detected_at = Some(Instant::now());
+                        completion_idle_since = Some(Instant::now());
+                    }
+                    // Don't return — grace period handler manages the kill
                 }
 
                 // PHASE TRACKING: infer phase from phases map (not phase_sequence).
@@ -592,45 +670,66 @@ pub(crate) fn monitor_session(
                         &config.working_dir, &mut cached_checkpoint_path,
                     ) {
                         if checkpoint.is_complete() {
-                            info!("Loop state gone + checkpoint complete → success");
+                            if completion_detected_at.is_none() {
+                                info!(
+                                    "Loop state gone + checkpoint complete — entering grace period ({}s idle to kill)",
+                                    COMPLETION_GRACE_IDLE_SECS,
+                                );
+                                println!(
+                                    "[gw] Arc completed (loop state gone, checkpoint confirmed) — grace period active (kill after {}m idle)",
+                                    COMPLETION_GRACE_IDLE_SECS / 60,
+                                );
+                                completion_detected_at = Some(Instant::now());
+                                completion_idle_since = Some(Instant::now());
+                            }
+                            // Don't return — grace period handler manages the kill
+                        } else {
+                            let current = checkpoint.inferred_phase_name()
+                                .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
+                            warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
+                            let reason = format!(
+                                "arc-phase-loop.local.md deleted during phase '{}' after {}s",
+                                current, session_age.as_secs(),
+                            );
+                            save_crash_dump(session_name, &config.working_dir, &reason);
                             let _ = kill_session(session_name);
-                            return Ok(SessionOutcome::Completed);
+                            return Ok(SessionOutcome::Crashed { reason });
                         }
-                        let current = checkpoint.inferred_phase_name()
-                            .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
-                        warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
-                        let reason = format!(
-                            "arc-phase-loop.local.md deleted during phase '{}' after {}s",
-                            current, session_age.as_secs(),
-                        );
-                        save_crash_dump(session_name, &config.working_dir, &reason);
-                        let _ = kill_session(session_name);
-                        return Ok(SessionOutcome::Crashed { reason });
                     }
                     // No checkpoint found. Disambiguate using session age:
                     // - Long-running (>5 min): Rune ran and cleaned up after itself → Completed
                     // - Short-running (<5 min): Rune failed early before creating checkpoint → Crashed
                     if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
-                        info!(
+                        if completion_detected_at.is_none() {
+                            info!(
+                                age_secs = session_age.as_secs(),
+                                "Loop state gone, no checkpoint, session ran {}m — entering grace period ({}s idle to kill)",
+                                session_age.as_secs() / 60,
+                                COMPLETION_GRACE_IDLE_SECS,
+                            );
+                            println!(
+                                "[gw] Arc likely completed (loop state gone, ran {}m) — grace period active (kill after {}m idle)",
+                                session_age.as_secs() / 60,
+                                COMPLETION_GRACE_IDLE_SECS / 60,
+                            );
+                            completion_detected_at = Some(Instant::now());
+                            completion_idle_since = Some(Instant::now());
+                        }
+                        // Don't return — grace period handler manages the kill
+                    } else {
+                        warn!(
                             age_secs = session_age.as_secs(),
-                            "Loop state gone, no checkpoint, but session ran {}m — assuming Rune cleaned up after completion",
-                            session_age.as_secs() / 60,
+                            "Loop state gone, no checkpoint, session only ran {}s — treating as crash",
+                            session_age.as_secs(),
                         );
+                        let reason = format!(
+                            "arc-phase-loop.local.md gone after only {}s with no checkpoint",
+                            session_age.as_secs(),
+                        );
+                        save_crash_dump(session_name, &config.working_dir, &reason);
                         let _ = kill_session(session_name);
-                        return Ok(SessionOutcome::Completed);
+                        return Ok(SessionOutcome::Crashed { reason });
                     }
-                    warn!(
-                        age_secs = session_age.as_secs(),
-                        "Loop state gone, no checkpoint, session only ran {}s — treating as crash",
-                        session_age.as_secs(),
-                    );
-                    let reason = format!(
-                        "arc-phase-loop.local.md gone after only {}s with no checkpoint",
-                        session_age.as_secs(),
-                    );
-                    save_crash_dump(session_name, &config.working_dir, &reason);
-                    let _ = kill_session(session_name);
-                    return Ok(SessionOutcome::Crashed { reason });
                 }
             } else if session_age > Duration::from_secs(wd.loop_state_warmup_secs) {
                 // Past the warmup deadline, but only act if Claude Code is
@@ -709,17 +808,23 @@ pub(crate) fn monitor_session(
         // SECONDARY: Check for completion signals in pane output (text matching).
         // Fallback for when checkpoint hasn't been written yet or is stale.
         if is_pipeline_complete(&pane_content) {
-            let elapsed = dispatch_time.elapsed();
-            info!("Pipeline completion detected in pane output");
-            println!(
-                "[gw] Pipeline complete! ({}m{}s elapsed)",
-                elapsed.as_secs() / 60,
-                elapsed.as_secs() % 60,
-            );
-            // Give it a moment to finish writing
-            std::thread::sleep(Duration::from_secs(5));
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::Completed);
+            if completion_detected_at.is_none() {
+                let elapsed = dispatch_time.elapsed();
+                info!(
+                    elapsed_secs = elapsed.as_secs(),
+                    "Arc completed (pane text) — entering grace period ({}s idle to kill)",
+                    COMPLETION_GRACE_IDLE_SECS,
+                );
+                println!(
+                    "[gw] Pipeline complete! ({}m{}s elapsed) — grace period active (kill after {}m idle)",
+                    elapsed.as_secs() / 60,
+                    elapsed.as_secs() % 60,
+                    COMPLETION_GRACE_IDLE_SECS / 60,
+                );
+                completion_detected_at = Some(Instant::now());
+                completion_idle_since = Some(Instant::now());
+            }
+            // Don't return — grace period handler manages the kill
         }
 
         // Evidence-based error detection.
