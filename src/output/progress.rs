@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Progress bar utilities using indicatif.
 //!
 //! Provides a two-level progress display:

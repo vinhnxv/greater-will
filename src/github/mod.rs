@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! GitHub issue integration for `gw run`.
 //!
 //! Enables `gw run https://github.com/owner/repo/issues/123` by:

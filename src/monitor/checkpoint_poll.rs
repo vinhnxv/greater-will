@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Checkpoint file watcher for monitoring phase progress.
 //!
 //! This module provides utilities for watching checkpoint.json files

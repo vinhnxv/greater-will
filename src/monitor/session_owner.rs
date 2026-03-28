@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Session ownership tracking for gw crash recovery.
 //!
 //! When gw starts monitoring a session, it writes `.gw/session-owner.json`

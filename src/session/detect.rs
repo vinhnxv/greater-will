@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Prompt detection and output velocity tracking.
 //!
 //! This module provides utilities for detecting Claude Code's prompt (❯)

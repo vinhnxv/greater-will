@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! System health checks for process spawning.
 //!
 //! Provides health gates to ensure system resources are available

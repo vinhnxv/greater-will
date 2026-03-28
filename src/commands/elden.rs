@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Elden command — Claude Code hook context injection.
 //!
 //! When registered as a `SessionStart` hook in `.claude/settings.json`,

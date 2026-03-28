@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Evidence-based completion detection for phase group monitoring.
 //!
 //! This module implements the detection system that monitors running

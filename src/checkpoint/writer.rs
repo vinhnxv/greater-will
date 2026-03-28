@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Checkpoint writer for Rune arc checkpoints.
 //!
 //! Provides atomic write operations for checkpoint.json files.

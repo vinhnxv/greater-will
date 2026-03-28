@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Checkpoint schema definitions for Rune arc checkpoints.
 //!
 //! This module provides Serde structs that can parse checkpoint.json files

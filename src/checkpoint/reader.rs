@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Checkpoint reader for Rune arc checkpoints.
 //!
 //! Provides functions to read, validate, and inspect checkpoint.json files.

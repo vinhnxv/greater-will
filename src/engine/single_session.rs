@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Single-session pipeline executor.
 //!
 //! Runs the entire `/rune:arc` pipeline in a single Claude Code tmux session.

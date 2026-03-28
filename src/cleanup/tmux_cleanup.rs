@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Stale tmux session cleanup.
 //!
 //! Provides utilities for detecting and cleaning up orphaned tmux

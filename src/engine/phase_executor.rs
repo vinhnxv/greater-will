@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase group executor - core state machine for running phase groups.
 //!
 //! This module implements the main executor that runs phase groups in

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase navigation — infer prev/current/next phase from checkpoint data.
 //!
 //! This module provides ground-truth phase tracking by scanning the `phases`

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase order constants for Rune arc pipelines.
 //!
 //! This module defines the canonical order of all 41 arc phases.

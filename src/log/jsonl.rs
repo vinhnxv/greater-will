@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! JSONL structured log writer for run-level telemetry.
 //!
 //! Each completed plan execution appends a single JSON line to

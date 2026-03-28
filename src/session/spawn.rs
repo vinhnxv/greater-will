@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Claude Code session spawning utilities.
 //!
 //! This module handles the creation and startup of Claude Code sessions

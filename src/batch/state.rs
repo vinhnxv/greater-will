@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Persistent batch state with atomic writes.
 //!
 //! State is written to `.gw/batch-state.json` using the write-to-tmp + rename

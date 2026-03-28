@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase-aware profiles for Rune arc monitoring.
 //!
 //! Each arc phase has different characteristics that affect how Greater-Will

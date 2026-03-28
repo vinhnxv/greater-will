@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase configuration schema for Rune arc phases.
 //!
 //! This module defines the TOML configuration structure for organizing

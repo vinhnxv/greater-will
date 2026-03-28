@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Auto-accept permission prompts in Claude Code sessions.
 //!
 //! When Claude Code asks "Allow tool? (y/n)", the session stalls if no human

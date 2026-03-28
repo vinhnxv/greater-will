@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Process tree management and kill logic.
 //!
 //! Provides utilities for traversing process trees and terminating

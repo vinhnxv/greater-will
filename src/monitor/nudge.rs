@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Idle detection and nudge management for phase sessions.
 //!
 //! This module handles the detection of idle sessions and sending

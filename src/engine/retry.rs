@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Retry logic, error classification, and evidence-based error detection.
 //!
 //! This module implements the retry system that handles failures during
