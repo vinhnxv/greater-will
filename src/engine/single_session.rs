@@ -733,9 +733,14 @@ fn monitor_session(
     // Effective timeout for current phase — resolved from checkpoint.totals.phase_times
     // or falls back to profile default. Reset on every phase transition.
     let mut effective_phase_timeout: u64 = current_profile.phase_timeout_secs;
-    // Transition gap tracking: detect when arc is between phases (no in_progress)
-    // and apply a separate timeout for the transition gap.
+    // Transition/failed gap tracking: detect when arc is between phases or has a
+    // failed phase, and apply escalating nudge → warn → kill timeouts.
+    // gw is an observer — always give Rune time to self-heal before intervening.
     let mut in_transition_since: Option<Instant> = None;
+    let mut transition_nudge_count: u32 = 0;
+    // Failed phase tracking: separate timer because Rune has its own retry system.
+    let mut in_failed_since: Option<Instant> = None;
+    let mut failed_nudge_count: u32 = 0;
 
     info!("Entering monitor loop (poll={}s, default nudge={}s, default kill={}s)",
         POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);
@@ -998,24 +1003,29 @@ fn monitor_session(
                     current_phase_name = inferred_phase;
                 }
 
-                // FAILED PHASE DETECTION: if a phase has failed, log it.
-                // Don't start transition timer — arc may be processing retry reaction.
+                // FAILED PHASE DETECTION: start failed timer.
+                // Don't start transition timer — arc has its own retry/halt reactions.
+                // gw observes and only intervenes after giving Rune time to self-heal.
                 if nav.has_failure() {
-                    if let crate::checkpoint::schema::PhasePosition::Failed {
-                        failed_phase, next_pending
-                    } = &nav.position {
-                        info!(
-                            failed = failed_phase,
-                            next = next_pending.unwrap_or("none"),
-                            "Phase failure detected — arc may be retrying or halted",
-                        );
+                    if in_failed_since.is_none() {
+                        if let crate::checkpoint::schema::PhasePosition::Failed {
+                            failed_phase, next_pending
+                        } = &nav.position {
+                            info!(
+                                failed = failed_phase,
+                                next = next_pending.unwrap_or("none"),
+                                "Phase failure detected — observing for Rune self-healing",
+                            );
+                        }
+                        in_failed_since = Some(Instant::now());
+                        failed_nudge_count = 0;
                     }
-                    // Don't set transition timer for failed phases — arc has its own
-                    // retry/halt reaction logic. The overall pipeline timeout still applies.
                     in_transition_since = None;
+                    transition_nudge_count = 0;
                 }
                 // TRANSITION GAP DETECTION: if no phase is in_progress but
-                // completed phases exist, we're between phases. Track how long.
+                // completed phases exist, we're between phases.
+                // Claude Code often needs 5-10 min to process between phases.
                 else if nav.is_transitioning() {
                     if in_transition_since.is_none() {
                         let gap = nav.transition_gap_secs().unwrap_or(0);
@@ -1023,15 +1033,26 @@ fn monitor_session(
                             last_completed = nav.prev.as_ref().map(|p| p.name).unwrap_or("?"),
                             next_pending = nav.next.unwrap_or("?"),
                             gap_secs = gap,
-                            "Transition gap detected — between phases",
+                            "Transition gap detected — between phases (normal: up to 10 min)",
                         );
                         in_transition_since = Some(Instant::now());
+                        transition_nudge_count = 0;
                     }
+                    // Clear failed state if we moved past it
+                    in_failed_since = None;
+                    failed_nudge_count = 0;
                 } else {
+                    // Phase is running — clear all gap timers
                     if in_transition_since.is_some() {
                         debug!("Transition gap ended — phase now in_progress");
                     }
+                    if in_failed_since.is_some() {
+                        info!("Failed phase resolved — Rune self-healed");
+                    }
                     in_transition_since = None;
+                    transition_nudge_count = 0;
+                    in_failed_since = None;
+                    failed_nudge_count = 0;
                 }
 
             }
@@ -1589,30 +1610,102 @@ fn monitor_session(
             }
         }
 
-        // TRANSITION GAP TIMEOUT: if stuck between phases for too long, nudge/kill.
-        // This catches the case where Rune finishes one phase but never starts the next.
+        // TRANSITION GAP ESCALATION: nudge → warn → kill.
+        // Claude Code needs time between phases (5-10 min is normal).
+        // gw observes and escalates gradually, giving Rune time to proceed.
         if let Some(transition_start) = in_transition_since {
             let gap_secs = transition_start.elapsed().as_secs();
-            let transition_timeout = phase_nav::DEFAULT_TRANSITION_TIMEOUT_SECS;
-            if gap_secs > transition_timeout {
-                let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+            let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+
+            if gap_secs > phase_nav::TRANSITION_KILL_SECS {
+                // KILL: hard timeout — Rune had enough time, likely stuck
                 warn!(
                     phase = phase_name,
                     gap_secs = gap_secs,
-                    timeout_secs = transition_timeout,
-                    "Transition gap timeout — stuck between phases for {}s > {}s",
-                    gap_secs, transition_timeout,
+                    "Transition gap kill — stuck between phases for {}s",
+                    gap_secs,
                 );
                 println!(
-                    "[gw] Transition gap timeout: stuck between phases for {}m > {}m — killing session",
+                    "[gw] Transition gap: {}m between phases — killing session",
                     gap_secs / 60,
-                    transition_timeout / 60,
                 );
                 save_crash_dump(session_name, &config.working_dir, &format!(
-                    "Transition gap timeout: {}s between phases (limit {}s)", gap_secs, transition_timeout,
+                    "Transition gap timeout: {}s between phases (kill after {}s)",
+                    gap_secs, phase_nav::TRANSITION_KILL_SECS,
                 ));
                 kill_session(session_name)?;
                 return Ok(SessionOutcome::Stuck);
+            } else if gap_secs > phase_nav::TRANSITION_WARN_SECS && transition_nudge_count < 2 {
+                // WARN: stronger nudge
+                transition_nudge_count = 2;
+                info!(gap_secs = gap_secs, "Transition gap warn nudge");
+                println!(
+                    "[gw] Transition gap: {}m between phases — sending warn nudge (kill at {}m)",
+                    gap_secs / 60, phase_nav::TRANSITION_KILL_SECS / 60,
+                );
+                let _ = send_keys_with_workaround(
+                    session_name,
+                    "are you stuck between phases? please continue to the next phase",
+                );
+            } else if gap_secs > phase_nav::TRANSITION_NUDGE_SECS && transition_nudge_count < 1 {
+                // NUDGE: gentle reminder
+                transition_nudge_count = 1;
+                info!(gap_secs = gap_secs, "Transition gap gentle nudge");
+                println!(
+                    "[gw] Transition gap: {}m between phases — sending gentle nudge",
+                    gap_secs / 60,
+                );
+                let _ = send_keys_with_workaround(
+                    session_name,
+                    "please continue working",
+                );
+            }
+        }
+
+        // FAILED PHASE ESCALATION: nudge → warn → kill.
+        // Rune has its own retry/halt reaction system. gw gives it time to self-heal.
+        if let Some(failed_start) = in_failed_since {
+            let gap_secs = failed_start.elapsed().as_secs();
+            let phase_name = current_phase_name.as_deref().unwrap_or("unknown");
+
+            if gap_secs > phase_nav::FAILED_KILL_SECS {
+                warn!(
+                    phase = phase_name,
+                    gap_secs = gap_secs,
+                    "Failed phase kill — Rune did not recover in time",
+                );
+                println!(
+                    "[gw] Failed phase '{}': no recovery after {}m — killing session",
+                    phase_name, gap_secs / 60,
+                );
+                save_crash_dump(session_name, &config.working_dir, &format!(
+                    "Failed phase '{}' not recovered: {}s (kill after {}s)",
+                    phase_name, gap_secs, phase_nav::FAILED_KILL_SECS,
+                ));
+                kill_session(session_name)?;
+                return Ok(SessionOutcome::Stuck);
+            } else if gap_secs > phase_nav::FAILED_WARN_SECS && failed_nudge_count < 2 {
+                failed_nudge_count = 2;
+                info!(gap_secs = gap_secs, "Failed phase warn nudge");
+                println!(
+                    "[gw] Failed phase '{}': {}m without recovery — sending warn nudge",
+                    phase_name, gap_secs / 60,
+                );
+                let _ = send_keys_with_workaround(
+                    session_name,
+                    "a phase has failed — please check and continue or retry",
+                );
+            } else if gap_secs > phase_nav::FAILED_NUDGE_SECS && failed_nudge_count < 1 {
+                failed_nudge_count = 1;
+                info!(gap_secs = gap_secs, "Failed phase gentle nudge");
+                println!(
+                    "[gw] Failed phase '{}': {}m without recovery — sending gentle nudge",
+                    phase_name, gap_secs / 60,
+                );
+                let _ = send_keys_with_workaround(
+                    session_name,
+                    "please continue working",
+                );
             }
         }
 

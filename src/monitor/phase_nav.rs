@@ -20,10 +20,29 @@
 use crate::checkpoint::schema::{Checkpoint, PhasePosition};
 use chrono::{DateTime, Utc};
 
-/// Default transition gap timeout in seconds.
-/// If no phase is `in_progress` for longer than this after the last phase
-/// completed, the arc is likely stuck between phases.
-pub const DEFAULT_TRANSITION_TIMEOUT_SECS: u64 = 180; // 3 minutes
+/// Transition gap escalation thresholds (seconds).
+///
+/// When no phase is `in_progress` after the last phase completed,
+/// Claude Code may still be processing (writing artifacts, updating state,
+/// preparing for next phase). This can legitimately take 5-10 minutes.
+///
+/// Escalation:
+///   - NUDGE: gentle reminder to continue
+///   - WARN: stronger nudge, signals possible issue
+///   - KILL: hard timeout, likely stuck
+///
+/// These are conservative defaults — better to nudge too late than kill too early.
+pub const TRANSITION_NUDGE_SECS: u64 = 300;  // 5 minutes — first nudge
+pub const TRANSITION_WARN_SECS: u64 = 480;   // 8 minutes — second nudge (stronger)
+pub const TRANSITION_KILL_SECS: u64 = 660;   // 11 minutes — hard kill
+
+/// Failed phase escalation thresholds (seconds).
+///
+/// When a phase has failed, Rune's reaction system may retry or halt.
+/// gw should observe and only intervene if Rune can't self-heal.
+pub const FAILED_NUDGE_SECS: u64 = 360;      // 6 minutes — first nudge
+pub const FAILED_WARN_SECS: u64 = 540;       // 9 minutes — second nudge
+pub const FAILED_KILL_SECS: u64 = 720;        // 12 minutes — hard kill
 
 /// Navigation context: where the pipeline was, is, and will be.
 #[derive(Debug, Clone)]
