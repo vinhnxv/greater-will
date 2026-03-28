@@ -67,7 +67,9 @@ pub enum PlanOutcome {
 pub struct CircuitBreakerState {
     /// Number of consecutive failures.
     pub consecutive_failures: u32,
-    /// Maximum consecutive failures before tripping.
+    /// Maximum consecutive failures before tripping the breaker.
+    /// The breaker trips when `consecutive_failures >= max_failures`.
+    /// A value of 3 means the 3rd consecutive failure triggers the breaker.
     pub max_failures: u32,
     /// Whether the circuit breaker is currently tripped.
     pub tripped: bool,
@@ -184,6 +186,11 @@ impl BatchState {
             }
         }
         self.results.push(result);
+        debug_assert!(
+            self.current_index < self.plans.len(),
+            "record_result called when current_index ({}) >= plans.len() ({})",
+            self.current_index, self.plans.len()
+        );
         self.current_index += 1;
     }
 

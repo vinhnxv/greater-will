@@ -125,6 +125,9 @@ impl PromptDetector {
     }
 
     /// Check if the session has been idle for the given duration.
+    ///
+    /// Returns `false` until at least one [`update()`](Self::update) call has been
+    /// made, since a baseline hash is needed before staleness can be detected.
     pub fn is_idle(&self, threshold: Duration) -> Result<bool> {
         let content = capture_pane(&self.session_id)?;
         let current_hash = compute_content_hash(&content);
@@ -202,6 +205,9 @@ impl OutputVelocity {
     }
 
     /// Check if content is currently changing.
+    ///
+    /// Returns `true` when no prior observation exists (conservative default —
+    /// we assume active until proven otherwise to avoid premature idle detection).
     pub fn is_active(&self) -> bool {
         match self.last_hash {
             Some(last) => self.current_hash != last,
@@ -371,7 +377,10 @@ fn rotate_crash_dumps(dump_dir: &std::path::Path, keep: usize) {
     }
 }
 
-/// Compute a hash of content for change detection.
+/// Compute a hash of content for in-session change detection.
+///
+/// Uses `DefaultHasher` — not cryptographic and not stable across builds.
+/// Suitable only for same-process comparisons, not for persistence.
 pub fn compute_content_hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);

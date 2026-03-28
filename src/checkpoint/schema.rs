@@ -333,6 +333,10 @@ impl Checkpoint {
 
     /// Get the current phase name based on `phase_sequence`.
     ///
+    /// **WARNING:** `phase_sequence` is often stale — Rune frequently fails to
+    /// update this field. Prefer [`inferred_phase_name()`](Self::inferred_phase_name)
+    /// which derives the phase from the actual `phases` map.
+    ///
     /// Returns `None` if `phase_sequence` is not set or is out of valid range.
     /// When `phase_sequence` equals `PHASE_COUNT` (the completed sentinel),
     /// returns the last phase in the pipeline. Values beyond `PHASE_COUNT`

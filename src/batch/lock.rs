@@ -18,7 +18,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct InstanceLock {
     lock_path: PathBuf,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Held for struct lifetime; dropping releases the advisory lock
     lock_file: File,
 }
 
@@ -47,7 +47,14 @@ impl InstanceLock {
             let pid_info = fs::read_to_string(&lock_path)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|pid| format!(" (PID {pid})"))
+                .map(|pid| {
+                    let alive = crate::cleanup::process::is_pid_alive(pid);
+                    if alive {
+                        format!(" (PID {pid}, running)")
+                    } else {
+                        format!(" (PID {pid}, not running — lock may be stale)")
+                    }
+                })
                 .unwrap_or_default();
             eyre::eyre!(
                 "Another gw instance is running{pid_info}. \

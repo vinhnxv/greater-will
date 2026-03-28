@@ -342,6 +342,7 @@ impl ErrorClass {
 
         // Require error-adjacent context: the keyword must appear near
         // an indicator that it's an actual error, not just mentioned in output.
+        // Note: `tail` is already lowercased above, so these checks are case-insensitive.
         let has_error_context = tail.lines().any(|line| {
             let trimmed = line.trim();
             trimmed.starts_with("error:") || trimmed.starts_with("error ")

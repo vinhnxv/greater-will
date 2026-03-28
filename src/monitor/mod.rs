@@ -18,10 +18,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use greater_will::monitor::{CheckpointWatcher, NudgeManager};
+//! use greater_will::monitor::checkpoint_poll::CheckpointWatcher;
+//! use greater_will::monitor::nudge::{NudgeManager, NudgeConfig};
 //!
 //! let watcher = CheckpointWatcher::new(".rune/arc/arc-123/checkpoint.json");
-//! let nudge_mgr = NudgeManager::new("gw-session-A");
+//! let nudge_mgr = NudgeManager::with_defaults("gw-session-A");
 //!
 //! loop {
 //!     // Check checkpoint

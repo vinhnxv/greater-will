@@ -105,7 +105,14 @@ impl Default for CompletionConfig {
 
 impl CompletionConfig {
     /// Create config with custom timeouts for a specific group.
+    ///
+    /// # Panics (debug only)
+    /// Panics if `idle_nudge_sec >= idle_kill_sec` — nudging must happen before killing.
     pub fn for_group(timeout_min: u32, idle_nudge_sec: u64, idle_kill_sec: u64) -> Self {
+        debug_assert!(
+            idle_nudge_sec < idle_kill_sec,
+            "idle_nudge_sec ({idle_nudge_sec}) must be less than idle_kill_sec ({idle_kill_sec})"
+        );
         Self {
             poll_interval: Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
             idle_nudge_after: Duration::from_secs(idle_nudge_sec),

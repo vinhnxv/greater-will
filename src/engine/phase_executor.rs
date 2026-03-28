@@ -439,7 +439,7 @@ impl PhaseGroupExecutor {
 
         // Modify checkpoint to mark phases before this group as completed
         let mut checkpoint = read_checkpoint(checkpoint_path)?;
-        let first_phase = group.phases.first().ok_or_else(|| eyre!("Group has no phases"))?;
+        let first_phase = group.phases.first().ok_or_else(|| eyre!("Phase group '{}' must have at least one phase", group.name))?;
         mark_phases_completed_before(&mut checkpoint, first_phase);
         write_checkpoint(&checkpoint, checkpoint_path)?;
 

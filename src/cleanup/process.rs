@@ -78,6 +78,7 @@ pub fn refresh_process_system(sys: &mut System) {
 /// ```
 pub fn is_pid_alive(pid: u32) -> bool {
     if pid > i32::MAX as u32 {
+        tracing::debug!(pid, "PID exceeds i32::MAX — treating as not alive");
         return false;
     }
 
