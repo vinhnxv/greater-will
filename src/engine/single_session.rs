@@ -1636,19 +1636,44 @@ fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("arc result: success")
 }
 
-/// Read checkpoint using `arc-phase-loop.local.md` as the single source of truth.
+/// Read checkpoint with three-strategy resolution.
 ///
 /// Resolution order:
 /// 1. Return from cache if path still exists
-/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md`
+/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md` (authoritative when active)
+/// 3. Fall back to plan-based discovery (when loop state is absent or inactive)
 ///
-/// Returns `None` if the loop state file doesn't exist yet (early arc init).
-/// Once resolved, the path is cached for the rest of the session.
+/// Returns `None` if no checkpoint can be resolved yet (early arc init).
+/// Once resolved, the path is cached until invalidated. Strategy 2 results
+/// are only cached when loop state is absent — never when loop state is active
+/// but its checkpoint file hasn't appeared yet, to avoid locking onto a stale
+/// prior-run checkpoint.
 fn read_cached_checkpoint(
     plan_path: &Path,
     working_dir: &Path,
     cached_path: &mut Option<PathBuf>,
 ) -> Option<Checkpoint> {
+    /// Try reading a checkpoint and optionally cache the path on success.
+    fn try_read_and_cache(
+        cp_path: &Path,
+        cached_path: &mut Option<PathBuf>,
+        cache_on_success: bool,
+        label: &str,
+    ) -> Option<Checkpoint> {
+        match crate::checkpoint::reader::read_checkpoint(cp_path) {
+            Ok(cp) => {
+                if cache_on_success {
+                    *cached_path = Some(cp_path.to_path_buf());
+                }
+                Some(cp)
+            }
+            Err(e) => {
+                debug!(error = %e, "{label}");
+                None
+            }
+        }
+    }
+
     // If we have a cached path, try reading directly — O(1)
     if let Some(cp_path) = cached_path.as_ref() {
         if cp_path.exists() {
@@ -1665,48 +1690,35 @@ fn read_cached_checkpoint(
         *cached_path = None;
     }
 
-    // Strategy 1: Read from arc-phase-loop.local.md — Rune's single source of truth.
-    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+    // Strategy 1: Read from arc-phase-loop.local.md — authoritative when active.
+    let loop_state_active = if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
         let cp_path = loop_state.resolve_checkpoint_path(working_dir);
-        if !cp_path.exists() {
-            debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
-            // Fall through to Strategy 2
-        } else {
+        if cp_path.exists() {
             info!(
                 checkpoint = %cp_path.display(),
                 arc_id = ?loop_state.arc_id(),
                 iteration = loop_state.iteration,
                 "Resolved checkpoint from arc-phase-loop.local.md"
             );
-            return match crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                Ok(cp) => {
-                    *cached_path = Some(cp_path);
-                    Some(cp)
-                }
-                Err(e) => {
-                    debug!(error = %e, "Could not read checkpoint (transient)");
-                    None
-                }
-            };
+            return try_read_and_cache(&cp_path, cached_path, true, "Could not read checkpoint (transient)");
         }
-    }
+        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet — falling through");
+        true // loop state is active but checkpoint file not yet written
+    } else {
+        false
+    };
 
     // Strategy 2: Fall back to plan-based discovery.
     // This handles cases where arc-phase-loop.local.md is inactive (arc completed)
     // or missing, but a checkpoint.json still exists from a prior/current arc run.
+    //
+    // IMPORTANT: Do NOT cache when loop_state is active — the discovered checkpoint
+    // may be from a prior run, and caching it would prevent the current run's
+    // checkpoint from ever being adopted once it appears.
     match crate::checkpoint::reader::find_checkpoint_for_plan(plan_path, working_dir) {
         Ok(Some(cp_path)) => {
             debug!(path = %cp_path.display(), "Discovered checkpoint via plan-based search");
-            match crate::checkpoint::reader::read_checkpoint(&cp_path) {
-                Ok(cp) => {
-                    *cached_path = Some(cp_path);
-                    Some(cp)
-                }
-                Err(e) => {
-                    debug!(error = %e, "Could not read discovered checkpoint");
-                    None
-                }
-            }
+            try_read_and_cache(&cp_path, cached_path, !loop_state_active, "Could not read discovered checkpoint")
         }
         Ok(None) => {
             debug!("No checkpoint found for plan via discovery");

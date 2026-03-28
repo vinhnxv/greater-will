@@ -254,15 +254,17 @@ impl Checkpoint {
 
     /// Get the current phase name based on `phase_sequence`.
     ///
-    /// Returns `None` only if `phase_sequence` is not set.
-    /// When `phase_sequence` is past the end of PHASE_ORDER (arc completed),
-    /// returns the last phase in the pipeline instead of `None`.
+    /// Returns `None` if `phase_sequence` is not set or is out of valid range.
+    /// When `phase_sequence` equals `PHASE_COUNT` (the completed sentinel),
+    /// returns the last phase in the pipeline. Values beyond `PHASE_COUNT`
+    /// are treated as corrupted data and return `None`.
     pub fn current_phase(&self) -> Option<&'static str> {
         let idx = self.phase_sequence? as usize;
+        let count = crate::checkpoint::phase_order::PHASE_COUNT;
         crate::checkpoint::phase_order::phase_at(idx).or_else(|| {
-            // phase_sequence past end means arc completed — return last phase
-            let count = crate::checkpoint::phase_order::PHASE_COUNT;
-            if count > 0 && idx >= count {
+            // Only the exact completed sentinel (idx == count) returns last phase.
+            // Values beyond that indicate corrupted data — return None.
+            if count > 0 && idx == count {
                 crate::checkpoint::phase_order::phase_at(count - 1)
             } else {
                 None
@@ -621,7 +623,13 @@ mod tests {
         assert_eq!(cp.current_phase(), Some("work"));
 
         cp.phase_sequence = Some(41);
-        assert_eq!(cp.current_phase(), Some("merge")); // past end → last phase
+        assert_eq!(cp.current_phase(), Some("merge")); // completed sentinel → last phase
+
+        cp.phase_sequence = Some(42);
+        assert_eq!(cp.current_phase(), None); // beyond sentinel → corrupted → None
+
+        cp.phase_sequence = Some(u32::MAX);
+        assert_eq!(cp.current_phase(), None); // garbage value → None
 
         cp.phase_sequence = None;
         assert_eq!(cp.current_phase(), None);
