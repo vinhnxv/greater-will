@@ -1,0 +1,448 @@
+//! Helper functions for single-session mode.
+//!
+//! Contains command builders, checkpoint resolution, pipeline completion
+//! detection, and activity snapshot types.
+
+use super::SingleSessionConfig;
+use crate::checkpoint::schema::Checkpoint;
+use crate::session::spawn::shell_escape;
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------
+
+/// Build the `/rune:arc` command string for initial run.
+pub(crate) fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
+    let mut cmd = format!("/rune:arc {}", shell_escape(plan_path));
+
+    if config.resume {
+        cmd.push_str(" --resume");
+    }
+
+    for flag in &config.arc_flags {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(flag));
+    }
+
+    cmd
+}
+
+/// Build the `/rune:arc --resume` command for crash recovery.
+pub(crate) fn build_resume_command(plan_path: &str, config: &SingleSessionConfig) -> String {
+    let mut cmd = format!("/rune:arc {} --resume", shell_escape(plan_path));
+
+    for flag in &config.arc_flags {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(flag));
+    }
+
+    cmd
+}
+
+// ---------------------------------------------------------------------------
+// Restart decision
+// ---------------------------------------------------------------------------
+
+/// Decision for how to restart after a crash.
+pub(crate) enum RestartDecision {
+    /// Run the original command (no --resume).
+    Fresh(String),
+    /// Run with --resume.
+    Resume(String),
+    /// Pipeline already complete — don't restart at all.
+    AlreadyDone,
+}
+
+/// Determine the correct restart command based on checkpoint state.
+///
+/// Phase-aware logic:
+/// - No checkpoint or no progress → fresh start
+/// - Mid-arc with progress → --resume
+/// - Ship phase with PR already merged → AlreadyDone
+/// - Ship phase with PR open → --resume
+pub(crate) fn resolve_restart_command(
+    working_dir: &Path,
+    plan_str: &str,
+    config: &SingleSessionConfig,
+    arc_command: &str,
+    restart_count: u32,
+) -> RestartDecision {
+    use crate::engine::phase_profile::{self, RecoveryStrategy};
+
+    // Read checkpoint path from arc-phase-loop.local.md — no directory scanning.
+    let cp_path = match crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+        Some(loop_state) => {
+            let path = loop_state.resolve_checkpoint_path(working_dir);
+            if path.exists() {
+                path
+            } else {
+                info!(restart = restart_count, "Loop state exists but checkpoint not written yet — fresh start");
+                println!("[gw] Checkpoint not written yet — running fresh (not --resume)");
+                return RestartDecision::Fresh(arc_command.to_string());
+            }
+        }
+        None => {
+            info!(restart = restart_count, "No loop state for plan '{}' — fresh start", plan_str);
+            println!("[gw] No active arc state found — running fresh (not --resume)");
+            return RestartDecision::Fresh(arc_command.to_string());
+        }
+    };
+
+    let checkpoint = match crate::checkpoint::reader::read_checkpoint(&cp_path) {
+        Ok(cp) => {
+            let has_progress = cp.phases.values().any(|p| {
+                p.status == "completed" || p.status == "in_progress" || p.status == "skipped"
+            });
+            if !has_progress {
+                info!(restart = restart_count, "Checkpoint for plan '{}' has no progress — fresh start", plan_str);
+                println!("[gw] Checkpoint exists but no progress — running fresh (not --resume)");
+                return RestartDecision::Fresh(arc_command.to_string());
+            }
+            cp
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to read checkpoint — fresh start");
+            println!("[gw] Failed to read checkpoint — running fresh (not --resume)");
+            return RestartDecision::Fresh(arc_command.to_string());
+        }
+    };
+
+    // Check if already complete
+    if checkpoint.is_complete() {
+        return RestartDecision::AlreadyDone;
+    }
+
+    // Determine current phase and its recovery strategy
+    let current_phase = checkpoint.current_phase().unwrap_or("unknown");
+    let profile = phase_profile::profile_for_phase(current_phase)
+        .unwrap_or_else(phase_profile::default_profile);
+
+    let completed = checkpoint.count_by_status("completed");
+    let skipped = checkpoint.count_by_status("skipped");
+    let total = checkpoint.phases.len();
+
+    match profile.recovery {
+        RecoveryStrategy::FreshStart => {
+            info!(
+                restart = restart_count,
+                phase = current_phase,
+                "Recovery strategy: fresh start for {:?} phase",
+                profile.category,
+            );
+            println!("[gw] Phase '{}' recovery: fresh start", current_phase);
+            RestartDecision::Fresh(arc_command.to_string())
+        }
+        RecoveryStrategy::Resume => {
+            info!(
+                restart = restart_count,
+                phase = current_phase,
+                progress = format!("{}/{}", completed + skipped, total),
+                "Recovery strategy: --resume from {:?} phase",
+                profile.category,
+            );
+            println!(
+                "[gw] Phase '{}' ({}/{} done) — resuming with --resume",
+                current_phase, completed + skipped, total,
+            );
+            RestartDecision::Resume(build_resume_command(plan_str, config))
+        }
+        RecoveryStrategy::ResumeCheckPR => {
+            // Ship/merge phase — check if PR already exists and is merged
+            if let Some(pr_url) = &checkpoint.pr_url {
+                info!(
+                    restart = restart_count,
+                    phase = current_phase,
+                    pr_url = %pr_url,
+                    "Ship phase with existing PR — resuming to finish merge"
+                );
+                println!("[gw] Phase '{}' with PR {} — resuming", current_phase, pr_url);
+            } else {
+                info!(
+                    restart = restart_count,
+                    phase = current_phase,
+                    "Ship phase without PR — resuming to create PR"
+                );
+            }
+            RestartDecision::Resume(build_resume_command(plan_str, config))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline completion detection
+// ---------------------------------------------------------------------------
+
+/// Check pane output for signals that the arc pipeline has completed.
+///
+/// Looks for common arc completion patterns in the visible pane content.
+pub(crate) fn is_pipeline_complete(pane_content: &str) -> bool {
+    // Check last ~20 lines for completion signals
+    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
+    let tail = last_lines.join("\n").to_lowercase();
+
+    // Arc completion signals
+    tail.contains("arc completed")
+        || tail.contains("all phases complete")
+        || tail.contains("pipeline completed")
+        || tail.contains("merge completed")
+        || tail.contains("arc run finished")
+        // Rune-specific completion markers
+        || tail.contains("the tarnished rests")
+        || tail.contains("arc result: success")
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint resolution
+// ---------------------------------------------------------------------------
+
+/// Read checkpoint with three-strategy resolution.
+///
+/// Resolution order:
+/// 1. Return from cache if path still exists
+/// 2. Read `checkpoint_path` from `.rune/arc-phase-loop.local.md` (authoritative when active)
+/// 3. Fall back to plan-based discovery (when loop state is absent or inactive)
+///
+/// Returns `None` if no checkpoint can be resolved yet (early arc init).
+/// Once resolved, the path is cached until invalidated.
+/// Only reads from arc-phase-loop.local.md — no directory scanning.
+pub(crate) fn read_cached_checkpoint(
+    working_dir: &Path,
+    cached_path: &mut Option<PathBuf>,
+) -> Option<Checkpoint> {
+    /// Try reading a checkpoint and optionally cache the path on success.
+    fn try_read_and_cache(
+        cp_path: &Path,
+        cached_path: &mut Option<PathBuf>,
+        cache_on_success: bool,
+        label: &str,
+    ) -> Option<Checkpoint> {
+        match crate::checkpoint::reader::read_checkpoint(cp_path) {
+            Ok(cp) => {
+                if cache_on_success {
+                    *cached_path = Some(cp_path.to_path_buf());
+                }
+                Some(cp)
+            }
+            Err(e) => {
+                debug!(error = %e, "{label}");
+                None
+            }
+        }
+    }
+
+    // If we have a cached path, try reading directly — O(1)
+    if let Some(cp_path) = cached_path.as_ref() {
+        if cp_path.exists() {
+            return match crate::checkpoint::reader::read_checkpoint(cp_path) {
+                Ok(cp) => Some(cp),
+                Err(e) => {
+                    debug!(error = %e, "Could not read cached checkpoint (transient)");
+                    None
+                }
+            };
+        }
+        // Cached path no longer exists — invalidate and re-discover
+        debug!("Cached checkpoint path disappeared, re-discovering");
+        *cached_path = None;
+    }
+
+    // Only source: arc-phase-loop.local.md — no directory scanning.
+    // All checkpoint reads go through arc-phase-loop.local.md — no directory scanning.
+    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+        let cp_path = loop_state.resolve_checkpoint_path(working_dir);
+        if cp_path.exists() {
+            info!(
+                checkpoint = %cp_path.display(),
+                arc_id = ?loop_state.arc_id(),
+                iteration = loop_state.iteration,
+                "Resolved checkpoint from arc-phase-loop.local.md"
+            );
+            return try_read_and_cache(&cp_path, cached_path, true, "Could not read checkpoint (transient)");
+        }
+        debug!(path = %cp_path.display(), "Loop state checkpoint_path doesn't exist yet");
+    }
+
+    None
+}
+
+/// Find artifact dir using the cached checkpoint path (avoids re-scanning).
+pub(crate) fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working_dir: &Path) -> Option<PathBuf> {
+    let cp_path = cached_cp_path.as_ref()?;
+    // checkpoint.json is at .rune/arc/arc-{id}/checkpoint.json
+    // artifact dir is at   tmp/arc/arc-{id}/
+    let arc_id = cp_path.parent()?.file_name()?;
+    let artifact_dir = working_dir.join("tmp").join("arc").join(arc_id);
+    if artifact_dir.is_dir() {
+        Some(artifact_dir)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Activity snapshots
+// ---------------------------------------------------------------------------
+
+/// Swarm activity snapshot — number of active Claude teammates.
+///
+/// Claude Code spawns `tmux -L claude-swarm-{lead_pid}` for agent teams.
+/// Each pane runs a teammate. If teammates are running, the system is working
+/// even if the main screen is stalled (team lead waiting for agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SwarmSnapshot {
+    /// Number of tmux panes in the swarm server.
+    pub pane_count: u32,
+    /// Number of panes with a live Claude child process.
+    pub active_count: u32,
+}
+
+/// Check swarm activity for a Claude Code process.
+///
+/// Looks for `claude-swarm-{pid}` tmux server and counts active panes.
+/// Returns `None` if no swarm server exists (not running agent teams).
+///
+/// Lightweight: one `tmux list-panes` call + one `ps` per pane.
+pub(crate) fn check_swarm_activity(claude_pid: u32) -> Option<SwarmSnapshot> {
+    use std::process::Command;
+
+    let socket_name = format!("claude-swarm-{}", claude_pid);
+
+    // Check if the swarm server exists by listing panes
+    let output = Command::new("tmux")
+        .args(["-L", &socket_name, "list-panes", "-a", "-F", "#{pane_pid}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None; // No swarm server for this PID
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane_pids: Vec<u32> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    if pane_pids.is_empty() {
+        return None;
+    }
+
+    // Count panes with active Claude child processes
+    // Each pane runs a shell → claude child. Check if claude child is alive.
+    let mut active_count = 0u32;
+    for &shell_pid in &pane_pids {
+        // Check if shell has a claude child via pgrep
+        let child_check = Command::new("pgrep")
+            .args(["-P", &shell_pid.to_string(), "-x", "claude"])
+            .output();
+        if let Ok(out) = child_check {
+            if out.status.success() {
+                active_count += 1;
+            }
+        }
+    }
+
+    Some(SwarmSnapshot {
+        pane_count: pane_pids.len() as u32,
+        active_count,
+    })
+}
+
+/// Lightweight snapshot of an artifact directory — file count and total size.
+///
+/// Used as an activity signal: if file_count or total_bytes changes between
+/// poll cycles, agents are actively writing output (review files, TOME,
+/// worker reports, etc.) even if the screen is stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArtifactSnapshot {
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
+/// Scan a directory recursively for file count and total size.
+///
+/// Lightweight: only calls `metadata()` per file, never reads content.
+/// Returns `None` if the directory doesn't exist (normal for early phases).
+pub(crate) fn scan_artifact_dir(dir: &Path) -> Option<ArtifactSnapshot> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    // Use a stack-based walk to avoid recursion depth issues
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                dirs_to_visit.push(entry.path());
+            } else if ft.is_file() {
+                file_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    Some(ArtifactSnapshot {
+        file_count,
+        total_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_arc_command() {
+        let config = SingleSessionConfig::new("/tmp");
+        let cmd = build_arc_command("plans/test.md", &config);
+        assert_eq!(cmd, "/rune:arc 'plans/test.md'");
+    }
+
+    #[test]
+    fn test_build_arc_command_with_resume() {
+        let config = SingleSessionConfig::new("/tmp").with_resume();
+        let cmd = build_arc_command("plans/test.md", &config);
+        assert_eq!(cmd, "/rune:arc 'plans/test.md' --resume");
+    }
+
+    #[test]
+    fn test_build_resume_command() {
+        let config = SingleSessionConfig::new("/tmp");
+        let cmd = build_resume_command("plans/test.md", &config);
+        assert_eq!(cmd, "/rune:arc 'plans/test.md' --resume");
+    }
+
+    #[test]
+    fn test_build_arc_command_escapes_special_chars() {
+        let config = SingleSessionConfig::new("/tmp");
+        let cmd = build_arc_command("plans/test; rm -rf /.md", &config);
+        assert_eq!(cmd, "/rune:arc 'plans/test; rm -rf /.md'");
+    }
+
+    #[test]
+    fn test_is_pipeline_complete() {
+        assert!(is_pipeline_complete("some output\narc completed\n❯"));
+        assert!(is_pipeline_complete("The Tarnished rests after a long journey"));
+        assert!(!is_pipeline_complete("still working on phase 5..."));
+        assert!(!is_pipeline_complete(""));
+    }
+}
