@@ -39,13 +39,13 @@ pub fn execute(checkpoint: PathBuf, resume: bool, force: bool) -> Result<()> {
     }
 
     // --- Resume path ---
-    use crate::checkpoint::reader::{next_pending_phase, validate_before_resume};
+    use crate::checkpoint::reader::{next_actionable_phase, validate_before_resume};
 
-    let next_phase = next_pending_phase(&cp)
+    let next_phase = next_actionable_phase(&cp)
         .ok_or_else(|| eyre::eyre!("All phases are completed or skipped. Nothing to resume."))?;
 
     println!();
-    println!("Next pending phase: {}", next_phase);
+    println!("Next actionable phase: {}", next_phase);
 
     if !force {
         let arc_dir = checkpoint.parent()

@@ -288,7 +288,7 @@ impl PhaseGroupExecutor {
 
         // Check skip condition
         if let Some(skip_if) = &group.skip_if {
-            if self.should_skip_group(skip_if, checkpoint_path)? {
+            if self.should_skip_group(skip_if, checkpoint_path, &group.phases)? {
                 info!(group = %group.name, reason = %skip_if, "Skipping group");
                 return Ok(PhaseGroupResult {
                     group_name: group.name.clone(),
@@ -730,38 +730,70 @@ impl PhaseGroupExecutor {
     }
 
     /// Check if a group should be skipped based on skip_if condition.
-    fn should_skip_group(&self, skip_if: &str, checkpoint_path: &Path) -> Result<bool> {
-        // For now, implement simple condition checking
-        // Could be extended to support more complex expressions
-
+    ///
+    /// Supports three skip mechanisms:
+    /// 1. Named conditions: "no_work_needed", "design_not_needed"
+    /// 2. All-phases-done: if every phase in the group is already completed,
+    ///    skipped, or in skip_map, the group is pointless to run
+    /// 3. Unknown conditions: log a warning, then fall through to all-phases check
+    fn should_skip_group(
+        &self,
+        skip_if: &str,
+        checkpoint_path: &Path,
+        group_phases: &[String],
+    ) -> Result<bool> {
         let checkpoint = match read_checkpoint(checkpoint_path) {
             Ok(cp) => cp,
             Err(_) => return Ok(false),
         };
 
-        // Check common conditions
+        // Check named conditions first
         match skip_if {
             "no_work_needed" => {
-                // Skip if work phase is marked as skipped
-                Ok(checkpoint
+                if checkpoint
                     .phases
                     .get("work")
                     .map(|s| s.status == "skipped")
-                    .unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    return Ok(true);
+                }
             }
             "design_not_needed" => {
-                Ok(checkpoint
+                if checkpoint
                     .phases
                     .get("design_extraction")
                     .map(|s| s.status == "skipped")
-                    .unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    return Ok(true);
+                }
+            }
+            "all_phases_skipped" => {
+                // Explicit condition — fall through to all-phases check below
             }
             _ => {
-                // Unknown condition, don't skip
-                warn!(condition = %skip_if, "Unknown skip_if condition");
-                Ok(false)
+                warn!(condition = %skip_if, "Unknown skip_if condition, checking all-phases fallback");
             }
         }
+
+        // Fallback: if ALL phases in this group are done or will-be-skipped,
+        // skip the entire group. Consults both phase status AND skip_map.
+        if !group_phases.is_empty() {
+            let all_done_or_will_skip = group_phases.iter().all(|phase| {
+                checkpoint.is_phase_done_or_will_skip(phase)
+            });
+
+            if all_done_or_will_skip {
+                info!(
+                    group_phases = ?group_phases,
+                    "All phases in group are completed/skipped/in skip_map — skipping group"
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Check if a group is complete in the checkpoint.

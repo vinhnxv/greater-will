@@ -113,7 +113,7 @@ fn run_single(
 
     // --- Resume validation: read checkpoint from loop state and validate ---
     if resume && plans.len() == 1 {
-        use crate::checkpoint::reader::{validate_before_resume, read_checkpoint, next_pending_phase};
+        use crate::checkpoint::reader::{validate_before_resume, read_checkpoint, next_actionable_phase};
 
         let loop_state = crate::monitor::loop_state::read_arc_loop_state(cwd);
         match loop_state {
@@ -126,7 +126,7 @@ fn run_single(
                     );
                 }
                 let cp = read_checkpoint(&cp_path)?;
-                match next_pending_phase(&cp) {
+                match next_actionable_phase(&cp) {
                     Some(next_phase) => {
                         println!("Found checkpoint: {}", cp_path.display());
                         println!("Arc: {} | Next phase: {}", cp.id, next_phase);

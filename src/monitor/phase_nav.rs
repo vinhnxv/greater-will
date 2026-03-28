@@ -184,18 +184,10 @@ fn find_prev_completed(checkpoint: &Checkpoint, before_idx: usize) -> Option<Pha
     })
 }
 
-/// Find the next pending phase scanning forward from `start_idx`.
+/// Find the next actionable pending phase scanning forward from `start_idx`.
+/// Skips phases that are in skip_map (will be auto-skipped by arc).
 fn find_next_pending(checkpoint: &Checkpoint, start_idx: usize) -> Option<&'static str> {
-    use crate::checkpoint::phase_order::PHASE_ORDER;
-
-    PHASE_ORDER.iter().skip(start_idx).find_map(|&p| {
-        let phase = checkpoint.phases.get(p)?;
-        if phase.status == "pending" || phase.status.is_empty() {
-            Some(p)
-        } else {
-            None
-        }
-    })
+    checkpoint.next_actionable_phase_after(start_idx)
 }
 
 /// Compute duration of a completed phase from started_at and completed_at.
@@ -397,5 +389,65 @@ mod tests {
         let nav = compute_phase_navigation(&cp);
 
         assert_eq!(nav.prev.as_ref().unwrap().duration_secs, Some(300)); // 5 min
+    }
+
+    #[test]
+    fn test_skip_map_next_phase() {
+        // forge completed, forge_qa pending but in skip_map, plan_review pending
+        // next should be plan_review, not forge_qa
+        let mut phases = HashMap::new();
+        phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:00:00Z".into()),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        phases.insert("forge_qa".into(), PhaseStatus::pending());
+        phases.insert("plan_review".into(), PhaseStatus {
+            status: "in_progress".into(),
+            started_at: Some("2026-03-20T00:06:00Z".into()),
+            ..Default::default()
+        });
+        phases.insert("plan_refine".into(), PhaseStatus::pending());
+        phases.insert("verification".into(), PhaseStatus::pending());
+
+        let mut cp = make_checkpoint(phases);
+        let mut skip_map = HashMap::new();
+        skip_map.insert("forge_qa".into(), "auto_skipped".into());
+        skip_map.insert("verification".into(), "codex_disabled".into());
+        cp.skip_map = Some(skip_map);
+
+        let nav = compute_phase_navigation(&cp);
+
+        assert_eq!(nav.current.as_ref().unwrap().name, "plan_review");
+        // next should skip verification (in skip_map) → plan_refine
+        assert_eq!(nav.next, Some("plan_refine"));
+    }
+
+    #[test]
+    fn test_transition_skip_map_aware() {
+        // forge completed, forge_qa + semantic_verification in skip_map,
+        // plan_review pending, nothing in_progress
+        let mut phases = HashMap::new();
+        phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:00:00Z".into()),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        phases.insert("forge_qa".into(), PhaseStatus::pending());
+        phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        let mut cp = make_checkpoint(phases);
+        let mut skip_map = HashMap::new();
+        skip_map.insert("forge_qa".into(), "auto_skipped".into());
+        cp.skip_map = Some(skip_map);
+
+        let nav = compute_phase_navigation(&cp);
+
+        assert!(nav.is_transitioning());
+        // Should transition to plan_review, NOT forge_qa
+        assert_eq!(nav.next, Some("plan_review"));
+        assert_eq!(nav.effective_phase_name(), Some("plan_review"));
     }
 }

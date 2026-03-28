@@ -356,6 +356,11 @@ impl Checkpoint {
             return PhasePosition::Unknown;
         }
 
+        // 0. If all phases in the map are done, we're done
+        if self.is_complete() {
+            return PhasePosition::AllDone;
+        }
+
         // 1. Look for an in_progress phase (scan in canonical order)
         for &phase_name in PHASE_ORDER {
             if let Some(ps) = self.phases.get(phase_name) {
@@ -379,18 +384,14 @@ impl Checkpoint {
             }
         }
 
-        // Find first pending after last completed
+        // Find first actionable pending after last completed (skip_map-aware)
         let search_start = last_completed.as_ref()
             .and_then(|(name, _)| PHASE_ORDER.iter().position(|&p| p == *name))
             .map_or(0, |i| i + 1);
 
-        let next_pending = PHASE_ORDER.iter().skip(search_start).find(|&&p| {
-            self.phases
-                .get(p)
-                .map_or(false, |ps| ps.status == "pending" || ps.status.is_empty())
-        }).copied();
+        let next_actionable = self.next_actionable_phase_after(search_start);
 
-        match (last_completed, next_pending) {
+        match (last_completed, next_actionable) {
             (Some((last, completed_at)), Some(next)) => PhasePosition::Transitioning {
                 last_completed: last,
                 last_completed_at: completed_at,
@@ -409,8 +410,8 @@ impl Checkpoint {
                     }
                 }
             }
-            (None, Some(first)) => PhasePosition::WaitingToStart {
-                first_pending: first,
+            (None, Some(first_actionable)) => PhasePosition::WaitingToStart {
+                first_pending: first_actionable,
             },
             (None, None) => PhasePosition::Unknown,
         }
@@ -447,6 +448,63 @@ impl Checkpoint {
             && self.phases.values().all(|p| {
                 p.status == "completed" || p.status == "skipped"
             })
+    }
+
+    /// Check if a phase is in the skip_map (will be auto-skipped by Rune).
+    ///
+    /// A phase in skip_map is "pending" in the phases map but will be
+    /// immediately skipped when arc reaches it — not actionable.
+    pub fn is_in_skip_map(&self, phase_name: &str) -> bool {
+        self.skip_map
+            .as_ref()
+            .map_or(false, |sm| sm.contains_key(phase_name))
+    }
+
+    /// Check if a phase should be considered "done" (completed, skipped, or will-be-skipped).
+    ///
+    /// Returns true for phases that are completed, skipped, or in skip_map.
+    pub fn is_phase_done_or_will_skip(&self, phase_name: &str) -> bool {
+        if self.is_in_skip_map(phase_name) {
+            return true;
+        }
+        self.phases
+            .get(phase_name)
+            .map_or(false, |p| p.status == "completed" || p.status == "skipped")
+    }
+
+    /// Check if a phase is actionable (pending, in the map, and NOT in skip_map).
+    ///
+    /// A phase is actionable if:
+    /// - It exists in the `phases` map (Rune populated it)
+    /// - Its status is "pending" or empty
+    /// - It's NOT in `skip_map` (won't be auto-skipped)
+    ///
+    /// Phases not in the map are NOT considered actionable — in production,
+    /// Rune populates all 41 phases. Missing phases indicate incomplete init.
+    pub fn is_phase_actionable(&self, phase_name: &str) -> bool {
+        if self.is_in_skip_map(phase_name) {
+            return false;
+        }
+        self.phases
+            .get(phase_name)
+            .map_or(false, |p| p.status == "pending" || p.status.is_empty())
+    }
+
+    /// Find the next actionable phase — first pending phase NOT in skip_map.
+    ///
+    /// Unlike `next_pending_phase()` in reader.rs, this skips phases that
+    /// are in skip_map (will be auto-skipped by arc).
+    pub fn next_actionable_phase(&self) -> Option<&'static str> {
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+
+        PHASE_ORDER.iter().find(|&&p| self.is_phase_actionable(p)).copied()
+    }
+
+    /// Find the next actionable phase after a given index in PHASE_ORDER.
+    pub fn next_actionable_phase_after(&self, start_idx: usize) -> Option<&'static str> {
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+
+        PHASE_ORDER.iter().skip(start_idx).find(|&&p| self.is_phase_actionable(p)).copied()
     }
 
     /// Count phases by status.
@@ -967,5 +1025,116 @@ mod tests {
 
         let cp: Checkpoint = serde_json::from_str(json).unwrap();
         assert_eq!(cp.owner_pid, "41111");
+    }
+
+    // ── skip_map awareness tests ─────────────────────────
+
+    #[test]
+    fn test_is_in_skip_map() {
+        let mut cp = Checkpoint::default();
+        let mut skip_map = HashMap::new();
+        skip_map.insert("semantic_verification".into(), "codex_disabled".into());
+        skip_map.insert("design_extraction".into(), "no_figma_urls".into());
+        cp.skip_map = Some(skip_map);
+
+        assert!(cp.is_in_skip_map("semantic_verification"));
+        assert!(cp.is_in_skip_map("design_extraction"));
+        assert!(!cp.is_in_skip_map("forge"));
+        assert!(!cp.is_in_skip_map("work"));
+    }
+
+    #[test]
+    fn test_is_in_skip_map_none() {
+        let cp = Checkpoint::default();
+        assert!(!cp.is_in_skip_map("anything"));
+    }
+
+    #[test]
+    fn test_is_phase_actionable() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus::pending());
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("semantic_verification".into(), PhaseStatus::pending());
+
+        let mut skip_map = HashMap::new();
+        skip_map.insert("semantic_verification".into(), "codex_disabled".into());
+        cp.skip_map = Some(skip_map);
+
+        assert!(cp.is_phase_actionable("forge")); // pending, not in skip_map
+        assert!(!cp.is_phase_actionable("forge_qa")); // completed
+        assert!(!cp.is_phase_actionable("semantic_verification")); // in skip_map
+    }
+
+    #[test]
+    fn test_next_actionable_phase() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus::pending());
+        cp.phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        // Without skip_map → forge_qa is next
+        assert_eq!(cp.next_actionable_phase(), Some("forge_qa"));
+
+        // With skip_map on forge_qa → plan_review is next
+        let mut skip_map = HashMap::new();
+        skip_map.insert("forge_qa".into(), "auto_skipped".into());
+        cp.skip_map = Some(skip_map);
+        assert_eq!(cp.next_actionable_phase(), Some("plan_review"));
+    }
+
+    #[test]
+    fn test_infer_phase_skip_map_aware() {
+        // Real-world scenario: forge completed, forge_qa + semantic_verification in skip_map,
+        // plan_review pending → should transition to plan_review, NOT forge_qa
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus::pending());
+        cp.phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        let mut skip_map = HashMap::new();
+        skip_map.insert("forge_qa".into(), "auto_skipped".into());
+        cp.skip_map = Some(skip_map);
+
+        match cp.infer_phase_position() {
+            PhasePosition::Transitioning { last_completed, next_pending, .. } => {
+                assert_eq!(last_completed, "forge");
+                assert_eq!(next_pending, "plan_review"); // NOT forge_qa
+            }
+            other => panic!("Expected Transitioning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_is_phase_done_or_will_skip() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "skipped".into(),
+            ..Default::default()
+        });
+        cp.phases.insert("semantic_verification".into(), PhaseStatus::pending());
+        cp.phases.insert("work".into(), PhaseStatus::pending());
+
+        let mut skip_map = HashMap::new();
+        skip_map.insert("semantic_verification".into(), "codex_disabled".into());
+        cp.skip_map = Some(skip_map);
+
+        assert!(cp.is_phase_done_or_will_skip("forge")); // completed
+        assert!(cp.is_phase_done_or_will_skip("forge_qa")); // skipped
+        assert!(cp.is_phase_done_or_will_skip("semantic_verification")); // in skip_map
+        assert!(!cp.is_phase_done_or_will_skip("work")); // pending, not in skip_map
     }
 }

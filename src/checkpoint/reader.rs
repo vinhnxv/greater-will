@@ -438,6 +438,10 @@ pub fn checkpoint_summary(checkpoint: &Checkpoint) -> String {
 ///
 /// Returns the name of the next phase that has status "pending",
 /// or None if all phases are done.
+///
+/// **Note**: This returns any pending phase, even if it's in skip_map.
+/// For the next phase that will actually run, use
+/// [`Checkpoint::next_actionable_phase()`] instead.
 pub fn next_pending_phase(checkpoint: &Checkpoint) -> Option<String> {
     for &phase in PHASE_ORDER {
         if let Some(status) = checkpoint.phases.get(phase) {
@@ -450,6 +454,15 @@ pub fn next_pending_phase(checkpoint: &Checkpoint) -> Option<String> {
         }
     }
     None
+}
+
+/// Find the next actionable phase in the checkpoint.
+///
+/// Like `next_pending_phase` but skips phases that are in `skip_map`
+/// (will be auto-skipped by arc). Returns the next phase that will
+/// actually execute.
+pub fn next_actionable_phase(checkpoint: &Checkpoint) -> Option<String> {
+    checkpoint.next_actionable_phase().map(|s| s.to_string())
 }
 
 #[cfg(test)]
