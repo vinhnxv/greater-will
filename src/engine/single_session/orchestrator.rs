@@ -256,6 +256,15 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                         session_name: session_name.clone(),
                     });
                 }
+                SessionOutcome::Failed { phase, reason } => {
+                    return Ok(PipelineResult {
+                        success: false,
+                        duration: start.elapsed(),
+                        crash_restarts: crash_detector.total_restarts(),
+                        message: format!("Phase '{}' failed in adopted session: {}", phase, reason),
+                        session_name: session_name.clone(),
+                    });
+                }
                 // Retryable errors — record restart and fall through to spawn a fresh session.
                 //
                 // RETRY SYSTEM INTERACTION: Two independent retry limiters operate here:
@@ -349,6 +358,18 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     duration: start.elapsed(),
                     crash_restarts: crash_detector.total_restarts(),
                     message: "Pipeline completed successfully".to_string(),
+                    session_name,
+                });
+            }
+            SessionOutcome::Failed { phase, reason } => {
+                // Phase failure (not a crash). Log and return — don't feed into
+                // the crash loop detector since this is a Rune-reported failure,
+                // not a process death.
+                return Ok(PipelineResult {
+                    success: false,
+                    duration: start.elapsed(),
+                    crash_restarts: crash_detector.total_restarts(),
+                    message: format!("Phase '{}' failed: {}", phase, reason),
                     session_name,
                 });
             }
@@ -495,7 +516,9 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
                 // Persist crash history before sleeping — if gw is killed during
                 // backoff, the next gw run will inherit the crash count.
-                crash_detector.persist(&config.working_dir);
+                if let Err(e) = crash_detector.persist(&config.working_dir) {
+                    tracing::warn!(error = %e, "Failed to persist crash history (best-effort)");
+                }
 
                 std::thread::sleep(backoff);
             }

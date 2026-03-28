@@ -114,8 +114,11 @@ pub(crate) fn resolve_restart_command(
         return RestartDecision::AlreadyDone;
     }
 
-    // Determine current phase and its recovery strategy
-    let current_phase = checkpoint.current_phase().unwrap_or("unknown");
+    // Determine current phase and its recovery strategy.
+    // Prefer inferred phase (scans actual statuses) over current_phase()
+    // which relies on often-stale phase_sequence index.
+    let current_phase = checkpoint.inferred_phase_name()
+        .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
     let profile = phase_profile::profile_for_phase(current_phase)
         .unwrap_or_else(phase_profile::default_profile);
 

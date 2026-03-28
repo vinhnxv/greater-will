@@ -755,21 +755,16 @@ fn print_brief_context(session_id: &str, source: &HookSource) -> Result<()> {
 
 /// Read hook input from stdin (Claude Code sends JSON).
 fn read_hook_input() -> Option<HookInput> {
-    let input;
-
     // Read with a size limit to avoid hanging on empty stdin
     let stdin = std::io::stdin();
     let mut handle = stdin.lock();
 
     // Try to read up to 4KB
     let mut buf = vec![0u8; 4096];
-    match handle.read(&mut buf) {
-        Ok(0) => return None,
-        Ok(n) => {
-            input = String::from_utf8_lossy(&buf[..n]).to_string();
-        }
-        Err(_) => return None,
-    }
+    let input = match handle.read(&mut buf) {
+        Ok(0) | Err(_) => return None,
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
+    };
 
     // Parse JSON — be lenient (may have extra whitespace/newlines)
     let trimmed = input.trim();
@@ -850,7 +845,7 @@ fn detect_arc_checkpoint() -> Option<ArcCheckpointInfo> {
     let current_phase = PHASE_ORDER
         .iter()
         .find(|&phase_name| {
-            phases.get(*phase_name).map_or(false, |v| {
+            phases.get(*phase_name).is_some_and(|v| {
                 let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 status != "completed" && status != "skipped"
             })

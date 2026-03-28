@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Retry logic, error classification, and evidence-based error detection.
 //!
 //! This module implements the retry system that handles failures during
@@ -533,6 +532,7 @@ pub enum RetryDecision {
 ///
 /// Defines how backoff duration changes with each attempt.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Public API reserved for future retry configuration
 pub enum BackoffStrategy {
     /// Fixed duration, same for every attempt.
     Fixed(Duration),
@@ -548,6 +548,7 @@ pub enum BackoffStrategy {
     Custom(Vec<Duration>),
 }
 
+#[allow(dead_code)]
 impl BackoffStrategy {
     /// Get the backoff duration for a specific attempt.
     pub fn duration_for_attempt(&self, attempt: u32) -> Duration {
@@ -605,15 +606,16 @@ impl RetryState {
     pub fn record_failure(&mut self) {
         let now = std::time::Instant::now();
 
-        // Check for rapid failure (3+ retries within 30 seconds)
+        self.attempts += 1;
+        self.last_failure = Some(now);
+
+        // Check for rapid failure (3+ attempts within 30 seconds).
+        // Checked AFTER increment so `attempts` reflects the current failure.
         if let Some(last) = self.last_failure {
             if now.duration_since(last) < Duration::from_secs(30) && self.attempts >= 3 {
                 self.is_rapid_failure = true;
             }
         }
-
-        self.attempts += 1;
-        self.last_failure = Some(now);
     }
 
     /// Check if this retry sequence has exceeded max retries.
@@ -650,6 +652,7 @@ impl Default for RetryCoordinator {
     }
 }
 
+#[allow(dead_code)] // Public API — query methods reserved for future dashboards
 impl RetryCoordinator {
     /// Create a new retry coordinator.
     pub fn new() -> Self {

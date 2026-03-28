@@ -64,7 +64,7 @@ const TMP_SUFFIX: &str = ".tmp";
 /// ```
 pub fn write_checkpoint<P: AsRef<Path>>(checkpoint: &Checkpoint, path: P) -> Result<()> {
     let path = path.as_ref();
-    write_checkpoint_with_tmp(checkpoint, path, &format!("{}{}", path.display(), TMP_SUFFIX))
+    write_checkpoint_with_tmp(checkpoint, path, format!("{}{}", path.display(), TMP_SUFFIX))
 }
 
 /// Write a checkpoint atomically with a custom temp file path.

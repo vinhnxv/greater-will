@@ -364,7 +364,7 @@ pub fn get_sessions_status() -> Result<Vec<(String, bool)>> {
         .iter()
         .map(|s| {
             let has_process = get_session_pid(&s.name)
-                .map(|pid| crate::cleanup::process::is_pid_alive(pid))
+                .map(crate::cleanup::process::is_pid_alive)
                 .unwrap_or(false);
             (s.name.clone(), has_process)
         })

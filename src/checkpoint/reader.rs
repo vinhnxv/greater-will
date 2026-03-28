@@ -363,7 +363,7 @@ pub fn mark_phases_completed_before(checkpoint: &mut Checkpoint, target_phase: &
         let is_skipped = checkpoint
             .skip_map
             .as_ref()
-            .map_or(false, |m| m.contains_key(phase_name));
+            .is_some_and(|m| m.contains_key(phase_name));
 
         if is_skipped {
             status.status = "skipped".into();

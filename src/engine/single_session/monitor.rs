@@ -25,6 +25,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Minimum session age (seconds) before we treat a vanished session as
+/// "likely completed" rather than "crashed".  Used in multiple check branches.
+const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
+
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
 pub(crate) fn run_session_attempt(
     session_name: &str,
@@ -274,7 +278,10 @@ pub(crate) fn monitor_session(
                         info!("Session ended, checkpoint confirms completion");
                         return Ok(SessionOutcome::Completed);
                     }
-                    let current = checkpoint.current_phase().unwrap_or("unknown");
+                    // Use inferred phase (scans actual statuses) instead of
+                    // current_phase() which relies on often-stale phase_sequence.
+                    let current = checkpoint.inferred_phase_name()
+                        .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
                     warn!(current_phase = current, "Session ended with incomplete checkpoint");
                     return Ok(SessionOutcome::Crashed {
                         reason: format!(
@@ -286,7 +293,6 @@ pub(crate) fn monitor_session(
                 // No checkpoint found. Use session age to disambiguate:
                 // Long-running sessions (>5 min) likely completed and Rune cleaned up.
                 // Short sessions crashed before creating a checkpoint.
-                const MIN_COMPLETION_AGE_SECS: u64 = 300;
                 if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
                     warn!(
                         age_secs = session_age.as_secs(),
@@ -384,7 +390,7 @@ pub(crate) fn monitor_session(
                 std::hash::Hash::hash(&nav.is_transitioning(), &mut cp_hasher);
                 let cp_hash = std::hash::Hasher::finish(&cp_hasher);
 
-                if last_checkpoint_hash.map_or(true, |h| h != cp_hash) {
+                if last_checkpoint_hash != Some(cp_hash) {
                     last_checkpoint_activity = Instant::now();
                 }
                 last_checkpoint_hash = Some(cp_hash);
@@ -590,7 +596,8 @@ pub(crate) fn monitor_session(
                             let _ = kill_session(session_name);
                             return Ok(SessionOutcome::Completed);
                         }
-                        let current = checkpoint.current_phase().unwrap_or("unknown");
+                        let current = checkpoint.inferred_phase_name()
+                            .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
                         warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
                         let reason = format!(
                             "arc-phase-loop.local.md deleted during phase '{}' after {}s",
@@ -603,7 +610,6 @@ pub(crate) fn monitor_session(
                     // No checkpoint found. Disambiguate using session age:
                     // - Long-running (>5 min): Rune ran and cleaned up after itself → Completed
                     // - Short-running (<5 min): Rune failed early before creating checkpoint → Crashed
-                    const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
                     if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
                         info!(
                             age_secs = session_age.as_secs(),
@@ -686,7 +692,7 @@ pub(crate) fn monitor_session(
             last_artifact_scan = Instant::now();
             if let Some(artifact_dir) = find_artifact_dir_cached(&cached_checkpoint_path, &config.working_dir) {
                 if let Some(snapshot) = scan_artifact_dir(&artifact_dir) {
-                    if last_artifact_snapshot.map_or(true, |prev| prev != snapshot) {
+                    if last_artifact_snapshot != Some(snapshot) {
                         debug!(
                             files = snapshot.file_count,
                             bytes = snapshot.total_bytes,
@@ -734,7 +740,7 @@ pub(crate) fn monitor_session(
 
         // Check if swarm teammates are running (lightweight: one tmux call)
         let swarm = check_swarm_activity(pid);
-        let swarm_active = swarm.map_or(false, |s| s.active_count > 0);
+        let swarm_active = swarm.is_some_and(|s| s.active_count > 0);
 
         let evidence = ErrorEvidence {
             keyword_match,
@@ -910,7 +916,8 @@ pub(crate) fn monitor_session(
                     return Ok(SessionOutcome::Completed);
                 }
                 // Checkpoint exists but not complete — this is a crash mid-pipeline
-                let current = checkpoint.current_phase().unwrap_or("unknown");
+                let current = checkpoint.inferred_phase_name()
+                    .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
                 warn!(current_phase = current, "Process died with incomplete checkpoint");
                 return Ok(SessionOutcome::Crashed {
                     reason: format!(
@@ -923,7 +930,6 @@ pub(crate) fn monitor_session(
             // No checkpoint found. Use session age to disambiguate:
             // Long-running sessions (>5 min) likely completed and Rune cleaned up.
             // Short sessions crashed before creating a checkpoint.
-            const MIN_COMPLETION_AGE_SECS: u64 = 300;
             if session_age.as_secs() >= MIN_COMPLETION_AGE_SECS {
                 info!(
                     age_secs = session_age.as_secs(),

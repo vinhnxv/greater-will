@@ -458,6 +458,20 @@ impl Checkpoint {
         self.infer_phase_position().effective_phase()
     }
 
+    /// Get the effective phase sequence index by scanning actual phase statuses.
+    ///
+    /// Like `inferred_phase_name()`, this ignores the often-stale `phase_sequence`
+    /// field and instead computes the index from the inferred phase position.
+    /// Falls back to `phase_sequence` if inference returns no result.
+    ///
+    /// Returns `None` if neither inference nor `phase_sequence` yields a value.
+    pub fn effective_phase_sequence(&self) -> Option<u32> {
+        self.inferred_phase_name()
+            .and_then(crate::checkpoint::phase_order::phase_index)
+            .map(|idx| idx as u32)
+            .or(self.phase_sequence)
+    }
+
     /// Check if the arc has completed (all phases done).
     ///
     /// An arc is complete if:
@@ -481,7 +495,7 @@ impl Checkpoint {
     pub fn is_in_skip_map(&self, phase_name: &str) -> bool {
         self.skip_map
             .as_ref()
-            .map_or(false, |sm| sm.contains_key(phase_name))
+            .is_some_and(|sm| sm.contains_key(phase_name))
     }
 
     /// Check if a phase should be considered "done" (completed, skipped, or will-be-skipped).
@@ -493,7 +507,7 @@ impl Checkpoint {
         }
         self.phases
             .get(phase_name)
-            .map_or(false, |p| p.status == "completed" || p.status == "skipped")
+            .is_some_and(|p| p.status == "completed" || p.status == "skipped")
     }
 
     /// Check if a phase is actionable (pending, in the map, and NOT in skip_map).
@@ -511,7 +525,7 @@ impl Checkpoint {
         }
         self.phases
             .get(phase_name)
-            .map_or(false, |p| p.status == "pending" || p.status.is_empty())
+            .is_some_and(|p| p.status == "pending" || p.status.is_empty())
     }
 
     /// Find the next actionable phase — first pending phase NOT in skip_map.

@@ -361,11 +361,12 @@ fn rotate_crash_dumps(dump_dir: &std::path::Path, keep: usize) {
         return;
     }
 
-    // Sort by modified time, oldest first
-    entries.sort_by_key(|e| {
-        e.metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    // Sort by modified time, oldest first.  Use filename as tiebreaker for
+    // stable ordering when timestamps are equal (e.g. rapid crash dumps).
+    entries.sort_by(|a, b| {
+        let time_a = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let time_b = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        time_a.cmp(&time_b).then_with(|| a.file_name().cmp(&b.file_name()))
     });
 
     // Remove oldest entries beyond the keep limit

@@ -112,6 +112,10 @@ pub(crate) enum SessionOutcome {
     Completed,
     /// Session crashed (process died unexpectedly).
     Crashed { reason: String },
+    /// A phase failed (distinct from crash — Rune reported failure, not process death).
+    /// Recovery strategy differs: crashes restart the session, failures may need
+    /// user intervention or a different retry approach.
+    Failed { phase: String, reason: String },
     /// Total pipeline timeout exceeded.
     Timeout,
     /// Session stuck (no output for too long).

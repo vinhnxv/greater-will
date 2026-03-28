@@ -25,6 +25,7 @@ use std::time::Duration;
 /// * `config_dir` - Optional custom configuration directory
 /// * `resume` - If true, resume a previously interrupted run
 /// * `multi_group` - If true, use legacy multi-group mode (7 sessions)
+#[allow(clippy::too_many_arguments)] // TODO: extract RunConfig struct
 pub fn execute(
     plans: Vec<String>,
     dry_run: bool,
@@ -152,9 +153,10 @@ fn run_single(
                 }
             }
             None => {
+                let plan_hint = plans.first().map(|p| p.as_str()).unwrap_or("<unknown>");
                 eyre::bail!(
                     "No active arc state found for plan: {}\nStart a fresh run without --resume.",
-                    plans[0]
+                    plan_hint
                 );
             }
         }

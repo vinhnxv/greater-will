@@ -268,8 +268,7 @@ impl CompletionDetector {
         let pane_hash = compute_pane_hash(pane_content);
         let pane_changed = self
             .state
-            .last_pane_hash
-            .map_or(true, |h| h != pane_hash);
+            .last_pane_hash != Some(pane_hash);
 
         if pane_changed {
             self.state.last_activity = Instant::now();
@@ -286,7 +285,7 @@ impl CompletionDetector {
         match checkpoint_result {
             Ok(checkpoint) => {
                 if self.state.starting_phase_sequence.is_none() {
-                    self.state.starting_phase_sequence = checkpoint.phase_sequence;
+                    self.state.starting_phase_sequence = checkpoint.effective_phase_sequence();
                 }
 
                 // Completion check
@@ -316,7 +315,7 @@ impl CompletionDetector {
                     hasher.finish()
                 };
 
-                if self.state.last_checkpoint_hash.map_or(true, |h| h != checkpoint_hash) {
+                if self.state.last_checkpoint_hash != Some(checkpoint_hash) {
                     self.state.last_checkpoint_activity = Instant::now();
 
                     // Log phase status changes
@@ -518,7 +517,7 @@ impl CompletionDetector {
             None => return false,
         };
 
-        let phase_seq = match checkpoint.phase_sequence {
+        let phase_seq = match checkpoint.effective_phase_sequence() {
             Some(seq) => seq as usize,
             None => return false,
         };

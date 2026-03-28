@@ -123,12 +123,14 @@ impl CheckpointWatcher {
                 Ok(CheckpointDiff::NotStarted)
             }
             (Some(current), None) => {
-                // First read
-                self.starting_sequence = current.phase_sequence;
+                // First read — use effective sequence (inferred from statuses)
+                self.starting_sequence = current.effective_phase_sequence();
                 self.last_checkpoint = Some(current.clone());
                 Ok(CheckpointDiff::Started {
                     arc_id: current.id.clone(),
-                    phase: current.current_phase().unwrap_or("unknown").to_string(),
+                    phase: current.inferred_phase_name()
+                        .unwrap_or_else(|| current.current_phase().unwrap_or("unknown"))
+                        .to_string(),
                 })
             }
             (None, Some(_)) => {
@@ -153,13 +155,15 @@ impl CheckpointWatcher {
             return CheckpointDiff::Completed;
         }
 
-        // Check for phase sequence change
-        let old_seq = old.phase_sequence.unwrap_or(0);
-        let new_seq = new.phase_sequence.unwrap_or(0);
+        // Check for phase sequence change using effective (inferred) sequence
+        let old_seq = old.effective_phase_sequence().unwrap_or(0);
+        let new_seq = new.effective_phase_sequence().unwrap_or(0);
 
         if new_seq > old_seq {
-            let old_phase = old.current_phase().unwrap_or("unknown");
-            let new_phase = new.current_phase().unwrap_or("unknown");
+            let old_phase = old.inferred_phase_name()
+                .unwrap_or_else(|| old.current_phase().unwrap_or("unknown"));
+            let new_phase = new.inferred_phase_name()
+                .unwrap_or_else(|| new.current_phase().unwrap_or("unknown"));
 
             info!(
                 old_phase = old_phase,
@@ -221,7 +225,7 @@ impl CheckpointWatcher {
 
         match (current, self.starting_sequence) {
             (Some(cp), Some(start_seq)) => {
-                let current_seq = cp.phase_sequence.unwrap_or(0);
+                let current_seq = cp.effective_phase_sequence().unwrap_or(0);
                 Ok(current_seq > start_seq)
             }
             _ => Ok(false),
@@ -262,22 +266,26 @@ impl CheckpointWatcher {
         }
     }
 
-    /// Get the current phase name.
+    /// Get the current phase name (inferred from actual statuses).
     pub fn current_phase(&self) -> Result<Option<String>> {
         let current = self.read_current()?;
 
         match current {
-            Some(cp) => Ok(cp.current_phase().map(|s| s.to_string())),
+            Some(cp) => Ok(Some(
+                cp.inferred_phase_name()
+                    .unwrap_or_else(|| cp.current_phase().unwrap_or("unknown"))
+                    .to_string()
+            )),
             None => Ok(None),
         }
     }
 
-    /// Get the current phase sequence index.
+    /// Get the current phase sequence index (inferred from actual statuses).
     pub fn current_sequence(&self) -> Result<Option<u32>> {
         let current = self.read_current()?;
 
         match current {
-            Some(cp) => Ok(cp.phase_sequence),
+            Some(cp) => Ok(cp.effective_phase_sequence()),
             None => Ok(None),
         }
     }
@@ -289,8 +297,10 @@ impl CheckpointWatcher {
         match current {
             Some(cp) => Ok(Some(CheckpointSummary {
                 arc_id: cp.id.clone(),
-                current_phase: cp.current_phase().map(|s| s.to_string()),
-                phase_sequence: cp.phase_sequence,
+                current_phase: cp.inferred_phase_name()
+                    .map(|s| s.to_string())
+                    .or_else(|| cp.current_phase().map(|s| s.to_string())),
+                phase_sequence: cp.effective_phase_sequence(),
                 completed_count: cp.count_by_status("completed"),
                 skipped_count: cp.count_by_status("skipped"),
                 pending_count: cp.count_by_status("pending"),

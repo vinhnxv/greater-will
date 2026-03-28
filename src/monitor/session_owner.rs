@@ -168,10 +168,16 @@ pub fn check_previous_owner(working_dir: &Path) -> OwnerCheck {
         None => return OwnerCheck::NoPrevious,
     };
 
-    // Check if previous gw process is alive
-    if crate::cleanup::process::is_pid_alive(owner.gw_pid) {
-        // Verify it's the same process, not a recycled PID
-        let current_start = get_process_start_time(owner.gw_pid);
+    // Check if previous gw process is alive.
+    //
+    // VEIL-002 fix: read start_time BEFORE checking liveness to close the
+    // TOCTOU window.  If start_time retrieval fails, the process is already
+    // dead.  If it succeeds, compare against the recorded value to detect PID
+    // recycling — all before the separate liveness check.
+    let current_start = get_process_start_time(owner.gw_pid);
+    let pid_alive = crate::cleanup::process::is_pid_alive(owner.gw_pid);
+
+    if pid_alive {
         if owner.gw_start_time > 0 && current_start > 0 && current_start != owner.gw_start_time {
             info!(
                 gw_pid = owner.gw_pid,
@@ -189,6 +195,16 @@ pub fn check_previous_owner(working_dir: &Path) -> OwnerCheck {
             );
         }
         // Fall through to orphan checks
+    } else if owner.gw_start_time > 0 && current_start > 0 {
+        // Process is dead but start_time was readable (race edge case) —
+        // still verify PID wasn't recycled between start_time read and
+        // liveness check.
+        if current_start != owner.gw_start_time {
+            info!(
+                gw_pid = owner.gw_pid,
+                "PID recycled (detected via start_time mismatch, process now dead)"
+            );
+        }
     }
 
     // Previous gw is dead. Check tmux session state.

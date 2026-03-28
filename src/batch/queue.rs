@@ -416,12 +416,12 @@ fn parse_plan_timeout() -> Duration {
     match env::var("GW_PLAN_TIMEOUT") {
         Ok(val) => {
             let val = val.trim();
-            let (num_str, multiplier) = if val.ends_with('h') {
-                (&val[..val.len() - 1], 3600u64)
-            } else if val.ends_with('m') {
-                (&val[..val.len() - 1], 60u64)
-            } else if val.ends_with('s') {
-                (&val[..val.len() - 1], 1u64)
+            let (num_str, multiplier) = if let Some(n) = val.strip_suffix('h') {
+                (n, 3600u64)
+            } else if let Some(n) = val.strip_suffix('m') {
+                (n, 60u64)
+            } else if let Some(n) = val.strip_suffix('s') {
+                (n, 1u64)
             } else {
                 (val, 1u64)
             };

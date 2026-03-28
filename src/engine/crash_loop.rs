@@ -4,6 +4,7 @@
 //! Crashes outside the window are forgotten, and a stability period of healthy
 //! running resets the crash history entirely.
 
+use color_eyre::eyre::{self, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -56,6 +57,10 @@ impl CrashLoopDetector {
     }
 
     /// Record a crash/restart. Returns whether to continue or stop.
+    ///
+    /// The threshold check uses `>=`: the loop stops when crash count *reaches*
+    /// `max_crashes`, not when it *exceeds* it.  With `max_crashes = 5` the
+    /// detector allows crashes 1–4 and stops on the 5th.
     pub fn record_restart(&mut self) -> CrashLoopDecision {
         let now = Instant::now();
         self.total_restarts += 1;
@@ -64,15 +69,17 @@ impl CrashLoopDetector {
 
         // Prune entries outside the window
         let cutoff = now - self.window;
-        while self.crash_times.front().map_or(false, |&t| t < cutoff) {
+        while self.crash_times.front().is_some_and(|&t| t < cutoff) {
             self.crash_times.pop_front();
         }
 
         if self.crash_times.len() >= self.max_crashes as usize {
             tracing::error!(
                 crashes_in_window = self.crash_times.len(),
+                max_crashes = self.max_crashes,
                 window_secs = self.window.as_secs(),
-                "Crash loop detected — too many crashes in window"
+                "Crash loop detected — {} crashes reached threshold of {} within {}s window",
+                self.crash_times.len(), self.max_crashes, self.window.as_secs()
             );
             CrashLoopDecision::StopCrashLoop
         } else {
@@ -82,9 +89,18 @@ impl CrashLoopDetector {
 
     /// Call periodically during healthy execution.
     /// If healthy for >= stability_period, reset crash counters.
+    ///
+    /// State transitions:
+    ///   `healthy_since == None`  →  start tracking (`Some(now)`)
+    ///   elapsed < stability      →  keep waiting (no-op)
+    ///   elapsed >= stability     →  clear crash history, restart tracking
+    ///
+    /// Invariant: after `crash_times.clear()`, `healthy_since` is always
+    /// reset to `Some(now)` so the next stability window starts fresh.
     pub fn record_healthy_tick(&mut self) {
         let now = Instant::now();
         match self.healthy_since {
+            // Stability period reached — clear crash history and restart tracking.
             Some(since) if now.duration_since(since) >= self.stability_period => {
                 tracing::info!(
                     stability_secs = self.stability_period.as_secs(),
@@ -94,10 +110,12 @@ impl CrashLoopDetector {
                 self.crash_times.clear();
                 self.healthy_since = Some(now);
             }
+            // First healthy tick after a crash — begin tracking stability.
             None => {
                 self.healthy_since = Some(now);
             }
-            _ => {} // Still within stability period
+            // Still within stability period — keep waiting.
+            _ => {}
         }
     }
 
@@ -111,12 +129,26 @@ impl CrashLoopDetector {
     ///
     /// Converts `Instant` timestamps to Unix epoch seconds for serialization.
     /// Only crashes within the current window are persisted.
-    pub fn persist(&self, working_dir: &Path) {
+    ///
+    /// # Clock drift (VEIL-001)
+    ///
+    /// The conversion assumes `Instant` and `SystemTime` advance at the same
+    /// rate.  During NTP adjustments or suspend/resume cycles the reconstructed
+    /// epoch timestamps may drift by a few seconds.  This is acceptable because
+    /// the crash window is large (typically 900 s) and a small drift will not
+    /// materially affect crash-loop detection.
+    ///
+    /// # Concurrency (VEIL-003)
+    ///
+    /// No file-level locking is performed.  `InstanceLock` (acquired in batch
+    /// mode) and the single-session design prevent concurrent `gw` processes in
+    /// the same working directory, so the race window is theoretical.  The
+    /// atomic write-to-tmp-then-rename pattern protects against partial reads.
+    pub fn persist(&self, working_dir: &Path) -> color_eyre::Result<()> {
         let now_instant = Instant::now();
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .inspect_err(|e| tracing::warn!(error = %e, "System clock before UNIX epoch"))
-            .unwrap_or_default()
+            .map_err(|e| eyre::eyre!("System clock before UNIX epoch: {e}"))?
             .as_secs();
 
         // Convert Instants to epoch seconds
@@ -133,24 +165,23 @@ impl CrashLoopDetector {
 
         let path = Self::history_path(working_dir);
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .wrap_err("Failed to create crash history directory")?;
         }
 
-        match serde_json::to_string_pretty(&record) {
-            Ok(json) => {
-                // Atomic write: write to .tmp then rename to avoid corruption on crash
-                let tmp_path = path.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp_path, &json) {
-                    tracing::warn!(error = %e, "Failed to write crash history tmp file");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                    tracing::warn!(error = %e, "Failed to rename crash history tmp file");
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "Failed to serialize crash history"),
+        let json = serde_json::to_string_pretty(&record)
+            .wrap_err("Failed to serialize crash history")?;
+
+        // Atomic write: write to .tmp then rename to avoid corruption on crash
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &json)
+            .wrap_err("Failed to write crash history tmp file")?;
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).wrap_err("Failed to rename crash history tmp file");
         }
+
+        Ok(())
     }
 
     /// Load crash history from a previous gw run.
@@ -215,6 +246,11 @@ impl CrashLoopDetector {
     }
 
     /// Remove persisted crash history (call on clean completion).
+    ///
+    /// `remove_file` is atomic on POSIX, and `InstanceLock` prevents concurrent
+    /// `gw` processes in the same working directory, so no additional locking is
+    /// needed.  A racing `load_history` call would either see the file or get
+    /// `ENOENT` — both are safe.
     pub fn clear_history(working_dir: &Path) {
         let path = Self::history_path(working_dir);
         let _ = std::fs::remove_file(&path);
@@ -305,7 +341,7 @@ mod tests {
         assert_eq!(d1.crashes_in_window(), 2);
 
         // Persist
-        d1.persist(dir.path());
+        d1.persist(dir.path()).unwrap();
         assert!(dir.path().join(".gw").join("crash-history.json").exists());
 
         // Load into a fresh detector
@@ -331,7 +367,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut d = CrashLoopDetector::new(5, 900, 1800);
         d.record_restart();
-        d.persist(dir.path());
+        d.persist(dir.path()).unwrap();
         assert!(dir.path().join(".gw").join("crash-history.json").exists());
 
         CrashLoopDetector::clear_history(dir.path());

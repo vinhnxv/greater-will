@@ -382,7 +382,7 @@ impl PhaseGroupExecutor {
         session_id: &str,
     ) -> Result<PhaseGroupResult> {
         let start = Instant::now();
-        let pid: Option<u32>;
+        
 
         // Pre-flight
         info!(group = %group.name, "Pre-flight checks");
@@ -459,8 +459,8 @@ impl PhaseGroupExecutor {
             spawn_config
         };
 
-        match spawn_claude_session(&spawn_config) {
-            Ok(p) => pid = Some(p),
+        let pid: Option<u32> = match spawn_claude_session(&spawn_config) {
+            Ok(p) => Some(p),
             Err(e) => {
                 return Ok(PhaseGroupResult {
                     group_name: group.name.clone(),
@@ -476,7 +476,7 @@ impl PhaseGroupExecutor {
                     phases: group.phases.clone(),
                 });
             }
-        }
+        };
 
         // Wait for prompt
         info!(group = %group.name, "Waiting for Claude Code prompt");
@@ -647,7 +647,7 @@ impl PhaseGroupExecutor {
                     info!(group = %group.name, "Prompt returned, checking checkpoint");
                     // Re-read checkpoint
                     if let Ok(cp) = read_checkpoint(checkpoint_path) {
-                        if self.is_group_complete_in_checkpoint(&group, &cp) {
+                        if self.is_group_complete_in_checkpoint(group, &cp) {
                             info!(group = %group.name, "Group completed (detected via prompt return)");
                             break;
                         }
@@ -655,7 +655,7 @@ impl PhaseGroupExecutor {
                 }
                 CompletionEvent::StillRunning => {
                     // Log status every ~10 ticks (30s)
-                    if tick_count % 10 == 0 {
+                    if tick_count.is_multiple_of(10) {
                         let elapsed = monitor_start.elapsed();
                         let current_phase = detector.current_running_phase()
                             .unwrap_or_else(|| "unknown".to_string());
