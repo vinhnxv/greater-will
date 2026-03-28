@@ -998,9 +998,25 @@ fn monitor_session(
                     current_phase_name = inferred_phase;
                 }
 
+                // FAILED PHASE DETECTION: if a phase has failed, log it.
+                // Don't start transition timer — arc may be processing retry reaction.
+                if nav.has_failure() {
+                    if let crate::checkpoint::schema::PhasePosition::Failed {
+                        failed_phase, next_pending
+                    } = &nav.position {
+                        info!(
+                            failed = failed_phase,
+                            next = next_pending.unwrap_or("none"),
+                            "Phase failure detected — arc may be retrying or halted",
+                        );
+                    }
+                    // Don't set transition timer for failed phases — arc has its own
+                    // retry/halt reaction logic. The overall pipeline timeout still applies.
+                    in_transition_since = None;
+                }
                 // TRANSITION GAP DETECTION: if no phase is in_progress but
                 // completed phases exist, we're between phases. Track how long.
-                if nav.is_transitioning() {
+                else if nav.is_transitioning() {
                     if in_transition_since.is_none() {
                         let gap = nav.transition_gap_secs().unwrap_or(0);
                         info!(

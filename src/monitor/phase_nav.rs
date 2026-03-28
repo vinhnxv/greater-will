@@ -53,6 +53,11 @@ impl PhaseNavigation {
         self.position.is_transitioning()
     }
 
+    /// Returns true if a phase has failed.
+    pub fn has_failure(&self) -> bool {
+        self.position.has_failure()
+    }
+
     /// Get the effective phase name for profile lookup and display.
     pub fn effective_phase_name(&self) -> Option<&'static str> {
         self.position.effective_phase()
@@ -153,6 +158,25 @@ pub fn compute_phase_navigation(checkpoint: &Checkpoint) -> PhaseNavigation {
                 prev,
                 current: None,
                 next: None,
+                position,
+            }
+        }
+
+        PhasePosition::Failed { failed_phase, next_pending } => {
+            // Find the previous completed phase before the failed one
+            let failed_idx = PHASE_ORDER.iter().position(|&p| p == *failed_phase);
+            let prev = failed_idx.and_then(|fi| find_prev_completed(checkpoint, fi));
+
+            // The failed phase is the "current" — show it with no duration
+            let current = Some(PhaseInfo {
+                name: failed_phase,
+                duration_secs: None,
+            });
+
+            PhaseNavigation {
+                prev,
+                current,
+                next: *next_pending,
                 position,
             }
         }
@@ -449,5 +473,34 @@ mod tests {
         // Should transition to plan_review, NOT forge_qa
         assert_eq!(nav.next, Some("plan_review"));
         assert_eq!(nav.effective_phase_name(), Some("plan_review"));
+    }
+
+    #[test]
+    fn test_failed_phase_navigation() {
+        let mut phases = HashMap::new();
+        phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(),
+            started_at: Some("2026-03-20T00:00:00Z".into()),
+            completed_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+        phases.insert("forge_qa".into(), PhaseStatus {
+            status: "failed".into(),
+            ..Default::default()
+        });
+        phases.insert("plan_review".into(), PhaseStatus::pending());
+
+        let cp = make_checkpoint(phases);
+        let nav = compute_phase_navigation(&cp);
+
+        assert!(nav.has_failure());
+        assert!(!nav.is_transitioning());
+        // current = the failed phase
+        assert_eq!(nav.current.as_ref().unwrap().name, "forge_qa");
+        // prev = forge (last completed before failed)
+        assert_eq!(nav.prev.as_ref().unwrap().name, "forge");
+        // next = plan_review
+        assert_eq!(nav.next, Some("plan_review"));
+        assert_eq!(nav.effective_phase_name(), Some("forge_qa"));
     }
 }

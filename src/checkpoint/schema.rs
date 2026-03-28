@@ -113,6 +113,13 @@ pub enum PhasePosition {
     WaitingToStart {
         first_pending: &'static str,
     },
+    /// A phase has failed — arc may be retrying or halted.
+    /// The `failed_phase` is the first failed phase in PHASE_ORDER.
+    /// `next_pending` is the next actionable phase (if any — arc may retry).
+    Failed {
+        failed_phase: &'static str,
+        next_pending: Option<&'static str>,
+    },
     /// All phases are completed or skipped.
     AllDone,
     /// Cannot determine position (empty phases map).
@@ -125,6 +132,11 @@ impl PhasePosition {
         matches!(self, PhasePosition::Transitioning { .. })
     }
 
+    /// Returns true if a phase has failed.
+    pub fn has_failure(&self) -> bool {
+        matches!(self, PhasePosition::Failed { .. })
+    }
+
     /// Returns the effective phase name for display/profile lookup.
     pub fn effective_phase(&self) -> Option<&'static str> {
         match self {
@@ -132,6 +144,7 @@ impl PhasePosition {
             PhasePosition::Transitioning { next_pending, .. } if !next_pending.is_empty() => {
                 Some(next_pending)
             }
+            PhasePosition::Failed { failed_phase, .. } => Some(failed_phase),
             PhasePosition::WaitingToStart { first_pending } => Some(first_pending),
             _ => None,
         }
@@ -373,7 +386,20 @@ impl Checkpoint {
             }
         }
 
-        // 2. No in_progress — find last completed and next pending in canonical order
+        // 2. Check for failed phases — arc may be halted or waiting for retry
+        for &phase_name in PHASE_ORDER {
+            if let Some(ps) = self.phases.get(phase_name) {
+                if ps.status == "failed" {
+                    let next = self.next_actionable_phase();
+                    return PhasePosition::Failed {
+                        failed_phase: phase_name,
+                        next_pending: next,
+                    };
+                }
+            }
+        }
+
+        // 3. No in_progress, no failed — find last completed and next pending
         let mut last_completed: Option<(&'static str, Option<String>)> = None;
 
         for &phase_name in PHASE_ORDER {
@@ -424,14 +450,7 @@ impl Checkpoint {
     /// For `WaitingToStart` → the first pending phase.
     /// For `AllDone` / `Unknown` → None.
     pub fn inferred_phase_name(&self) -> Option<&'static str> {
-        match self.infer_phase_position() {
-            PhasePosition::Running { phase, .. } => Some(phase),
-            PhasePosition::Transitioning { next_pending, .. } if !next_pending.is_empty() => {
-                Some(next_pending)
-            }
-            PhasePosition::WaitingToStart { first_pending } => Some(first_pending),
-            _ => None,
-        }
+        self.infer_phase_position().effective_phase()
     }
 
     /// Check if the arc has completed (all phases done).
@@ -1136,5 +1155,87 @@ mod tests {
         assert!(cp.is_phase_done_or_will_skip("forge_qa")); // skipped
         assert!(cp.is_phase_done_or_will_skip("semantic_verification")); // in skip_map
         assert!(!cp.is_phase_done_or_will_skip("work")); // pending, not in skip_map
+    }
+
+    // ── failed phase detection tests ─────────────────────
+
+    #[test]
+    fn test_infer_phase_failed_detected() {
+        // completed → completed → skipped → skipped → completed → failed → completed → pending
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(), ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "completed".into(), ..Default::default()
+        });
+        cp.phases.insert("plan_review".into(), PhaseStatus {
+            status: "skipped".into(), ..Default::default()
+        });
+        cp.phases.insert("plan_refine".into(), PhaseStatus {
+            status: "skipped".into(), ..Default::default()
+        });
+        cp.phases.insert("verification".into(), PhaseStatus {
+            status: "completed".into(), ..Default::default()
+        });
+        cp.phases.insert("semantic_verification".into(), PhaseStatus {
+            status: "failed".into(), ..Default::default()
+        });
+        cp.phases.insert("design_extraction".into(), PhaseStatus {
+            status: "completed".into(), ..Default::default()
+        });
+        cp.phases.insert("work".into(), PhaseStatus::pending());
+
+        match cp.infer_phase_position() {
+            PhasePosition::Failed { failed_phase, next_pending } => {
+                assert_eq!(failed_phase, "semantic_verification");
+                assert_eq!(next_pending, Some("work"));
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+        // effective phase should be the failed one
+        assert_eq!(cp.inferred_phase_name(), Some("semantic_verification"));
+    }
+
+    #[test]
+    fn test_infer_phase_failed_no_pending() {
+        // All done except one failed — no more pending
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "completed".into(), ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "failed".into(), ..Default::default()
+        });
+
+        match cp.infer_phase_position() {
+            PhasePosition::Failed { failed_phase, next_pending } => {
+                assert_eq!(failed_phase, "forge_qa");
+                assert_eq!(next_pending, None);
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_in_progress_takes_priority_over_failed() {
+        // If a failed phase is being retried (another phase is in_progress),
+        // Running takes priority
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".into(), PhaseStatus {
+            status: "failed".into(), ..Default::default()
+        });
+        cp.phases.insert("forge_qa".into(), PhaseStatus {
+            status: "in_progress".into(),
+            started_at: Some("2026-03-20T00:05:00Z".into()),
+            ..Default::default()
+        });
+
+        match cp.infer_phase_position() {
+            PhasePosition::Running { phase, .. } => {
+                assert_eq!(phase, "forge_qa");
+            }
+            other => panic!("Expected Running, got {:?}", other),
+        }
     }
 }
