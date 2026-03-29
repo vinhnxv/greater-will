@@ -807,7 +807,14 @@ pub(crate) fn monitor_session(
 
         // SECONDARY: Check for completion signals in pane output (text matching).
         // Fallback for when checkpoint hasn't been written yet or is stale.
-        if is_pipeline_complete(&pane_content) {
+        // Guard: ignore pane text completion for the first 3 minutes — no arc can
+        // complete that fast, and Claude Code's startup rendering often contains
+        // completion-like strings (Rune routing tables, system-reminders, etc.)
+        // that trigger false positives.
+        const PANE_COMPLETION_MIN_ELAPSED_SECS: u64 = 180;
+        if dispatch_time.elapsed().as_secs() >= PANE_COMPLETION_MIN_ELAPSED_SECS
+            && is_pipeline_complete(&pane_content)
+        {
             if completion_detected_at.is_none() {
                 let elapsed = dispatch_time.elapsed();
                 info!(
