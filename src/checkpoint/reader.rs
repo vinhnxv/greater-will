@@ -55,11 +55,25 @@ pub fn read_checkpoint<P: AsRef<Path>>(path: P) -> Result<Checkpoint> {
     file.read_to_string(&mut contents)
         .wrap_err_with(|| format!("Failed to read checkpoint file: {}", path.display()))?;
 
-    // Parse JSON
-    let checkpoint: Checkpoint = serde_json::from_str(&contents)
+    // Parse JSON via serde_json::Value first to handle duplicate keys.
+    //
+    // Rune's checkpoint writer (JavaScript) sometimes emits duplicate keys
+    // (e.g., `phase_sequence` appears twice). Direct deserialization into
+    // the Checkpoint struct fails because `#[serde(flatten)]` conflicts
+    // with the duplicate. Parsing through Value first applies last-value-wins
+    // semantics (per RFC 8259 §4) and deduplicates keys before struct mapping.
+    let value: serde_json::Value = serde_json::from_str(&contents)
         .wrap_err_with(|| {
             format!(
-                "Failed to parse checkpoint JSON from {}. Invalid schema?",
+                "Failed to parse checkpoint JSON from {}. Malformed JSON?",
+                path.display()
+            )
+        })?;
+
+    let checkpoint: Checkpoint = serde_json::from_value(value)
+        .wrap_err_with(|| {
+            format!(
+                "Failed to deserialize checkpoint from {}. Invalid schema?",
                 path.display()
             )
         })?;
@@ -622,6 +636,32 @@ mod tests {
         let result = validate_before_resume(&cp, dir.path()).unwrap();
         assert!(result.can_resume());
         assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_read_checkpoint_with_duplicate_keys() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("checkpoint.json");
+
+        // Simulate Rune's buggy writer that emits phase_sequence twice
+        let json = r#"{
+            "id": "arc-dup-test",
+            "schema_version": 27,
+            "plan_file": "plans/test.md",
+            "started_at": "2026-03-30T00:00:00Z",
+            "phase_sequence": 0,
+            "current_phase": "forge",
+            "phase_sequence": 1,
+            "phases": {
+                "forge": { "status": "completed", "artifact": null, "artifact_hash": null, "team_name": null, "started_at": null, "completed_at": null }
+            }
+        }"#;
+        std::fs::write(&file_path, json).unwrap();
+
+        let cp = read_checkpoint(&file_path).expect("should parse despite duplicate keys");
+        assert_eq!(cp.id, "arc-dup-test");
+        // Last value wins per RFC 8259 §4
+        assert_eq!(cp.phase_sequence, Some(1));
     }
 
 }
