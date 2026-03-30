@@ -117,7 +117,7 @@ fn run_single(
         use crate::checkpoint::reader::{validate_before_resume, read_checkpoint, next_actionable_phase};
 
         let loop_state = crate::monitor::loop_state::read_arc_loop_state(cwd);
-        match loop_state {
+        match loop_state.active() {
             Some(state) => {
                 let cp_path = state.resolve_checkpoint_path(cwd);
                 if !cp_path.exists() {

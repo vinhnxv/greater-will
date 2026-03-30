@@ -101,7 +101,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
     // Pre-flight: Check for existing arc-phase-loop.local.md.
     // Now that we use session-owner.json for gw-level orphan detection,
     // this check only handles the loop state file consistency.
-    if let Some(existing_state) = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir) {
+    if let Some(existing_state) = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir).active() {
         let existing_plan = existing_state.plan_file.clone();
         let our_plan = plan_str.to_string();
 

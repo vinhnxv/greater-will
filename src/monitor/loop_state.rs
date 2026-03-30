@@ -127,33 +127,75 @@ impl ArcLoopState {
     }
 }
 
+/// Result of reading `arc-phase-loop.local.md`.
+#[derive(Debug, Clone)]
+pub enum LoopStateRead {
+    /// File does not exist or is unparseable.
+    Missing,
+    /// File exists but `active: false` (leftover from a previous run).
+    Inactive,
+    /// File exists with `active: true` and valid content.
+    Active(ArcLoopState),
+}
+
+impl LoopStateRead {
+    /// Returns the active state if present, `None` otherwise.
+    pub fn active(&self) -> Option<&ArcLoopState> {
+        match self {
+            LoopStateRead::Active(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the file physically exists on disk (active or inactive).
+    pub fn file_exists(&self) -> bool {
+        !matches!(self, LoopStateRead::Missing)
+    }
+}
+
 /// Read and parse `arc-phase-loop.local.md` from the project directory.
 ///
-/// Returns `None` if:
-/// - File doesn't exist
-/// - File can't be parsed
-/// - `active` is not `true`
-pub fn read_arc_loop_state(working_dir: &Path) -> Option<ArcLoopState> {
+/// Returns `Missing` if the file doesn't exist or can't be parsed,
+/// `Inactive` if the file exists but `active` is `false`,
+/// `Active(state)` if the file is active and valid.
+pub fn read_arc_loop_state(working_dir: &Path) -> LoopStateRead {
     let loop_file = working_dir.join(".rune").join("arc-phase-loop.local.md");
-    let contents = std::fs::read_to_string(&loop_file).ok()?;
+    let contents = match std::fs::read_to_string(&loop_file) {
+        Ok(c) => c,
+        Err(_) => return LoopStateRead::Missing,
+    };
 
-    let yaml = extract_frontmatter(&contents)?;
+    let yaml = match extract_frontmatter(&contents) {
+        Some(y) => y,
+        None => return LoopStateRead::Missing,
+    };
 
-    let active = parse_yaml_bool(&yaml, "active")?;
+    let active = match parse_yaml_bool(&yaml, "active") {
+        Some(a) => a,
+        None => return LoopStateRead::Missing,
+    };
+
     if !active {
         debug!("arc-phase-loop.local.md exists but active=false");
-        return None;
+        return LoopStateRead::Inactive;
     }
 
-    let checkpoint_path = parse_yaml_str(&yaml, "checkpoint_path")?;
-    let plan_file = parse_yaml_str(&yaml, "plan_file")?;
+    let checkpoint_path = match parse_yaml_str(&yaml, "checkpoint_path") {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            debug!("arc-phase-loop state has empty checkpoint_path");
+            return LoopStateRead::Missing;
+        }
+    };
+    let plan_file = match parse_yaml_str(&yaml, "plan_file") {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            debug!("arc-phase-loop state has empty plan_file");
+            return LoopStateRead::Missing;
+        }
+    };
 
-    if checkpoint_path.is_empty() || plan_file.is_empty() {
-        debug!("arc-phase-loop state has empty checkpoint_path or plan_file");
-        return None;
-    }
-
-    Some(ArcLoopState {
+    LoopStateRead::Active(ArcLoopState {
         active,
         checkpoint_path,
         plan_file,
@@ -233,7 +275,9 @@ owner_pid: 12345
 session_id: abc-def-123
 ---
 ");
-        let state = read_arc_loop_state(dir.path()).unwrap();
+        let result = read_arc_loop_state(dir.path());
+        assert!(result.file_exists());
+        let state = result.active().unwrap();
         assert!(state.active);
         assert_eq!(state.checkpoint_path, ".rune/arc/arc-1774560563000/checkpoint.json");
         assert_eq!(state.plan_file, "plans/my-plan.md");
@@ -245,7 +289,7 @@ session_id: abc-def-123
     }
 
     #[test]
-    fn test_read_inactive_returns_none() {
+    fn test_read_inactive_returns_inactive() {
         let dir = TempDir::new().unwrap();
         write_loop_state(dir.path(), "\
 ---
@@ -254,13 +298,19 @@ checkpoint_path: .rune/arc/arc-123/checkpoint.json
 plan_file: plans/test.md
 ---
 ");
-        assert!(read_arc_loop_state(dir.path()).is_none());
+        let result = read_arc_loop_state(dir.path());
+        assert!(result.file_exists());
+        assert!(result.active().is_none());
+        assert!(matches!(result, LoopStateRead::Inactive));
     }
 
     #[test]
-    fn test_missing_file_returns_none() {
+    fn test_missing_file_returns_missing() {
         let dir = TempDir::new().unwrap();
-        assert!(read_arc_loop_state(dir.path()).is_none());
+        let result = read_arc_loop_state(dir.path());
+        assert!(!result.file_exists());
+        assert!(result.active().is_none());
+        assert!(matches!(result, LoopStateRead::Missing));
     }
 
     #[test]

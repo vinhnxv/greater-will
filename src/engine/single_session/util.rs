@@ -55,6 +55,38 @@ pub(crate) enum RestartDecision {
     AlreadyDone,
 }
 
+/// Try to extract the checkpoint path from an inactive (active=false) loop state file.
+///
+/// When arc sets `active: false` during shutdown but the session is killed before
+/// cleanup, the file still contains the checkpoint path needed for --resume.
+/// This reads the raw file and extracts `checkpoint_path` regardless of `active` status.
+fn try_checkpoint_from_inactive(working_dir: &Path) -> Option<PathBuf> {
+    let loop_file = working_dir.join(".rune").join("arc-phase-loop.local.md");
+    let contents = std::fs::read_to_string(&loop_file).ok()?;
+
+    // Quick YAML parse — extract checkpoint_path from frontmatter
+    let trimmed = contents.trim();
+    let after_first = trimmed.strip_prefix("---")?;
+    let end = after_first.find("---")?;
+    let yaml = &after_first[..end];
+
+    for line in yaml.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("checkpoint_path:") {
+            let val = value.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() && val != "null" {
+                let path = if val.starts_with('/') {
+                    PathBuf::from(val)
+                } else {
+                    working_dir.join(val)
+                };
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Determine the correct restart command based on checkpoint state.
 ///
 /// Phase-aware logic:
@@ -72,7 +104,11 @@ pub(crate) fn resolve_restart_command(
     use crate::engine::phase_profile::{self, RecoveryStrategy};
 
     // Read checkpoint path from arc-phase-loop.local.md — no directory scanning.
-    let cp_path = match crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+    // Check both active AND inactive states: when a session crashes after arc
+    // sets active=false (e.g., during merge phase), the file still contains the
+    // valid checkpoint path we need for --resume.
+    let loop_state_read = crate::monitor::loop_state::read_arc_loop_state(working_dir);
+    let cp_path = match loop_state_read.active() {
         Some(loop_state) => {
             let path = loop_state.resolve_checkpoint_path(working_dir);
             if path.exists() {
@@ -84,9 +120,25 @@ pub(crate) fn resolve_restart_command(
             }
         }
         None => {
-            info!(restart = restart_count, "No loop state for plan '{}' — fresh start", plan_str);
-            println!("[gw] No active arc state found — running fresh (not --resume)");
-            return RestartDecision::Fresh(arc_command.to_string());
+            // Try to extract checkpoint path from inactive file (active=false).
+            // This handles the case where arc set active=false during its final
+            // phases but the session was killed before cleanup completed.
+            match try_checkpoint_from_inactive(working_dir) {
+                Some(path) if path.exists() => {
+                    info!(
+                        restart = restart_count,
+                        checkpoint = %path.display(),
+                        "Loop state inactive but checkpoint exists — attempting resume"
+                    );
+                    println!("[gw] Found checkpoint from inactive loop state — attempting --resume");
+                    path
+                }
+                _ => {
+                    info!(restart = restart_count, "No loop state for plan '{}' — fresh start", plan_str);
+                    println!("[gw] No active arc state found — running fresh (not --resume)");
+                    return RestartDecision::Fresh(arc_command.to_string());
+                }
+            }
         }
     };
 
@@ -253,7 +305,7 @@ pub(crate) fn read_cached_checkpoint(
 
     // Only source: arc-phase-loop.local.md — no directory scanning.
     // All checkpoint reads go through arc-phase-loop.local.md — no directory scanning.
-    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir) {
+    if let Some(loop_state) = crate::monitor::loop_state::read_arc_loop_state(working_dir).active() {
         let cp_path = loop_state.resolve_checkpoint_path(working_dir);
         if cp_path.exists() {
             info!(

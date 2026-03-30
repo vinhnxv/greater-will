@@ -815,7 +815,7 @@ struct ArcCheckpointInfo {
 /// Detect the active arc checkpoint via arc-phase-loop.local.md — no directory scanning.
 fn detect_arc_checkpoint() -> Option<ArcCheckpointInfo> {
     let cwd = std::env::current_dir().ok()?;
-    let loop_state = crate::monitor::loop_state::read_arc_loop_state(&cwd)?;
+    let loop_state = crate::monitor::loop_state::read_arc_loop_state(&cwd).active()?.clone();
     let cp_path = loop_state.resolve_checkpoint_path(&cwd);
     if !cp_path.exists() {
         return None;

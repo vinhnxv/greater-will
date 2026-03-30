@@ -574,7 +574,9 @@ pub(crate) fn monitor_session(
 
         // LOOP STATE TRACKING: Monitor arc-phase-loop.local.md for existence,
         // content changes, and stall detection. This file is Rune's heartbeat.
-        let current_loop_state = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir);
+        let loop_state_read = crate::monitor::loop_state::read_arc_loop_state(&config.working_dir);
+        let loop_state_file_on_disk = loop_state_read.file_exists();
+        let current_loop_state = loop_state_read.active().cloned();
         let loop_state_exists = current_loop_state.is_some();
 
         if let Some(ref current) = current_loop_state {
@@ -686,14 +688,38 @@ pub(crate) fn monitor_session(
                         } else {
                             let current = checkpoint.inferred_phase_name()
                                 .unwrap_or_else(|| checkpoint.current_phase().unwrap_or("unknown"));
-                            warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
-                            let reason = format!(
-                                "arc-phase-loop.local.md deleted during phase '{}' after {}s",
-                                current, session_age.as_secs(),
-                            );
-                            save_crash_dump(session_name, &config.working_dir, &reason);
-                            let _ = kill_session(session_name);
-                            return Ok(SessionOutcome::Crashed { reason });
+
+                            // Distinguish between file truly deleted (crash) vs
+                            // file still on disk with active=false (graceful shutdown).
+                            // When arc completes, it sets active=false but the checkpoint
+                            // may not have its "complete" flag set yet (race condition).
+                            // If the file is still on disk, this is an intentional
+                            // deactivation — enter grace period instead of killing.
+                            if loop_state_file_on_disk {
+                                info!(
+                                    current_phase = current,
+                                    "Loop state deactivated (active=false) during phase '{}' — treating as completion (file still on disk)",
+                                    current,
+                                );
+                                if completion_detected_at.is_none() {
+                                    println!(
+                                        "[gw] Arc deactivated during '{}' (active=false, file on disk) — grace period active (kill after {}m idle)",
+                                        current, COMPLETION_GRACE_IDLE_SECS / 60,
+                                    );
+                                    completion_detected_at = Some(Instant::now());
+                                    completion_idle_since = Some(Instant::now());
+                                }
+                                // Don't return — grace period handler manages the kill
+                            } else {
+                                warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
+                                let reason = format!(
+                                    "arc-phase-loop.local.md deleted during phase '{}' after {}s",
+                                    current, session_age.as_secs(),
+                                );
+                                save_crash_dump(session_name, &config.working_dir, &reason);
+                                let _ = kill_session(session_name);
+                                return Ok(SessionOutcome::Crashed { reason });
+                            }
                         }
                     }
                     // No checkpoint found. Disambiguate using session age:
@@ -739,24 +765,70 @@ pub(crate) fn monitor_session(
                 let screen_idle_secs = last_activity.elapsed().as_secs();
                 let screen_active = screen_idle_secs < wd.loop_state_warmup_secs;
 
-                if screen_active {
-                    // Claude Code is still producing output — likely still
-                    // initializing (loading plugins, MCP servers, etc.).
-                    // Don't kill it; just log periodically.
+                // If the file exists on disk with active=false, it's a stale
+                // leftover from a previous arc run. The new arc hasn't flipped
+                // it to active yet. This is NOT the same as "file never appeared"
+                // — give extra warmup time for the new session to claim it.
+                let stale_file_present = loop_state_file_on_disk && !loop_state_exists;
+
+                if screen_active || stale_file_present {
+                    // Claude Code is still producing output or a stale file is
+                    // present (new arc hasn't activated yet). Keep waiting.
                     if session_age.as_secs() % 60 < (wd.checkpoint_poll_interval_secs + 1) {
-                        info!(
-                            warmup_secs = wd.loop_state_warmup_secs,
+                        if stale_file_present && !screen_active {
+                            info!(
+                                warmup_secs = wd.loop_state_warmup_secs,
+                                elapsed_secs = session_age.as_secs(),
+                                screen_idle_secs,
+                                "arc-phase-loop.local.md exists with active=false (stale from previous run) — waiting for new arc to activate"
+                            );
+                            println!(
+                                "[gw] Stale arc-phase-loop.local.md (active=false) from previous run — waiting for activation ({}s elapsed, idle {}s)",
+                                session_age.as_secs(), screen_idle_secs,
+                            );
+                        } else {
+                            info!(
+                                warmup_secs = wd.loop_state_warmup_secs,
+                                elapsed_secs = session_age.as_secs(),
+                                screen_idle_secs,
+                                "arc-phase-loop.local.md not yet active, but screen is active — waiting"
+                            );
+                            println!(
+                                "[gw] Warmup exceeded {}s but Claude Code still active (idle {}s) — waiting",
+                                wd.loop_state_warmup_secs, screen_idle_secs,
+                            );
+                        }
+                    }
+
+                    // Safety valve: if stale file persists AND screen is idle
+                    // for 2x warmup, give up — something is genuinely wrong.
+                    let stale_hard_limit = wd.loop_state_warmup_secs * 2;
+                    if stale_file_present && !screen_active
+                        && session_age.as_secs() > stale_hard_limit
+                    {
+                        warn!(
                             elapsed_secs = session_age.as_secs(),
                             screen_idle_secs,
-                            "arc-phase-loop.local.md not yet created, but screen is active — waiting"
+                            hard_limit_secs = stale_hard_limit,
+                            "Stale arc-phase-loop.local.md never activated and screen is idle — giving up"
+                        );
+                        let reason = format!(
+                            "arc-phase-loop.local.md stuck at active=false after {}s (hard limit {}s, screen idle {}s) — Rune failed to initialize",
+                            session_age.as_secs(), stale_hard_limit, screen_idle_secs,
                         );
                         println!(
-                            "[gw] Warmup exceeded {}s but Claude Code still active (idle {}s) — waiting",
-                            wd.loop_state_warmup_secs, screen_idle_secs,
+                            "[gw] Stale loop state never activated after {}s — restarting session",
+                            session_age.as_secs(),
                         );
+                        save_crash_dump(session_name, &config.working_dir, &reason);
+                        kill_session(session_name)?;
+                        return Ok(SessionOutcome::ErrorDetected {
+                            error_class: ErrorClass::BootstrapError,
+                            reason,
+                        });
                     }
                 } else {
-                    // Screen is stale AND past warmup → Rune genuinely failed
+                    // Screen is stale AND no file on disk → Rune genuinely failed
                     warn!(
                         warmup_secs = wd.loop_state_warmup_secs,
                         elapsed_secs = session_age.as_secs(),
