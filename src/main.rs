@@ -51,8 +51,8 @@ fn main() -> Result<()> {
             resume,
             multi_group,
             allow_dirty,
-            foreground: _,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty),
+            foreground,
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground),
         commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
                 commands::elden::install()
@@ -70,22 +70,10 @@ fn main() -> Result<()> {
         commands::Commands::Replay { checkpoint, resume, force } => {
             commands::replay::execute(checkpoint, resume, force)
         }
-        commands::Commands::Daemon { action: _ } => {
-            tracing::info!("daemon commands not yet implemented");
-            Ok(())
-        }
-        commands::Commands::Ps { all: _, json: _ } => {
-            tracing::info!("ps command not yet implemented");
-            Ok(())
-        }
-        commands::Commands::Logs { run_id: _, follow: _, tail: _ } => {
-            tracing::info!("logs command not yet implemented");
-            Ok(())
-        }
-        commands::Commands::Stop { run_id: _ } => {
-            tracing::info!("stop command not yet implemented");
-            Ok(())
-        }
+        commands::Commands::Daemon { action } => commands::daemon::execute(action),
+        commands::Commands::Ps { all, json } => commands::ps::execute(all, json),
+        commands::Commands::Logs { run_id, follow, tail } => commands::logs::execute(run_id, follow, tail),
+        commands::Commands::Stop { run_id } => commands::stop::execute(run_id),
         commands::Commands::Clean => commands::clean::execute(),
     }
 }

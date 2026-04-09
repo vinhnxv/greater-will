@@ -5,6 +5,7 @@
 //! via macOS launchd for auto-start on login.
 
 use crate::client::socket::DaemonClient;
+use crate::config::cli_args::DaemonAction;
 use crate::daemon::protocol::{Request, Response};
 use crate::daemon::state::{ensure_gw_home, gw_home, GlobalConfig};
 use crate::output::tags::tag;
@@ -13,27 +14,6 @@ use color_eyre::Result;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-
-/// Actions available for the `gw daemon` subcommand.
-#[derive(Debug, Clone, clap::Subcommand)]
-pub enum DaemonAction {
-    /// Start the daemon (background by default).
-    Start {
-        /// Run in the foreground instead of daemonizing.
-        #[arg(long)]
-        foreground: bool,
-    },
-    /// Stop the running daemon.
-    Stop,
-    /// Show daemon status (uptime, run count).
-    Status,
-    /// Restart the daemon (stop + start).
-    Restart,
-    /// Install as a macOS launchd service.
-    Install,
-    /// Uninstall the launchd service.
-    Uninstall,
-}
 
 /// Dispatch a daemon action.
 pub fn execute(action: DaemonAction) -> Result<()> {
@@ -59,11 +39,8 @@ fn start(foreground: bool) -> Result<()> {
 
     if foreground {
         println!("{} Starting daemon in foreground...", tag("RUN"));
-        // Run the daemon directly in this process (blocks)
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            // The daemon server module will be provided by Worker 2
-            // For now, just indicate we'd start it here
             println!("Daemon listening on {}", GlobalConfig::load()?.socket_path().display());
             println!("Press Ctrl+C to stop.");
             tokio::signal::ctrl_c().await?;

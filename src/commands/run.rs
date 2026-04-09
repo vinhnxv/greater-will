@@ -35,8 +35,17 @@ pub fn execute(
     resume: bool,
     multi_group: bool,
     allow_dirty: bool,
+    foreground: bool,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
+
+    // Daemon delegation: if the daemon is running and --foreground is not set,
+    // submit the plan for background execution instead of running inline.
+    if !foreground && !dry_run && mock.is_none() {
+        if crate::client::socket::DaemonClient::is_daemon_running() {
+            return delegate_to_daemon(&plans, &cwd);
+        }
+    }
 
     // Resolve config_dir: CLI --config-dir takes priority, then $CLAUDE_CONFIG_DIR env var
     let config_dir = config_dir.or_else(|| {
@@ -678,6 +687,58 @@ fn preflight_mock(mock_path: &PathBuf) -> Result<()> {
                 "Mock script is not executable. Run: chmod +x {}",
                 mock_path.display()
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Delegate plan execution to the background daemon.
+///
+/// Resolves plan paths to absolute, submits each to the daemon, and prints
+/// the run ID so the user can monitor with `gw ps` / `gw logs`.
+fn delegate_to_daemon(plans: &[String], cwd: &Path) -> Result<()> {
+    use crate::client::socket::DaemonClient;
+    use crate::daemon::protocol::{Request, Response};
+    use crate::output::tags::tag;
+
+    println!("{} Daemon detected — submitting run(s) for background execution", tag("RUN"));
+    println!();
+
+    for plan in plans {
+        // Resolve to absolute path so the daemon can find it from any cwd
+        let plan_path = if Path::new(plan).is_absolute() {
+            PathBuf::from(plan)
+        } else {
+            cwd.join(plan)
+        };
+
+        if !plan_path.exists() {
+            eyre::bail!("Plan file not found: {}", plan_path.display());
+        }
+
+        let client = DaemonClient::new()?;
+        let request = Request::SubmitRun {
+            plan_path: plan_path.clone(),
+            repo_dir: cwd.to_path_buf(),
+            session_name: None,
+        };
+
+        match client.send(request)? {
+            Response::RunSubmitted { run_id } => {
+                let short = if run_id.len() > 8 { &run_id[..8] } else { &run_id };
+                println!("{} Submitted: {} -> run {}", tag("OK"), plan, short);
+                println!("  Monitor: gw ps");
+                println!("  Logs:    gw logs {}", short);
+                println!("  Stop:    gw stop {}", short);
+                println!();
+            }
+            Response::Error { message, .. } => {
+                println!("{} Failed to submit {}: {}", tag("FAIL"), plan, message);
+            }
+            _ => {
+                println!("{} Unexpected response for {}", tag("WARN"), plan);
+            }
         }
     }
 
