@@ -5,7 +5,7 @@
 
 use color_eyre::{eyre::WrapErr, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 /// Default retention limit for completed runs.
@@ -27,13 +27,12 @@ pub fn gw_home() -> PathBuf {
     }
 }
 
-/// Create the standard directory hierarchy under GW_HOME:
-/// - `~/.gw/`
-/// - `~/.gw/runs/`
-/// - `~/.gw/repos/`
-pub fn ensure_gw_home() -> Result<PathBuf> {
-    let home = gw_home();
-    let dirs = [home.clone(), home.join("runs"), home.join("repos")];
+/// Create the standard directory hierarchy under the given base:
+/// - `<base>/`
+/// - `<base>/runs/`
+/// - `<base>/repos/`
+pub fn ensure_dirs(base: &Path) -> Result<()> {
+    let dirs = [base.to_path_buf(), base.join("runs"), base.join("repos")];
 
     for dir in &dirs {
         std::fs::create_dir_all(dir)
@@ -41,6 +40,13 @@ pub fn ensure_gw_home() -> Result<PathBuf> {
         debug!("ensured directory: {}", dir.display());
     }
 
+    Ok(())
+}
+
+/// Create the standard directory hierarchy under GW_HOME.
+pub fn ensure_gw_home() -> Result<PathBuf> {
+    let home = gw_home();
+    ensure_dirs(&home)?;
     Ok(home)
 }
 
@@ -83,7 +89,12 @@ impl Default for GlobalConfig {
 impl GlobalConfig {
     /// Load config from `~/.gw/config.toml`, falling back to defaults.
     pub fn load() -> Result<Self> {
-        let path = gw_home().join("config.toml");
+        Self::load_from(&gw_home())
+    }
+
+    /// Load config from `<base>/config.toml`, falling back to defaults.
+    pub fn load_from(base: &Path) -> Result<Self> {
+        let path = base.join("config.toml");
         if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .wrap_err_with(|| format!("failed to read {}", path.display()))?;
@@ -110,12 +121,16 @@ impl GlobalConfig {
 /// Runs are sorted by modification time (oldest first), and excess
 /// completed runs are removed until we're within the retention limit.
 pub fn cleanup_old_runs(retention: usize) -> Result<()> {
-    let runs_dir = gw_home().join("runs");
+    cleanup_old_runs_in(&gw_home().join("runs"), retention)
+}
+
+/// Remove run directories in the given directory beyond the retention limit.
+pub fn cleanup_old_runs_in(runs_dir: &Path, retention: usize) -> Result<()> {
     if !runs_dir.exists() {
         return Ok(());
     }
 
-    let mut entries: Vec<_> = std::fs::read_dir(&runs_dir)
+    let mut entries: Vec<_> = std::fs::read_dir(runs_dir)
         .wrap_err("failed to read runs directory")?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
@@ -151,30 +166,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Helper: set GW_HOME to a temp directory for isolated testing.
-    fn with_temp_gw_home(f: impl FnOnce(&TempDir)) {
+    #[test]
+    fn ensure_dirs_creates_hierarchy() {
         let tmp = TempDir::new().unwrap();
-        // Safety: tests run single-threaded with `cargo test -- --test-threads=1`
-        // or this env var is scoped enough for our purposes.
-        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
-        f(&tmp);
-        unsafe { std::env::remove_var("GW_HOME") };
-    }
-
-    #[test]
-    fn gw_home_respects_env() {
-        with_temp_gw_home(|tmp| {
-            assert_eq!(gw_home(), tmp.path());
-        });
-    }
-
-    #[test]
-    fn ensure_gw_home_creates_dirs() {
-        with_temp_gw_home(|tmp| {
-            ensure_gw_home().unwrap();
-            assert!(tmp.path().join("runs").is_dir());
-            assert!(tmp.path().join("repos").is_dir());
-        });
+        let base = tmp.path().join("gw");
+        ensure_dirs(&base).unwrap();
+        assert!(base.join("runs").is_dir());
+        assert!(base.join("repos").is_dir());
     }
 
     #[test]
@@ -187,63 +185,76 @@ mod tests {
 
     #[test]
     fn global_config_load_missing_file() {
-        with_temp_gw_home(|_| {
-            let cfg = GlobalConfig::load().unwrap();
-            assert_eq!(cfg.retention, DEFAULT_RETENTION);
-        });
+        let tmp = TempDir::new().unwrap();
+        let cfg = GlobalConfig::load_from(tmp.path()).unwrap();
+        assert_eq!(cfg.retention, DEFAULT_RETENTION);
     }
 
     #[test]
     fn global_config_load_from_file() {
-        with_temp_gw_home(|tmp| {
-            let config_content = r#"
+        let tmp = TempDir::new().unwrap();
+        let config_content = r#"
 retention = 10
 socket_name = "custom.sock"
 max_concurrent_runs = 4
 "#;
-            std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();
-            let cfg = GlobalConfig::load().unwrap();
-            assert_eq!(cfg.retention, 10);
-            assert_eq!(cfg.socket_name, "custom.sock");
-            assert_eq!(cfg.max_concurrent_runs, 4);
-        });
+        std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();
+        let cfg = GlobalConfig::load_from(tmp.path()).unwrap();
+        assert_eq!(cfg.retention, 10);
+        assert_eq!(cfg.socket_name, "custom.sock");
+        assert_eq!(cfg.max_concurrent_runs, 4);
+    }
+
+    #[test]
+    fn global_config_partial_toml_uses_defaults() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "retention = 5\n").unwrap();
+        let cfg = GlobalConfig::load_from(tmp.path()).unwrap();
+        assert_eq!(cfg.retention, 5);
+        assert_eq!(cfg.socket_name, "daemon.sock"); // default
+        assert_eq!(cfg.max_concurrent_runs, 0); // default
     }
 
     #[test]
     fn cleanup_old_runs_removes_excess() {
-        with_temp_gw_home(|tmp| {
-            let runs_dir = tmp.path().join("runs");
-            std::fs::create_dir_all(&runs_dir).unwrap();
+        use filetime::FileTime;
 
-            // Create 5 run directories
-            for i in 0..5 {
-                let run_dir = runs_dir.join(format!("run-{i:03}"));
-                std::fs::create_dir(&run_dir).unwrap();
-                // Touch a file so the dir isn't empty
-                std::fs::write(run_dir.join("state.json"), "{}").unwrap();
-            }
+        let tmp = TempDir::new().unwrap();
+        let runs_dir = tmp.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
 
-            assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 5);
+        // Create 5 run directories with staggered modification times
+        for i in 0..5u64 {
+            let run_dir = runs_dir.join(format!("run-{i:03}"));
+            std::fs::create_dir(&run_dir).unwrap();
+            std::fs::write(run_dir.join("state.json"), "{}").unwrap();
+            let t = FileTime::from_unix_time((i * 1000) as i64, 0);
+            filetime::set_file_mtime(&run_dir, t).unwrap();
+        }
 
-            // Retain only 2
-            cleanup_old_runs(2).unwrap();
-
-            assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 2);
-        });
+        assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 5);
+        cleanup_old_runs_in(&runs_dir, 2).unwrap();
+        assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 2);
     }
 
     #[test]
     fn cleanup_old_runs_noop_within_limit() {
-        with_temp_gw_home(|tmp| {
-            let runs_dir = tmp.path().join("runs");
-            std::fs::create_dir_all(&runs_dir).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let runs_dir = tmp.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
 
-            for i in 0..3 {
-                std::fs::create_dir(runs_dir.join(format!("run-{i}"))).unwrap();
-            }
+        for i in 0..3 {
+            std::fs::create_dir(runs_dir.join(format!("run-{i}"))).unwrap();
+        }
 
-            cleanup_old_runs(5).unwrap();
-            assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 3);
-        });
+        cleanup_old_runs_in(&runs_dir, 5).unwrap();
+        assert_eq!(std::fs::read_dir(&runs_dir).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn cleanup_old_runs_missing_dir_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let runs_dir = tmp.path().join("nonexistent");
+        cleanup_old_runs_in(&runs_dir, 10).unwrap(); // should not error
     }
 }

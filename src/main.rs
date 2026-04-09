@@ -51,6 +51,7 @@ fn main() -> Result<()> {
             resume,
             multi_group,
             allow_dirty,
+            foreground: _,
         } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty),
         commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
@@ -68,6 +69,22 @@ fn main() -> Result<()> {
         commands::Commands::Status => commands::status::execute(),
         commands::Commands::Replay { checkpoint, resume, force } => {
             commands::replay::execute(checkpoint, resume, force)
+        }
+        commands::Commands::Daemon { action: _ } => {
+            tracing::info!("daemon commands not yet implemented");
+            Ok(())
+        }
+        commands::Commands::Ps { all: _, json: _ } => {
+            tracing::info!("ps command not yet implemented");
+            Ok(())
+        }
+        commands::Commands::Logs { run_id: _, follow: _, tail: _ } => {
+            tracing::info!("logs command not yet implemented");
+            Ok(())
+        }
+        commands::Commands::Stop { run_id: _ } => {
+            tracing::info!("stop command not yet implemented");
+            Ok(())
         }
         commands::Commands::Clean => commands::clean::execute(),
     }
