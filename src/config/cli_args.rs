@@ -95,6 +95,13 @@ pub enum Commands {
         /// per-phase-group execution.
         #[arg(long)]
         multi_group: bool,
+
+        /// Run via the background daemon instead of inline.
+        ///
+        /// Submits the plan to the gw daemon for execution and returns
+        /// immediately. Use `gw ps` to monitor progress.
+        #[arg(long)]
+        foreground: bool,
     },
 
     /// Show status of active or recent arc runs.
@@ -155,6 +162,43 @@ pub enum Commands {
         event: Option<String>,
     },
 
+    /// Manage the background daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
+    /// List all runs across repositories.
+    Ps {
+        /// Show all runs including completed ones.
+        #[arg(short, long)]
+        all: bool,
+
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// View logs for a specific run.
+    Logs {
+        /// The run ID to view logs for.
+        run_id: String,
+
+        /// Follow log output in real time.
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Show only the last N lines.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+    },
+
+    /// Stop a running arc.
+    Stop {
+        /// The run ID to stop.
+        run_id: String,
+    },
+
     /// Clean up temporary files and tmux sessions.
     ///
     /// Removes:
@@ -162,4 +206,25 @@ pub enum Commands {
     /// - Temporary checkpoint files
     /// - Log files from previous runs
     Clean,
+}
+
+/// Subcommands for `gw daemon`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum DaemonAction {
+    /// Start the daemon process.
+    Start {
+        /// Run in the foreground instead of daemonizing.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running daemon.
+    Stop,
+    /// Show daemon status.
+    Status,
+    /// Install as a system service (launchd/systemd).
+    Install,
+    /// Uninstall the system service.
+    Uninstall,
+    /// Restart the daemon.
+    Restart,
 }
