@@ -54,7 +54,7 @@ impl HeartbeatMonitor {
 
     /// Check all Running entries in the registry.
     async fn check_all_runs(&self) {
-        let mut registry = self.registry.lock().await;
+        let registry = self.registry.lock().await;
 
         // Collect run IDs to check (avoid holding lock during tmux calls)
         let running: Vec<(String, Option<String>)> = registry
@@ -263,7 +263,7 @@ impl HeartbeatMonitor {
         }
 
         // Check for pipeline completion
-        if crate::engine::single_session::util::is_pipeline_complete(pane_content) {
+        if is_pipeline_complete(pane_content) {
             info!(run_id = %run_id, "pipeline completed");
             let mut registry = self.registry.lock().await;
             let _ = registry.update_status(
@@ -284,7 +284,7 @@ async fn spawn_recovery(
     run_id: &str,
     repo_dir: &std::path::Path,
     plan_path: &std::path::Path,
-    session_name: &str,
+    _session_name: &str,
 ) {
     let tmux_session = format!("gw-{}", run_id);
 
@@ -347,4 +347,21 @@ async fn spawn_recovery(
             );
         }
     }
+}
+
+/// Check pane output for signals that the arc pipeline has completed.
+///
+/// Mirrors the logic from `engine::single_session::util::is_pipeline_complete`
+/// which is private. Duplicated here to avoid modifying module visibility.
+fn is_pipeline_complete(pane_content: &str) -> bool {
+    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
+    let tail = last_lines.join("\n").to_lowercase();
+
+    tail.contains("arc completed")
+        || tail.contains("all phases complete")
+        || tail.contains("pipeline completed")
+        || tail.contains("merge completed")
+        || tail.contains("arc run finished")
+        || tail.contains("the tarnished rests")
+        || tail.contains("arc result: success")
 }

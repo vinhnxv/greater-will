@@ -1,4 +1,7 @@
+pub mod executor;
+pub mod heartbeat;
 pub mod protocol;
+pub mod reconciler;
 pub mod registry;
 pub mod server;
 pub mod state;
