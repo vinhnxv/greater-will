@@ -21,6 +21,9 @@ mod monitor;
 mod output;
 mod session;
 
+mod client;
+mod daemon;
+
 use clap::Parser;
 use color_eyre::Result;
 
