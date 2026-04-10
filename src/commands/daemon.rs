@@ -67,12 +67,19 @@ fn start(foreground: bool) -> Result<()> {
 }
 
 /// Stop the running daemon via IPC.
+///
+/// If a launchd service is installed (`KeepAlive: true`), the daemon would
+/// respawn immediately after shutdown.  We send the graceful IPC shutdown
+/// first, then unload the launchd plist to prevent respawn.
 fn stop() -> Result<()> {
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
         return Ok(());
     }
 
+    let service_is_loaded = is_launchd_service_loaded();
+
+    // 1. Send graceful IPC shutdown while socket is still alive.
     let client = DaemonClient::new()?;
     match client.send(Request::Shutdown)? {
         Response::Ok { message } => {
@@ -91,7 +98,50 @@ fn stop() -> Result<()> {
             println!("{} Unexpected response from daemon", tag("WARN"));
         }
     }
+
+    // 2. Unload the launchd service *after* IPC shutdown so KeepAlive
+    //    does not respawn the process.  If launchd already restarted it
+    //    in the brief window, unload will stop the new instance too.
+    if service_is_loaded {
+        unload_launchd_service();
+        println!(
+            "  (launchd service was unloaded — run `gw daemon install` to re-enable)"
+        );
+    }
+
     Ok(())
+}
+
+/// Check whether the launchd service is currently loaded.
+fn is_launchd_service_loaded() -> bool {
+    let plist = match plist_path() {
+        Ok(p) if p.exists() => p,
+        _ => return false,
+    };
+    let _ = plist; // plist existence is a prerequisite
+
+    Command::new("launchctl")
+        .args(["list", "com.greater-will.daemon"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Unload the launchd plist so KeepAlive stops respawning the daemon.
+fn unload_launchd_service() {
+    let plist = match plist_path() {
+        Ok(p) if p.exists() => p,
+        _ => return,
+    };
+
+    let _ = Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(&plist)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Query and display daemon status.
