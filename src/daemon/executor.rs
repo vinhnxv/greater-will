@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Grace period after sending /exit before force-killing.
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Poll interval when waiting for graceful stop.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
