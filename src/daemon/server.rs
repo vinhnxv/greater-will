@@ -485,58 +485,63 @@ mod tests {
     use crate::daemon::protocol::{write_message, read_message};
     use tempfile::TempDir;
 
-    fn with_temp_gw_home(f: impl FnOnce(&TempDir)) {
-        let tmp = TempDir::new().unwrap();
-        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
-        crate::daemon::state::ensure_gw_home().unwrap();
-        f(&tmp);
-        unsafe { std::env::remove_var("GW_HOME") };
-    }
-
     #[tokio::test]
     async fn server_accepts_and_responds() {
-        with_temp_gw_home(|tmp| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let socket_path = tmp.path().join("test.sock");
-                let registry = Arc::new(Mutex::new(RunRegistry::new()));
-                let cancel = CancellationToken::new();
+        // Set up GW_HOME under the serializing mutex (sync section)
+        let tmp = {
+            use std::sync::{Mutex as StdMutex, OnceLock};
+            static MUTEX: OnceLock<StdMutex<()>> = OnceLock::new();
+            let _guard = MUTEX
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let tmp = TempDir::new().unwrap();
+            unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+            crate::daemon::state::ensure_gw_home().unwrap();
+            tmp
+            // _guard drops here — OK because we only needed GW_HOME set for ensure_gw_home
+        };
 
-                let server = DaemonServer::new(
-                    Arc::clone(&registry),
-                    socket_path.clone(),
-                    cancel.clone(),
-                );
+        let socket_path = tmp.path().join("test.sock");
+        let registry = Arc::new(Mutex::new(RunRegistry::new()));
+        let cancel = CancellationToken::new();
 
-                // Spawn server in background
-                let server_handle = tokio::spawn(async move {
-                    let _ = server.start().await;
-                });
+        let server = DaemonServer::new(
+            Arc::clone(&registry),
+            socket_path.clone(),
+            cancel.clone(),
+        );
 
-                // Give server time to bind
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Connect and send DaemonStatus
-                let stream = tokio::net::UnixStream::connect(&socket_path)
-                    .await
-                    .unwrap();
-                let (mut reader, mut writer) = stream.into_split();
-
-                let req = Request::DaemonStatus;
-                write_message(&mut writer, &req).await.unwrap();
-
-                let resp: Response = read_message(&mut reader).await.unwrap();
-                match resp {
-                    Response::Ok { message } => {
-                        assert!(message.contains("daemon running"));
-                    }
-                    other => panic!("unexpected response: {other:?}"),
-                }
-
-                // Shutdown
-                cancel.cancel();
-                let _ = server_handle.await;
-            });
+        // Spawn server in background
+        let server_handle = tokio::spawn(async move {
+            let _ = server.start().await;
         });
+
+        // Give server time to bind
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Connect and send DaemonStatus
+        let stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        let req = Request::DaemonStatus;
+        write_message(&mut writer, &req).await.unwrap();
+
+        let resp: Response = read_message(&mut reader).await.unwrap();
+        match resp {
+            Response::Ok { message } => {
+                assert!(message.contains("daemon running"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Shutdown
+        cancel.cancel();
+        let _ = server_handle.await;
+
+        // Clean up GW_HOME
+        unsafe { std::env::remove_var("GW_HOME") };
     }
 }
