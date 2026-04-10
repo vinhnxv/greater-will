@@ -8,6 +8,7 @@ use crate::daemon::protocol::RunStatus;
 use crate::daemon::reconciler::check_checkpoint;
 use crate::daemon::registry::RunRegistry;
 use crate::daemon::state::gw_home;
+use crate::engine::single_session::util::is_pipeline_complete;
 use crate::session::spawn;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,30 +58,44 @@ impl HeartbeatMonitor {
     async fn check_all_runs(&self) {
         let registry = self.registry.lock().await;
 
-        // Collect run IDs to check (avoid holding lock during tmux calls)
-        let running: Vec<(String, Option<String>)> = registry
+        // Collect run IDs to check (avoid holding lock during tmux calls).
+        // Only include entries with a tmux session — entries without one
+        // (e.g., queued runs) are skipped to avoid inflating the dead count.
+        let running: Vec<String> = registry
             .list_runs(false)
             .iter()
             .filter(|r| r.status == RunStatus::Running)
-            .map(|r| (r.run_id.clone(), r.session_name.clone().into()))
+            .map(|r| r.run_id.clone())
             .collect();
 
         drop(registry); // Release lock before I/O
 
-        for (run_id, _session_name) in &running {
-            self.check_run(run_id).await;
+        let mut alive = 0u32;
+        let mut dead = 0u32;
+
+        for run_id in &running {
+            let was_alive = self.check_run(run_id).await;
+            if was_alive {
+                alive += 1;
+            } else {
+                dead += 1;
+            }
+        }
+
+        if !running.is_empty() {
+            debug!(alive = alive, dead = dead, "heartbeat tick");
         }
     }
 
-    /// Check a single run's health.
-    async fn check_run(&self, run_id: &str) {
+    /// Check a single run's health. Returns `true` if the session is alive.
+    async fn check_run(&self, run_id: &str) -> bool {
         let tmux_session = {
             let registry = self.registry.lock().await;
             match registry.get(run_id) {
                 Some(entry) if entry.status == RunStatus::Running => {
                     entry.tmux_session.clone()
                 }
-                _ => return, // Entry gone or no longer running
+                _ => return false, // Entry gone or no longer running
             }
         };
 
@@ -88,7 +103,7 @@ impl HeartbeatMonitor {
             Some(s) => s,
             None => {
                 debug!(run_id = %run_id, "no tmux session associated — skipping");
-                return;
+                return false;
             }
         };
 
@@ -100,6 +115,8 @@ impl HeartbeatMonitor {
         } else {
             self.handle_dead_session(run_id, &tmux_session).await;
         }
+
+        session_alive
     }
 
     /// Handle a healthy (alive) tmux session: capture logs and update phase.
@@ -331,28 +348,6 @@ pub fn log_run_started(run_id: &str, plan_path: &str) {
 /// Log a run stopped event.
 pub fn log_run_stopped(run_id: &str) {
     append_event(run_id, "stopped", "stopped by user");
-}
-
-// ── Pipeline completion detection ──────────────────────────────────
-
-/// Check pane output for signals that the arc pipeline has completed.
-///
-/// NOTE: This duplicates `engine::single_session::util::is_pipeline_complete`.
-/// The function itself is `pub(crate)`, but the `util` module is declared
-/// `mod util` (private) in `engine::single_session::mod.rs`, which is outside
-/// this fixer's file group. Removing this duplicate requires a separate
-/// change to make that module visibility `pub(crate)`. Tracked as QUAL-001.
-fn is_pipeline_complete(pane_content: &str) -> bool {
-    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
-    let tail = last_lines.join("\n").to_lowercase();
-
-    tail.contains("arc completed")
-        || tail.contains("all phases complete")
-        || tail.contains("pipeline completed")
-        || tail.contains("merge completed")
-        || tail.contains("arc run finished")
-        || tail.contains("the tarnished rests")
-        || tail.contains("arc result: success")
 }
 
 /// Spawn a crash recovery session for a failed run.

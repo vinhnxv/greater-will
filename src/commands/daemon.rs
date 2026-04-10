@@ -96,41 +96,108 @@ fn stop() -> Result<()> {
 
 /// Query and display daemon status.
 fn cmd_status() -> Result<()> {
+    let home = gw_home();
+
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
         println!("  Start with: gw daemon start");
         return Ok(());
     }
 
-    let client = DaemonClient::new()?;
+    let config = GlobalConfig::load()?;
 
-    // Get daemon status
-    match client.send(Request::DaemonStatus)? {
-        Response::Ok { message } => {
-            println!("{} Daemon is running", tag("OK"));
-            println!("  {}", message);
-        }
-        other => {
-            println!("{} Daemon responded: {:?}", tag("OK"), other);
-        }
+    // Read PID and compute uptime from PID file modification time
+    let pid_path = home.join("daemon.pid");
+    let pid = fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let uptime = fs::metadata(&pid_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok());
+
+    // Header
+    println!("{} Daemon is running", tag("OK"));
+
+    // PID + uptime
+    if let Some(p) = pid {
+        let uptime_str = uptime.map(format_duration).unwrap_or_else(|| "unknown".into());
+        println!("  PID:        {}", p);
+        println!("  Uptime:     {}", uptime_str);
     }
 
-    // Also show run count
+    // Paths
+    println!("  GW_HOME:    {}", home.display());
+    println!("  Socket:     {}", config.socket_path().display());
+    println!("  Log file:   {}", home.join("daemon.log").display());
+
+    // Run counts by status
     let client = DaemonClient::new()?;
-    match client.send(Request::ListRuns { all: false })? {
-        Response::RunList { runs } => {
-            let active = runs.iter().filter(|r| {
-                r.status == crate::daemon::protocol::RunStatus::Running
-                    || r.status == crate::daemon::protocol::RunStatus::Queued
-            }).count();
-            println!("  Active runs: {}", active);
-            println!("  Total tracked: {}", runs.len());
+    if let Response::RunList { runs } = client.send(Request::ListRuns { all: true })? {
+        use crate::daemon::protocol::RunStatus;
+        let running = runs.iter().filter(|r| r.status == RunStatus::Running).count();
+        let queued = runs.iter().filter(|r| r.status == RunStatus::Queued).count();
+        let succeeded = runs.iter().filter(|r| r.status == RunStatus::Succeeded).count();
+        let failed = runs.iter().filter(|r| r.status == RunStatus::Failed).count();
+        let stopped = runs.iter().filter(|r| r.status == RunStatus::Stopped).count();
+
+        println!();
+        println!("  Runs:");
+        println!("    Running:   {}", running);
+        if queued > 0 {
+            println!("    Queued:    {}", queued);
         }
-        _ => {}
+        println!("    Succeeded: {}", succeeded);
+        println!("    Failed:    {}", failed);
+        if stopped > 0 {
+            println!("    Stopped:   {}", stopped);
+        }
+        println!("    Total:     {}", runs.len());
     }
 
-    println!("  Socket: {}", GlobalConfig::load()?.socket_path().display());
+    // Last heartbeat — check pane.log mtime as a proxy
+    let runs_dir = home.join("runs");
+    if let Some(last_hb) = latest_heartbeat_time(&runs_dir) {
+        let ago = last_hb.elapsed().ok().map(format_duration).unwrap_or_else(|| "unknown".into());
+        println!();
+        println!("  Last heartbeat: {} ago", ago);
+    }
+
     Ok(())
+}
+
+/// Format a duration as a human-readable string (e.g., "2h 15m 30s").
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, mins)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, s)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+/// Find the most recent pane.log modification time across all runs.
+///
+/// The heartbeat monitor appends to `pane.log` on each tick, so its mtime
+/// serves as a proxy for the last heartbeat capture.
+fn latest_heartbeat_time(runs_dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let entries = fs::read_dir(runs_dir).ok()?;
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let log_path = e.path().join("logs").join("pane.log");
+            fs::metadata(&log_path).ok()?.modified().ok()
+        })
+        .max()
 }
 
 /// Restart the daemon.

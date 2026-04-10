@@ -11,12 +11,12 @@
 //! - Probe (is_daemon_running): 1 second
 
 use crate::daemon::protocol::{read_message, write_message, Request, Response};
-use crate::daemon::state::{gw_home, GlobalConfig};
+use crate::daemon::state::GlobalConfig;
 use color_eyre::{eyre::eyre, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Timeout for establishing a connection to the daemon.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,11 +39,6 @@ impl DaemonClient {
         Ok(Self {
             socket_path: config.socket_path(),
         })
-    }
-
-    /// Create a client pointing at a specific socket path.
-    pub fn with_path(socket_path: PathBuf) -> Self {
-        Self { socket_path }
     }
 
     /// Check whether the daemon socket exists and is connectable.
@@ -197,48 +192,4 @@ impl DaemonClient {
         })
     }
 
-    /// Stream logs for a run, calling `on_line` for each line received.
-    ///
-    /// This is a convenience wrapper around `send_streaming` that extracts
-    /// log data from `LogChunk` responses and splits into lines.
-    ///
-    /// Returns when the daemon closes the connection (run completed/failed)
-    /// or `on_line` returns `false`.
-    pub fn stream_logs<F>(&self, run_id: String, mut on_line: F) -> Result<()>
-    where
-        F: FnMut(&str) -> bool, // return false to stop
-    {
-        let request = Request::GetLogs {
-            run_id,
-            follow: true,
-            tail: None,
-            pane: false,
-        };
-
-        self.send_streaming(request, |resp| match resp {
-            Response::LogChunk { data, .. } => {
-                for line in data.lines() {
-                    if !on_line(line) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Response::Error { message, .. } => {
-                warn!(message = %message, "error from daemon during log streaming");
-                false
-            }
-            _ => true, // ignore unexpected response types
-        })
-    }
-
-    /// Return the socket path for display purposes.
-    pub fn socket_path(&self) -> &PathBuf {
-        &self.socket_path
-    }
-}
-
-/// Default socket path for display in error messages.
-pub fn default_socket_path() -> PathBuf {
-    gw_home().join("daemon.sock")
 }

@@ -230,6 +230,8 @@ impl RunRegistry {
     }
 
     /// Remove a run from registry and disk.
+    // Future daemon-side cleanup API — currently only exercised by tests.
+    #[allow(dead_code)]
     pub fn remove_run(&mut self, run_id: &str) -> Result<()> {
         if let Some(entry) = self.runs.remove(run_id) {
             let run_dir = gw_home().join("runs").join(run_id);
@@ -365,11 +367,22 @@ mod tests {
     use tempfile::TempDir;
 
     fn with_temp_gw_home(f: impl FnOnce(&TempDir)) {
+        use std::sync::{Mutex, OnceLock};
+        static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        // Recover from poison: a panicking test already fails; propagating
+        // lock poison would cascade failures to unrelated tests.
+        let _guard = MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let tmp = TempDir::new().unwrap();
         unsafe { std::env::set_var("GW_HOME", tmp.path()) };
         crate::daemon::state::ensure_gw_home().unwrap();
-        f(&tmp);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tmp)));
         unsafe { std::env::remove_var("GW_HOME") };
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]
