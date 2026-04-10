@@ -75,7 +75,10 @@ fn test_run_dry_run_with_group_filter() {
 
 #[test]
 fn test_run_invalid_group_error() {
+    // Isolate from any live daemon by pointing GW_HOME to a temp dir
+    let tmp = tempfile::tempdir().expect("create temp dir");
     gw()
+        .env("GW_HOME", tmp.path())
         .args(["run", "--multi-group", "--allow-dirty", "--group", "Z", "tests/fixtures/sample-plan.md"])
         .assert()
         .failure()
@@ -102,7 +105,10 @@ fn test_replay_missing_file() {
 
 #[test]
 fn test_status_no_active_batch() {
+    // Isolate from any live daemon by pointing GW_HOME to a temp dir
+    let tmp = tempfile::tempdir().expect("create temp dir");
     gw()
+        .env("GW_HOME", tmp.path())
         .arg("status")
         .assert()
         .success()
