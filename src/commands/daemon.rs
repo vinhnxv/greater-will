@@ -18,7 +18,10 @@ use std::process::Command;
 /// Dispatch a daemon action.
 pub fn execute(action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Start { foreground, verbose } => start(foreground, verbose),
+        DaemonAction::Start {
+            foreground,
+            verbose,
+        } => start(foreground, verbose),
         DaemonAction::Stop => stop(),
         DaemonAction::Status => cmd_status(),
         DaemonAction::Restart => restart(),
@@ -72,13 +75,20 @@ fn start(foreground: bool, verbose: u8) -> Result<()> {
             2 => "debug",
             _ => "trace",
         };
-        println!("{} Daemon started (pid: {}, log level: {})", tag("OK"), child.id(), level_label);
-        println!("  Socket: {}", GlobalConfig::load()?.socket_path().display());
+        println!(
+            "{} Daemon started (pid: {}, log level: {})",
+            tag("OK"),
+            child.id(),
+            level_label
+        );
+        println!(
+            "  Socket: {}",
+            GlobalConfig::load()?.socket_path().display()
+        );
 
         // Write PID file for tracking
         let pid_path = gw_home().join("daemon.pid");
-        fs::write(&pid_path, child.id().to_string())
-            .wrap_err("failed to write PID file")?;
+        fs::write(&pid_path, child.id().to_string()).wrap_err("failed to write PID file")?;
     }
 
     Ok(())
@@ -122,9 +132,7 @@ fn stop() -> Result<()> {
     //    in the brief window, unload will stop the new instance too.
     if service_is_loaded {
         unload_launchd_service();
-        println!(
-            "  (launchd service was unloaded — run `gw daemon install` to re-enable)"
-        );
+        println!("  (launchd service was unloaded — run `gw daemon install` to re-enable)");
     }
 
     Ok(())
@@ -166,6 +174,14 @@ fn unload_launchd_service() {
 fn cmd_status() -> Result<()> {
     let home = gw_home();
 
+    // Check for a crash loop flag first — it may be the *reason* the
+    // daemon is not running, so surface it prominently before anything
+    // else.  `read_crashloop_flag` returns None for both missing and
+    // malformed files, so this is a safe no-op when there is no flag.
+    if let Some(flag) = crate::daemon::read_crashloop_flag(&home) {
+        print_crashloop_banner(&flag);
+    }
+
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
         println!("  Start with: gw daemon start");
@@ -189,7 +205,9 @@ fn cmd_status() -> Result<()> {
 
     // PID + uptime
     if let Some(p) = pid {
-        let uptime_str = uptime.map(format_duration).unwrap_or_else(|| "unknown".into());
+        let uptime_str = uptime
+            .map(format_duration)
+            .unwrap_or_else(|| "unknown".into());
         println!("  PID:        {}", p);
         println!("  Uptime:     {}", uptime_str);
     }
@@ -203,11 +221,26 @@ fn cmd_status() -> Result<()> {
     let client = DaemonClient::new()?;
     if let Response::RunList { runs } = client.send(Request::ListRuns { all: true })? {
         use crate::daemon::protocol::RunStatus;
-        let running = runs.iter().filter(|r| r.status == RunStatus::Running).count();
-        let queued = runs.iter().filter(|r| r.status == RunStatus::Queued).count();
-        let succeeded = runs.iter().filter(|r| r.status == RunStatus::Succeeded).count();
-        let failed = runs.iter().filter(|r| r.status == RunStatus::Failed).count();
-        let stopped = runs.iter().filter(|r| r.status == RunStatus::Stopped).count();
+        let running = runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Running)
+            .count();
+        let queued = runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Queued)
+            .count();
+        let succeeded = runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Succeeded)
+            .count();
+        let failed = runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Failed)
+            .count();
+        let stopped = runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Stopped)
+            .count();
 
         println!();
         println!("  Runs:");
@@ -226,12 +259,43 @@ fn cmd_status() -> Result<()> {
     // Last heartbeat — check pane.log mtime as a proxy
     let runs_dir = home.join("runs");
     if let Some(last_hb) = latest_heartbeat_time(&runs_dir) {
-        let ago = last_hb.elapsed().ok().map(format_duration).unwrap_or_else(|| "unknown".into());
+        let ago = last_hb
+            .elapsed()
+            .ok()
+            .map(format_duration)
+            .unwrap_or_else(|| "unknown".into());
         println!();
         println!("  Last heartbeat: {} ago", ago);
     }
 
     Ok(())
+}
+
+/// Print a prominent banner warning that the daemon is halted by the
+/// crash-loop detector.
+///
+/// Called from `cmd_status` when `~/.gw/crashloop.flag` exists.  The
+/// banner must be visually loud because its presence means launchd
+/// respawn has stopped and the operator needs to intervene before the
+/// daemon will run again.
+fn print_crashloop_banner(flag: &crate::daemon::CrashLoopFlag) {
+    let bar = "━".repeat(60);
+    println!("{}", bar);
+    println!(
+        "{} CRASHLOOP DETECTED — daemon halted by launchd backoff",
+        tag("FAIL")
+    );
+    println!("{}", bar);
+    println!("  Crashes in window : {}", flag.crash_count);
+    println!("  Flag timestamp    : {} (unix)", flag.timestamp);
+    if let Some(err) = &flag.last_error {
+        println!("  Last error        : {err}");
+    }
+    println!("  Details           : {}", flag.message);
+    println!("  Recovery          : inspect ~/.gw/daemon.log, fix the root cause,");
+    println!("                      then `rm ~/.gw/crashloop.flag && gw daemon start`");
+    println!("{}", bar);
+    println!();
 }
 
 /// Format a duration as a human-readable string (e.g., "2h 15m 30s").
@@ -285,8 +349,7 @@ fn install() -> Result<()> {
         .ok_or_else(|| eyre::eyre!("cannot determine home directory"))?
         .join("Library/LaunchAgents");
 
-    fs::create_dir_all(&plist_dir)
-        .wrap_err("failed to create LaunchAgents directory")?;
+    fs::create_dir_all(&plist_dir).wrap_err("failed to create LaunchAgents directory")?;
 
     let plist_path = plist_dir.join("com.greater-will.daemon.plist");
     let exe = std::env::current_exe().wrap_err("failed to determine executable path")?;
@@ -363,7 +426,10 @@ fn uninstall() -> Result<()> {
         .wrap_err("failed to run launchctl unload")?;
 
     if !status.success() {
-        println!("{} launchctl unload returned non-zero (service may not have been loaded)", tag("WARN"));
+        println!(
+            "{} launchctl unload returned non-zero (service may not have been loaded)",
+            tag("WARN")
+        );
     }
 
     // Remove the plist file
