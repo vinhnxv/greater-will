@@ -129,8 +129,15 @@ impl DaemonServer {
                 std::fs::remove_file(socket_path)
                     .wrap_err("failed to remove stale socket file")?;
             } else {
+                // Read PID for actionable error message
+                let pid_info = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|p| format!(" (PID {})", p))
+                    .unwrap_or_default();
                 return Err(color_eyre::eyre::eyre!(
-                    "another daemon is already running (socket exists with live PID)"
+                    "Another daemon is already running{}. Run `gw daemon stop` first.",
+                    pid_info
                 ));
             }
         }
