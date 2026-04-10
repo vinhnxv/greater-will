@@ -726,7 +726,7 @@ fn delegate_to_daemon(plans: &[String], cwd: &Path) -> Result<()> {
 
         match client.send(request)? {
             Response::RunSubmitted { run_id } => {
-                let short = if run_id.len() > 8 { &run_id[..8] } else { &run_id };
+                let short = crate::commands::util::short_id(&run_id);
                 println!("{} Submitted: {} -> run {}", tag("OK"), plan, short);
                 println!("  Monitor: gw ps");
                 println!("  Logs:    gw logs {}", short);

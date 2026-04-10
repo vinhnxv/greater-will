@@ -12,6 +12,7 @@ pub mod replay;
 pub mod run;
 pub mod status;
 pub mod stop;
+pub(crate) mod util;
 
 // Re-export Commands from cli_args for convenience
 pub use crate::config::cli_args::Commands;

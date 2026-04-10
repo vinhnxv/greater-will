@@ -7,9 +7,13 @@ pub mod server;
 pub mod state;
 
 use color_eyre::{eyre::WrapErr, Result};
+use fs2::FileExt;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use tracing_appender::rolling;
 
 use crate::daemon::registry::RunRegistry;
@@ -32,24 +36,45 @@ pub async fn start_daemon() -> Result<()> {
     // 1. Ensure directory structure
     let home = ensure_gw_home()?;
 
-    // 2. Check for existing daemon
+    // 2. Open the PID file and acquire an exclusive OS-level lock.
+    //    The lock is released automatically by the kernel when this process
+    //    exits — clean shutdown or crash — so stale PID files cannot cause
+    //    a lockout. `try_lock_exclusive` is non-blocking: failure means
+    //    another daemon already holds the lock.
     let pid_path = home.join("daemon.pid");
-    if pid_path.exists() {
-        let content = std::fs::read_to_string(&pid_path).unwrap_or_default();
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            if crate::cleanup::process::is_pid_alive(pid) {
-                return Err(color_eyre::eyre::eyre!(
-                    "daemon already running (PID {pid}). Stop it first with `gw daemon stop`."
-                ));
-            }
-            tracing::info!(stale_pid = pid, "removing stale PID file");
-        }
+    let mut pid_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&pid_path)
+        .wrap_err("failed to open daemon PID file")?;
+
+    if FileExt::try_lock_exclusive(&pid_file).is_err() {
+        // Another daemon owns the lock — read its PID for a helpful error.
+        let existing = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        return Err(color_eyre::eyre::eyre!(
+            "daemon already running (PID {}). Stop it first with `gw daemon stop`.",
+            existing.trim()
+        ));
     }
 
-    // 3. Write our PID file
+    // 3. Lock acquired — write our PID atomically into the locked file.
+    //    `pid_file` must remain in scope for the full daemon lifetime so
+    //    the OS keeps the lock held.
     let our_pid = std::process::id();
-    std::fs::write(&pid_path, our_pid.to_string())
+    pid_file
+        .set_len(0)
+        .wrap_err("failed to truncate daemon PID file")?;
+    pid_file
+        .seek(SeekFrom::Start(0))
+        .wrap_err("failed to seek daemon PID file")?;
+    pid_file
+        .write_all(our_pid.to_string().as_bytes())
         .wrap_err("failed to write daemon PID file")?;
+    pid_file
+        .flush()
+        .wrap_err("failed to flush daemon PID file")?;
 
     // 4. Init tracing to daemon.log with daily rotation
     let log_dir = home.clone();
@@ -64,7 +89,7 @@ pub async fn start_daemon() -> Result<()> {
     // Only set if not already set (tests may have their own subscriber)
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    tracing::info!(pid = our_pid, home = %home.display(), "daemon starting");
+    info!(pid = our_pid, home = %home.display(), "daemon starting");
 
     // 5. Load run registry from disk
     let config = GlobalConfig::load()?;
@@ -79,7 +104,7 @@ pub async fn start_daemon() -> Result<()> {
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.start().await {
-            tracing::error!(error = %e, "server exited with error");
+            error!(error = %e, "server exited with error");
         }
     });
 
@@ -87,7 +112,7 @@ pub async fn start_daemon() -> Result<()> {
     let shutdown_cancel = cancel.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("received shutdown signal");
+        info!("received shutdown signal");
         shutdown_cancel.cancel();
     });
 
@@ -99,7 +124,7 @@ pub async fn start_daemon() -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("failed to register SIGTERM handler");
             sigterm.recv().await;
-            tracing::info!("received SIGTERM");
+            info!("received SIGTERM");
             term_cancel.cancel();
         });
     }
@@ -107,17 +132,22 @@ pub async fn start_daemon() -> Result<()> {
     // Wait for server to finish (it exits when cancel fires)
     let _ = server_handle.await;
 
-    // 8. Graceful shutdown: clean up old runs, remove PID file
-    tracing::info!("daemon shutting down");
+    // 8. Graceful shutdown: clean up old runs, release lock, remove PID file.
+    info!("daemon shutting down");
     state::cleanup_old_runs(config.retention)?;
+
+    // Explicitly release the exclusive lock before unlinking the PID file.
+    // (Drop would also release it, but being explicit documents the intent.)
+    let _ = FileExt::unlock(&pid_file);
+    drop(pid_file);
 
     if let Err(e) = std::fs::remove_file(&pid_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(error = %e, "failed to remove PID file");
+            warn!(error = %e, "failed to remove PID file");
         }
     }
 
-    tracing::info!("daemon stopped");
+    info!("daemon stopped");
     Ok(())
 }
 
@@ -138,6 +168,15 @@ pub fn stop_daemon() -> Result<()> {
         .parse()
         .wrap_err("invalid PID in daemon.pid")?;
 
+    // Reject unsafe target PIDs before ever calling libc::kill.
+    // PID 0 sends the signal to the caller's entire process group, and
+    // PID 1 is init/systemd — signalling either is catastrophic.
+    if pid <= 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "refusing to signal PID {pid}: 0 targets the caller's process group and 1 is init"
+        ));
+    }
+
     if !crate::cleanup::process::is_pid_alive(pid) {
         // Stale PID file — clean up
         let _ = std::fs::remove_file(&pid_path);
@@ -146,7 +185,11 @@ pub fn stop_daemon() -> Result<()> {
         ));
     }
 
-    tracing::info!(pid = pid, "sending SIGTERM to daemon");
+    info!(pid = pid, "sending SIGTERM to daemon");
+    // SAFETY: `pid` is validated > 1 above, so this cannot target PID 0
+    // (process group) or PID 1 (init). The conversion `pid as i32` is sound
+    // because std::process::id returns u32 which on all supported Unix
+    // platforms fits comfortably in a positive i32 pid_t.
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
@@ -155,14 +198,15 @@ pub fn stop_daemon() -> Result<()> {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !crate::cleanup::process::is_pid_alive(pid) {
-            tracing::info!(pid = pid, "daemon stopped");
+            info!(pid = pid, "daemon stopped");
             let _ = std::fs::remove_file(&pid_path);
             return Ok(());
         }
     }
 
     // Force kill
-    tracing::warn!(pid = pid, "daemon did not stop gracefully, sending SIGKILL");
+    warn!(pid = pid, "daemon did not stop gracefully, sending SIGKILL");
+    // SAFETY: same validation as above — `pid > 1` checked at entry.
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
     }

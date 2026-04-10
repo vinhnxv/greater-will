@@ -4,6 +4,7 @@
 //! Each connection uses length-prefixed JSON framing (see `protocol.rs`).
 
 use color_eyre::{eyre::WrapErr, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -12,7 +13,7 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::protocol::{
-    read_message, write_message, ErrorCode, Request, Response, RunStatus,
+    read_message, write_message, ErrorCode, Request, Response,
 };
 use crate::daemon::registry::RunRegistry;
 
@@ -50,6 +51,20 @@ impl DaemonServer {
         let listener = UnixListener::bind(&self.socket_path)
             .wrap_err_with(|| format!("failed to bind socket: {}", self.socket_path.display()))?;
 
+        // SEC-003: Restrict socket to owner-only (rw-------). Unix domain
+        // sockets ignore `umask` on many platforms, so without this any local
+        // user could connect and submit/cancel runs as the daemon owner.
+        std::fs::set_permissions(
+            &self.socket_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to set 0600 permissions on socket: {}",
+                self.socket_path.display()
+            )
+        })?;
+
         tracing::info!(path = %self.socket_path.display(), "daemon listening");
 
         loop {
@@ -83,6 +98,13 @@ impl DaemonServer {
     }
 
     /// Remove stale socket file if it exists and no daemon owns it.
+    ///
+    /// SEC-006: There is a theoretical TOCTOU window between reading
+    /// `daemon.pid`, deciding the socket is stale, and removing it. That
+    /// window is closed by the `daemon.pid` flock acquired in
+    /// `daemon/mod.rs` (see SEC-001): the flock guarantees that only one
+    /// daemon process can reach this codepath for a given `socket_path`
+    /// at a time, so no other daemon can race us to recreate the socket.
     fn cleanup_stale_socket(socket_path: &Path) -> Result<()> {
         if socket_path.exists() {
             // Check if a daemon PID file exists and process is alive
@@ -184,17 +206,58 @@ async fn dispatch_request(
             repo_dir,
             session_name,
         } => {
-            let mut reg = registry.lock().await;
-            match reg.register_run(plan_path, repo_dir, session_name) {
+            // SEC-008: Validate repo_dir first, then ensure the plan_path
+            // resolves *inside* the canonicalized repo root. Without this a
+            // client could direct the daemon to spawn `/etc/shadow` or any
+            // other file outside the project.
+            let canonical_repo = match validate_repo_dir(&repo_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid repo_dir: {e}"),
+                    };
+                }
+            };
+            let canonical_plan = match validate_plan_path(&plan_path, &canonical_repo) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid plan_path: {e}"),
+                    };
+                }
+            };
+
+            // BACK-003: Delegate to `executor::spawn_run`, which registers
+            // the run AND spawns the tmux session. Previously the handler
+            // only called `reg.register_run()` and never started tmux, so
+            // every submitted run sat in the Queued state forever.
+            //
+            // Note: `executor::spawn_run` internally calls `register_run`,
+            // so we MUST NOT call it ourselves beforehand — the per-repo
+            // flock would reject the nested registration. The call is
+            // awaited inline (not wrapped in `tokio::spawn`) because the
+            // registry lock is only held briefly inside the executor, the
+            // tmux work is sub-second, and we need the returned run_id for
+            // the synchronous response.
+            match crate::daemon::executor::spawn_run(
+                Arc::clone(registry),
+                &canonical_plan,
+                &canonical_repo,
+                session_name,
+            )
+            .await
+            {
                 Ok(run_id) => Response::RunSubmitted { run_id },
                 Err(e) => {
-                    let message = e.to_string();
-                    let code = if message.contains("locked") {
-                        ErrorCode::RepoLocked
-                    } else {
-                        ErrorCode::InternalError
-                    };
-                    Response::Error { code, message }
+                    // QUAL-005: classify errors into typed ErrorCode
+                    // variants instead of a naive `contains("locked")`.
+                    let code = classify_spawn_error(&e);
+                    Response::Error {
+                        code,
+                        message: e.to_string(),
+                    }
                 }
             }
         }
@@ -205,16 +268,28 @@ async fn dispatch_request(
             Response::RunList { runs }
         }
 
-        Request::GetLogs { run_id, .. } => {
+        Request::GetLogs {
+            run_id,
+            follow: _,
+            tail,
+        } => {
             let reg = registry.lock().await;
             match reg.find_by_prefix(&run_id) {
                 Some(entry) => {
-                    // Read log file for this run
+                    // FLAW-002: Read the file the heartbeat monitor actually
+                    // writes to (`<gw_home>/runs/<id>/logs/session.log`).
+                    // The previous path (`output.log`) was never produced
+                    // by any component, so `get-logs` always returned "".
                     let log_path = crate::daemon::state::gw_home()
                         .join("runs")
                         .join(&entry.run_id)
-                        .join("output.log");
-                    let data = std::fs::read_to_string(&log_path).unwrap_or_default();
+                        .join("logs")
+                        .join("session.log");
+                    // SEC-004: Read only the last `tail` bytes (or a 1 MB
+                    // cap when unset). Previously `std::fs::read_to_string`
+                    // loaded the entire file, so a multi-GB log could OOM
+                    // the daemon process.
+                    let data = read_log_tail(&log_path, tail);
                     Response::LogChunk {
                         run_id: entry.run_id.clone(),
                         data,
@@ -228,23 +303,35 @@ async fn dispatch_request(
         }
 
         Request::StopRun { run_id } => {
-            let mut reg = registry.lock().await;
-            match reg.find_by_prefix(&run_id) {
-                Some(entry) => {
-                    let actual_id = entry.run_id.clone();
-                    match reg.update_status(&actual_id, RunStatus::Stopped, None, None) {
-                        Ok(()) => Response::Ok {
-                            message: format!("run {actual_id} stopped"),
-                        },
-                        Err(e) => Response::Error {
-                            code: ErrorCode::InternalError,
-                            message: e.to_string(),
-                        },
+            // Resolve the prefix to a full run_id under a short-lived lock,
+            // then release the lock before delegating to the executor (which
+            // re-acquires it briefly at the end).
+            let actual_id = {
+                let reg = registry.lock().await;
+                match reg.find_by_prefix(&run_id) {
+                    Some(entry) => entry.run_id.clone(),
+                    None => {
+                        return Response::Error {
+                            code: ErrorCode::RunNotFound,
+                            message: format!("no run matching prefix: {run_id}"),
+                        };
                     }
                 }
-                None => Response::Error {
-                    code: ErrorCode::RunNotFound,
-                    message: format!("no run matching prefix: {run_id}"),
+            };
+
+            // SEC-002: Delegate to `executor::stop_run`, which sends /exit
+            // to the tmux session, waits for graceful shutdown, force-kills
+            // on timeout, and then updates the registry. The previous code
+            // only mutated the registry — it left the tmux session (and
+            // its arc worker) running, leaking resources and making the
+            // "stopped" state a lie.
+            match crate::daemon::executor::stop_run(Arc::clone(registry), &actual_id).await {
+                Ok(()) => Response::Ok {
+                    message: format!("run {actual_id} stopped"),
+                },
+                Err(e) => Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
                 },
             }
         }
@@ -268,6 +355,126 @@ async fn dispatch_request(
                 message: "shutting down".into(),
             }
         }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Upper bound on log bytes returned when a client does not specify `tail`.
+/// Chosen at 1 MB — large enough to be useful for most cases, small enough
+/// that we will not exhaust daemon memory on a multi-GB rogue log.
+const DEFAULT_LOG_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Read the trailing bytes of a log file without loading the whole file.
+///
+/// If `tail` is `Some(n)` with `n > 0`, reads the last `n` bytes; otherwise
+/// defaults to [`DEFAULT_LOG_TAIL_BYTES`]. Missing / unreadable files yield
+/// an empty string so the wire protocol stays on the happy path — callers
+/// can distinguish "no logs yet" from "run missing" via the `RunNotFound`
+/// branch above.
+///
+/// SEC-004: Bounds the read so an attacker (or a runaway process) cannot
+/// force the daemon to allocate arbitrary memory for a single IPC call.
+fn read_log_tail(path: &Path, tail: Option<usize>) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return String::new(),
+    };
+
+    let want_bytes: u64 = match tail {
+        Some(n) if n > 0 => n as u64,
+        _ => DEFAULT_LOG_TAIL_BYTES,
+    };
+
+    let start = file_len.saturating_sub(want_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+
+    let capacity = want_bytes.min(file_len) as usize;
+    let mut buf = Vec::with_capacity(capacity);
+    if file.take(want_bytes).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Validate a repo directory path supplied by an IPC client.
+///
+/// SEC-008: Rejects any `..` components in the *raw* input (defense-in-depth,
+/// even if canonicalization would resolve them) and then canonicalizes,
+/// which implicitly enforces that the directory exists and is accessible.
+fn validate_repo_dir(repo_dir: &Path) -> Result<PathBuf> {
+    for component in repo_dir.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(color_eyre::eyre::eyre!(
+                "repo_dir contains '..' component"
+            ));
+        }
+    }
+    repo_dir
+        .canonicalize()
+        .wrap_err_with(|| format!("repo_dir does not exist: {}", repo_dir.display()))
+}
+
+/// Validate a plan file path and enforce that it resolves inside `allowed_root`.
+///
+/// SEC-008: The `..`-component rejection is defense-in-depth on top of the
+/// canonical-path prefix check, which is the real security boundary. A
+/// plan_path that canonicalizes outside the repo root (e.g., via a symlink)
+/// will be rejected here.
+fn validate_plan_path(plan_path: &Path, allowed_root: &Path) -> Result<PathBuf> {
+    for component in plan_path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(color_eyre::eyre::eyre!(
+                "plan_path contains '..' component"
+            ));
+        }
+    }
+
+    let canonical = plan_path
+        .canonicalize()
+        .wrap_err_with(|| format!("plan_path does not exist: {}", plan_path.display()))?;
+
+    if !canonical.starts_with(allowed_root) {
+        return Err(color_eyre::eyre::eyre!(
+            "plan_path {} is outside allowed root {}",
+            canonical.display(),
+            allowed_root.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
+/// Classify an error returned from `executor::spawn_run` (or its inner
+/// `register_run` call) into a wire `ErrorCode`.
+///
+/// QUAL-005: Improves over the previous naive `message.contains("locked")`
+/// by recognising both known lock-error phrasings and the executor's
+/// pre-flight messages. A fully typed error hierarchy would require
+/// refactoring `RunRegistry::register_run`, which is out of scope for this
+/// file's fix group.
+fn classify_spawn_error(e: &color_eyre::Report) -> ErrorCode {
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("locked")
+        || msg.contains("already has an active run")
+    {
+        ErrorCode::RepoLocked
+    } else if msg.contains("plan file not found")
+        || msg.contains("repository directory not found")
+    {
+        ErrorCode::InvalidRequest
+    } else {
+        ErrorCode::InternalError
     }
 }
 

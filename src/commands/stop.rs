@@ -18,7 +18,7 @@ pub fn execute(run_id: String) -> Result<()> {
         return Ok(());
     }
 
-    let short = if run_id.len() > 8 { &run_id[..8] } else { &run_id };
+    let short = crate::commands::util::short_id(&run_id);
     println!("Stopping run {}...", short);
 
     let client = DaemonClient::new()?;

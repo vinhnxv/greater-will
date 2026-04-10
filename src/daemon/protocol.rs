@@ -107,6 +107,14 @@ where
     T: Serialize,
 {
     let payload = serde_json::to_vec(msg)?;
+    // Enforce the same upper bound read_message enforces, so an oversized
+    // message is rejected before truncating via the `as u32` cast below.
+    if payload.len() > MAX_MESSAGE_SIZE as usize {
+        return Err(color_eyre::eyre::eyre!(
+            "message size {} exceeds maximum {MAX_MESSAGE_SIZE}",
+            payload.len()
+        ));
+    }
     let len = payload.len() as u32;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&payload).await?;

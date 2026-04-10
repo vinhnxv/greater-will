@@ -5,6 +5,7 @@
 //! by either auto-resuming (if a checkpoint exists) or marking as Failed.
 
 use crate::daemon::protocol::RunStatus;
+use crate::daemon::reconciler::check_checkpoint;
 use crate::daemon::registry::RunRegistry;
 use crate::daemon::state::gw_home;
 use crate::session::spawn;
@@ -126,7 +127,7 @@ impl HeartbeatMonitor {
         };
 
         // Check if we have a checkpoint for crash recovery
-        let checkpoint_exists = self.has_checkpoint(&entry.repo_dir);
+        let checkpoint_exists = check_checkpoint(&entry.repo_dir);
 
         if checkpoint_exists && entry.crash_restarts < MAX_CRASH_RESTARTS {
             info!(
@@ -190,23 +191,6 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Check if a checkpoint exists in the repo's .rune directory.
-    fn has_checkpoint(&self, repo_dir: &std::path::Path) -> bool {
-        let rune_dir = repo_dir.join(".rune").join("arc");
-        if !rune_dir.is_dir() {
-            return false;
-        }
-        // Look for any checkpoint.json under .rune/arc/
-        std::fs::read_dir(&rune_dir)
-            .ok()
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|e| e.path().join("checkpoint.json").exists())
-            })
-            .unwrap_or(false)
-    }
-
     /// Append captured pane content to the session log.
     fn append_session_log(&self, run_id: &str, content: &str) {
         let log_dir = gw_home().join("runs").join(run_id).join("logs");
@@ -266,6 +250,21 @@ impl HeartbeatMonitor {
         if is_pipeline_complete(pane_content) {
             info!(run_id = %run_id, "pipeline completed");
             let mut registry = self.registry.lock().await;
+            // Re-check status: stop_run (or another path) may have mutated the
+            // entry between our earlier lock drop and this re-acquisition. If
+            // the run is no longer Running, skip the Succeeded update to avoid
+            // overwriting a Stopped/Failed terminal state.
+            let still_running = registry
+                .get(run_id)
+                .map(|e| e.status == RunStatus::Running)
+                .unwrap_or(false);
+            if !still_running {
+                debug!(
+                    run_id = %run_id,
+                    "status changed since alive-check began — skipping completion update"
+                );
+                return;
+            }
             let _ = registry.update_status(
                 run_id,
                 RunStatus::Succeeded,
@@ -274,6 +273,26 @@ impl HeartbeatMonitor {
             );
         }
     }
+}
+
+/// Check pane output for signals that the arc pipeline has completed.
+///
+/// NOTE: This duplicates `engine::single_session::util::is_pipeline_complete`.
+/// The function itself is `pub(crate)`, but the `util` module is declared
+/// `mod util` (private) in `engine::single_session::mod.rs`, which is outside
+/// this fixer's file group. Removing this duplicate requires a separate
+/// change to make that module visibility `pub(crate)`. Tracked as QUAL-001.
+fn is_pipeline_complete(pane_content: &str) -> bool {
+    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
+    let tail = last_lines.join("\n").to_lowercase();
+
+    tail.contains("arc completed")
+        || tail.contains("all phases complete")
+        || tail.contains("pipeline completed")
+        || tail.contains("merge completed")
+        || tail.contains("arc run finished")
+        || tail.contains("the tarnished rests")
+        || tail.contains("arc result: success")
 }
 
 /// Spawn a crash recovery session for a failed run.
@@ -287,6 +306,11 @@ async fn spawn_recovery(
     _session_name: &str,
 ) {
     let tmux_session = format!("gw-{}", run_id);
+
+    // Clear any lingering tmux session with the same name before recreating.
+    // This is idempotent: kill_session returns Err if the session does not
+    // exist, which we deliberately ignore.
+    let _ = spawn::kill_session(&tmux_session);
 
     info!(
         run_id = %run_id,
@@ -349,19 +373,3 @@ async fn spawn_recovery(
     }
 }
 
-/// Check pane output for signals that the arc pipeline has completed.
-///
-/// Mirrors the logic from `engine::single_session::util::is_pipeline_complete`
-/// which is private. Duplicated here to avoid modifying module visibility.
-fn is_pipeline_complete(pane_content: &str) -> bool {
-    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
-    let tail = last_lines.join("\n").to_lowercase();
-
-    tail.contains("arc completed")
-        || tail.contains("all phases complete")
-        || tail.contains("pipeline completed")
-        || tail.contains("merge completed")
-        || tail.contains("arc run finished")
-        || tail.contains("the tarnished rests")
-        || tail.contains("arc result: success")
-}

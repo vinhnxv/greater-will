@@ -40,13 +40,7 @@ fn start(foreground: bool) -> Result<()> {
     if foreground {
         println!("{} Starting daemon in foreground...", tag("RUN"));
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            println!("Daemon listening on {}", GlobalConfig::load()?.socket_path().display());
-            println!("Press Ctrl+C to stop.");
-            tokio::signal::ctrl_c().await?;
-            println!("\nShutting down...");
-            Ok::<(), color_eyre::Report>(())
-        })?;
+        rt.block_on(crate::daemon::start_daemon())?;
     } else {
         println!("{} Starting daemon in background...", tag("RUN"));
 

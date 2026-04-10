@@ -64,7 +64,7 @@ fn show_daemon_status() -> Result<()> {
             } else {
                 println!();
                 for run in &runs {
-                    let short = if run.run_id.len() > 8 { &run.run_id[..8] } else { &run.run_id };
+                    let short = crate::commands::util::short_id(&run.run_id);
                     let status_tag = match run.status {
                         RunStatus::Running => tag("RUN"),
                         RunStatus::Queued => tag("WARN"),

@@ -4,6 +4,7 @@
 //! with color-coded status indicators.
 
 use crate::client::socket::DaemonClient;
+use crate::commands::util::short_id;
 use crate::daemon::protocol::{Request, Response, RunInfo, RunStatus};
 use crate::output::tags::tag;
 use color_eyre::Result;
@@ -55,12 +56,7 @@ fn print_table(runs: &[RunInfo]) {
     println!("{}", "-".repeat(78));
 
     for run in runs {
-        let short_id = if run.run_id.len() > 8 {
-            &run.run_id[..8]
-        } else {
-            &run.run_id
-        };
-
+        let id = short_id(&run.run_id);
         let status_str = format_status(run.status);
         let plan = abbreviate_path(&run.plan_path.to_string_lossy(), 24);
         let repo = abbreviate_path(&run.repo_dir.to_string_lossy(), 10);
@@ -69,7 +65,7 @@ fn print_table(runs: &[RunInfo]) {
 
         println!(
             "{:<10} {:<10} {:<26} {:<12} {:<10} {}",
-            short_id, status_str, plan, repo, phase, uptime
+            id, status_str, plan, repo, phase, uptime
         );
     }
 

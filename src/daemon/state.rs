@@ -3,6 +3,7 @@
 //! Manages the `~/.gw/` directory hierarchy where the daemon stores
 //! run state, configuration, and per-repo metadata.
 
+use crate::daemon::protocol::RunStatus;
 use color_eyre::{eyre::WrapErr, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,12 @@ const DEFAULT_RETENTION: usize = 50;
 
 /// Default socket filename within GW_HOME.
 const DEFAULT_SOCKET_NAME: &str = "daemon.sock";
+
+/// Default cap on concurrent runs. A non-zero default prevents accidental
+/// resource exhaustion on hosts where the config file is missing or partial.
+/// Operators who really want no limit must set `max_concurrent_runs = 0`
+/// explicitly in `~/.gw/config.toml`.
+const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 
 // ── Path helpers ─────────────────────────────────────────────────────
 
@@ -63,8 +70,11 @@ pub struct GlobalConfig {
     #[serde(default = "default_socket_name")]
     pub socket_name: String,
 
-    /// Maximum concurrent runs (0 = unlimited).
-    #[serde(default)]
+    /// Maximum concurrent runs. `0` means unlimited (opt-in only — must be
+    /// set explicitly in `config.toml`). The default is
+    /// `DEFAULT_MAX_CONCURRENT_RUNS` to prevent accidental resource
+    /// exhaustion when the config file is missing or omits this field.
+    #[serde(default = "default_max_concurrent_runs")]
     pub max_concurrent_runs: usize,
 }
 
@@ -76,12 +86,16 @@ fn default_socket_name() -> String {
     DEFAULT_SOCKET_NAME.to_string()
 }
 
+fn default_max_concurrent_runs() -> usize {
+    DEFAULT_MAX_CONCURRENT_RUNS
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             retention: DEFAULT_RETENTION,
             socket_name: DEFAULT_SOCKET_NAME.to_string(),
-            max_concurrent_runs: 0,
+            max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
         }
     }
 }
@@ -150,6 +164,15 @@ pub fn cleanup_old_runs_in(runs_dir: &Path, retention: usize) -> Result<()> {
     let to_remove = entries.len() - retention;
     for entry in entries.into_iter().take(to_remove) {
         let path = entry.path();
+
+        // Safety: never delete an active run (Running or Queued).
+        // Read meta.json and skip if the run is still live. If the meta file
+        // is missing or unreadable, assume the run is inactive (best-effort).
+        if is_run_active(&path) {
+            debug!("skipping active run: {}", path.display());
+            continue;
+        }
+
         debug!("removing old run directory: {}", path.display());
         if let Err(e) = std::fs::remove_dir_all(&path) {
             warn!("failed to remove {}: {e}", path.display());
@@ -157,6 +180,26 @@ pub fn cleanup_old_runs_in(runs_dir: &Path, retention: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read `<run_dir>/meta.json` and return `true` if the run's status is
+/// `Running` or `Queued`. Returns `false` if the file is missing or
+/// malformed — treating unknown runs as inactive is the safe default for
+/// cleanup (an active run will always have a valid meta file).
+fn is_run_active(run_dir: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct StatusOnly {
+        status: RunStatus,
+    }
+
+    let meta_path = run_dir.join("meta.json");
+    let Ok(content) = std::fs::read_to_string(&meta_path) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<StatusOnly>(&content) else {
+        return false;
+    };
+    matches!(meta.status, RunStatus::Running | RunStatus::Queued)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -180,7 +223,7 @@ mod tests {
         let cfg = GlobalConfig::default();
         assert_eq!(cfg.retention, 50);
         assert_eq!(cfg.socket_name, "daemon.sock");
-        assert_eq!(cfg.max_concurrent_runs, 0);
+        assert_eq!(cfg.max_concurrent_runs, DEFAULT_MAX_CONCURRENT_RUNS);
     }
 
     #[test]
@@ -212,7 +255,7 @@ max_concurrent_runs = 4
         let cfg = GlobalConfig::load_from(tmp.path()).unwrap();
         assert_eq!(cfg.retention, 5);
         assert_eq!(cfg.socket_name, "daemon.sock"); // default
-        assert_eq!(cfg.max_concurrent_runs, 0); // default
+        assert_eq!(cfg.max_concurrent_runs, DEFAULT_MAX_CONCURRENT_RUNS); // default
     }
 
     #[test]

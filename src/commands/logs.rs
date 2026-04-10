@@ -5,6 +5,7 @@
 //! limit initial output.
 
 use crate::client::socket::DaemonClient;
+use crate::commands::util::short_id;
 use crate::daemon::protocol::{Request, Response};
 use crate::output::tags::tag;
 use color_eyre::Result;
@@ -68,9 +69,4 @@ pub fn execute(run_id: String, follow: bool, tail: Option<usize>) -> Result<()> 
     }
 
     Ok(())
-}
-
-/// Shorten a run ID for display.
-fn short_id(id: &str) -> &str {
-    if id.len() > 8 { &id[..8] } else { id }
 }

@@ -114,11 +114,21 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
         let has_checkpoint = check_checkpoint(repo_dir);
 
         if has_checkpoint {
-            // STALE with checkpoint → mark for auto-resume
+            // STALE with checkpoint → mark for auto-resume.
+            //
+            // Convention: set `tmux_session` to the canonical `gw-{run_id}` name as a
+            // synthetic marker. That session does not exist (we already know tmux is
+            // dead for this run), so on the next heartbeat tick the monitor will
+            // invoke `handle_dead_session`, see the checkpoint, and call
+            // `spawn_recovery`. Leaving `tmux_session = None` would cause the
+            // heartbeat to skip the entry entirely, leaving the run permanently stuck.
             info!(
                 run_id = %run_id,
                 "STALE: tmux dead but checkpoint exists — marking for auto-resume"
             );
+            if let Some(entry) = registry.get_mut(run_id) {
+                entry.tmux_session = Some(format!("gw-{run_id}"));
+            }
             if let Err(e) = registry.update_status(
                 run_id,
                 RunStatus::Running,
@@ -226,7 +236,10 @@ fn find_stale_runs(
 }
 
 /// Check if a checkpoint exists for a repo.
-fn check_checkpoint(repo_dir: &std::path::Path) -> bool {
+///
+/// Returns `true` if any `.rune/arc/*/checkpoint.json` file exists under
+/// `repo_dir`. Shared with the heartbeat monitor to avoid duplication.
+pub(crate) fn check_checkpoint(repo_dir: &std::path::Path) -> bool {
     let rune_dir = repo_dir.join(".rune").join("arc");
     if !rune_dir.is_dir() {
         return false;
