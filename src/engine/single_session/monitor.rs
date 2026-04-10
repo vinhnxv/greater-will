@@ -134,38 +134,57 @@ pub(crate) fn monitor_session(
     // When the file disappears, we wait for a grace period before acting,
     // to avoid false positives from Rune briefly rewriting the file.
     let mut loop_state_gone_since: Option<Instant> = None;
-    const LOOP_STATE_GONE_GRACE_SECS: u64 = 15;
+    const LOOP_STATE_GONE_GRACE_SECS: u64 = 300; // 5 min minimum — give Rune time to self-heal
 
     // Content change tracking: detect field-level changes in the loop state file.
     // Tracks iteration progression, anomalous field mutations, and content stall.
     let mut prev_loop_state: Option<crate::monitor::loop_state::ArcLoopState> = None;
     let mut last_loop_state_change = Instant::now();
 
-    // Error confirmation state: when confidence is in the "watch" zone (0.5-0.8),
-    // we start a confirmation timer. If the timer expires without new activity,
-    // we kill. Any heartbeat/artifact/checkpoint change cancels the pending kill.
+    // ─── UNIFIED KILL GATE ─────────────────────────────────────────────
     //
-    // | Confidence | Confirmation Period | Rationale |
-    // |------------|-------------------|-----------|
-    // | < 0.5      | never act         | Below threshold |
-    // | 0.5 - 0.8  | 15 min            | Medium confidence — could be transient |
-    // | >= 0.8     | 5 min             | High confidence — strong evidence |
-    let mut error_confirm_since: Option<(Instant, ErrorClass, f64)> = None;
+    // RULE: GW must NEVER kill a session instantly. ALL kill paths go through
+    // a single pending-kill gate with a minimum 5-minute confirmation period.
+    //
+    // During the confirmation period, GW watches for recovery signals:
+    //   - Screen activity (pane output changing)
+    //   - Checkpoint changes (phases progressing)
+    //   - Artifact changes (files being written)
+    //   - Loop state changes (iteration advancing)
+    //
+    // If ANY recovery signal is detected → cancel the pending kill.
+    // Only after 5 minutes of COMPLETE silence → execute the kill.
+    //
+    // Note on Stop/StopFailure signals: these may fire from TEAMMATE agents
+    // (not the team lead), so a StopFailure does NOT mean the main session
+    // is broken. Rune and Claude Code have their own recovery mechanisms.
+    // GW must give them time to self-heal.
+
+    /// Minimum confirmation period before ANY kill (seconds).
+    /// Rune and Claude Code have self-recovery mechanisms. GW must wait
+    /// at least this long and verify no recovery signals before killing.
+    const KILL_GATE_MIN_SECS: u64 = 300; // 5 minutes
+
+    /// A pending kill request. Set by detection logic, executed by the kill gate.
+    struct PendingKillRequest {
+        reason: String,
+        error_class: Option<ErrorClass>,
+        outcome: &'static str, // "stuck", "error", "timeout", "crashed"
+        started_at: Instant,
+        nudge_sent: bool,
+    }
+
+    let mut pending_kill: Option<PendingKillRequest> = None;
     let wd = &config.watchdog;
 
     const MIN_SESSION_DURATION_SECS: u64 = 30;
-    let error_confirm_medium_secs = wd.error_confirm_medium_secs;
-    let error_confirm_high_secs = wd.error_confirm_high_secs;
 
-    // StopFailure confirmation state: when a StopFailure signal is detected,
-    // we DON'T kill immediately. Instead, start a confirmation timer and
-    // verify the error is real (screen stalled, no new activity).
-    // This prevents false kills from transient API errors that Claude recovers from.
-    let mut stop_failure_confirm_since: Option<(Instant, ErrorClass)> = None;
-    /// Confirmation period for StopFailure signals (seconds).
-    /// Shorter than general error confirmation because the signal is from Claude itself,
-    /// but still gives time to verify the session is actually stuck.
-    const STOP_FAILURE_CONFIRM_SECS: u64 = 60; // 1 minute
+    // Error evidence confirmation timer (feeds into kill gate).
+    // When error evidence reaches confidence threshold, this timer starts.
+    // After the confirmation period, the kill request is routed to the kill gate.
+    let mut error_confirm_since: Option<(Instant, ErrorClass, f64)> = None;
+    let error_confirm_medium_secs = wd.error_confirm_medium_secs.max(KILL_GATE_MIN_SECS);
+    let error_confirm_high_secs = wd.error_confirm_high_secs.max(KILL_GATE_MIN_SECS);
 
     // Track Claude Code's session_id from arc-phase-loop.local.md.
     // Used to filter out stale signals from previous sessions.
@@ -243,15 +262,13 @@ pub(crate) fn monitor_session(
 
         // SIGNAL CHECK: StopFailure — API error reported by Claude Code itself.
         //
-        // IMPORTANT: We do NOT kill immediately. Transient API errors (overload,
-        // network blips) are common and Claude Code often recovers on retry.
-        // Instead, we start a confirmation timer and verify the error is real:
-        //   1. Signal must belong to the current session (session_id check)
-        //   2. Screen must be stalled (no new output)
-        //   3. Confirmation period must expire (STOP_FAILURE_CONFIRM_SECS)
-        //   4. Any new screen activity cancels the pending kill
+        // StopFailure means ONE API turn failed — NOT that the session is broken.
+        // Claude Code and Rune have self-recovery mechanisms. The signal may also
+        // come from a TEAMMATE agent, not the team lead.
+        //
+        // Action: log the signal, route through unified kill gate (5 min wait).
+        // The kill gate will cancel if any recovery signal appears.
         if let Some(signal) = crate::commands::elden::read_stop_failure_signal() {
-            // Clear the signal file immediately to prevent re-reading
             crate::commands::elden::clear_signals();
 
             let signal_session = signal.get("session_id")
@@ -263,119 +280,41 @@ pub(crate) fn monitor_session(
                 Some(current_id) => signal_session == current_id
                     || signal_session == "unknown"
                     || current_id == "unknown",
-                None => true, // No session_id yet (early startup) — accept
+                None => true,
             };
 
             if !is_current_session {
                 info!(
                     signal_session = signal_session,
                     current_session = claude_session_id.as_deref().unwrap_or("none"),
-                    "StopFailure signal from different session — ignoring stale signal"
+                    "StopFailure signal from different session — ignoring"
                 );
-                println!(
-                    "[gw] Ignoring stale StopFailure signal (session {} != current {})",
-                    signal_session,
-                    claude_session_id.as_deref().unwrap_or("none"),
-                );
-            } else if stop_failure_confirm_since.is_none() {
-                // Start confirmation timer — don't kill yet
+            } else if pending_kill.is_none() {
                 let pane_for_classify = capture_pane(session_name).unwrap_or_default();
                 let error_class = ErrorClass::from_pane_output(&pane_for_classify, true)
                     .unwrap_or(ErrorClass::ApiOverload);
 
-                // Fatal errors (auth, billing) skip confirmation — they won't recover
-                if error_class.skips_plan() {
-                    let reason = format!(
-                        "StopFailure hook — fatal {:?} (no confirmation needed)",
-                        error_class,
-                    );
-                    warn!(
-                        error_class = ?error_class,
-                        signal_session = signal_session,
-                        "Fatal StopFailure — killing immediately"
-                    );
-                    println!("[gw] {} — killing session", reason);
-                    save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
-                    return Ok(SessionOutcome::ErrorDetected {
-                        error_class,
-                        reason,
-                    });
-                }
-
+                let reason = format!(
+                    "StopFailure signal: {:?} (session={}, may be teammate — waiting {}m for recovery)",
+                    error_class, signal_session, KILL_GATE_MIN_SECS / 60,
+                );
                 warn!(
                     error_class = ?error_class,
                     signal_session = signal_session,
-                    confirm_secs = STOP_FAILURE_CONFIRM_SECS,
-                    "StopFailure detected — starting {}s confirmation (NOT killing yet)",
-                    STOP_FAILURE_CONFIRM_SECS,
+                    "StopFailure detected — routing to kill gate ({}s wait)",
+                    KILL_GATE_MIN_SECS,
                 );
                 println!(
-                    "[gw] StopFailure signal ({:?}) — watching for {}s before killing (may recover)",
-                    error_class, STOP_FAILURE_CONFIRM_SECS,
+                    "[gw] StopFailure ({:?}) — waiting {}m for Rune/Claude self-recovery before acting",
+                    error_class, KILL_GATE_MIN_SECS / 60,
                 );
-                stop_failure_confirm_since = Some((Instant::now(), error_class));
-            }
-        }
-
-        // StopFailure confirmation check: if the timer is running,
-        // verify the session is still stuck before killing.
-        if let Some((confirm_start, ref error_class)) = stop_failure_confirm_since {
-            let confirm_elapsed = confirm_start.elapsed().as_secs();
-            let screen_idle_secs = last_activity.elapsed().as_secs();
-
-            // Cancel if screen shows new activity (Claude recovered from the error)
-            if screen_idle_secs < 10 && confirm_elapsed > 5 {
-                info!(
-                    screen_idle_secs = screen_idle_secs,
-                    "Screen active after StopFailure — Claude recovered, cancelling kill"
-                );
-                println!(
-                    "[gw] StopFailure cleared — Claude recovered (screen active, idle {}s)",
-                    screen_idle_secs,
-                );
-                stop_failure_confirm_since = None;
-            } else if confirm_elapsed >= STOP_FAILURE_CONFIRM_SECS {
-                // Confirmation expired — verify screen is truly stalled
-                if screen_idle_secs >= STOP_FAILURE_CONFIRM_SECS / 2 {
-                    let error_class = error_class.clone();
-                    let reason = format!(
-                        "StopFailure confirmed: {:?} (observed={}s, screen idle={}s)",
-                        error_class, confirm_elapsed, screen_idle_secs,
-                    );
-                    warn!(
-                        error_class = ?error_class,
-                        confirm_secs = confirm_elapsed,
-                        screen_idle_secs = screen_idle_secs,
-                        "StopFailure confirmed after {}s — killing session",
-                        confirm_elapsed,
-                    );
-                    println!("[gw] {} — killing session", reason);
-                    save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
-                    return Ok(SessionOutcome::ErrorDetected {
-                        error_class,
-                        reason,
-                    });
-                } else {
-                    // Screen is active despite expired timer — Claude recovered
-                    info!(
-                        screen_idle_secs = screen_idle_secs,
-                        confirm_elapsed = confirm_elapsed,
-                        "StopFailure timer expired but screen is active — Claude recovered"
-                    );
-                    println!(
-                        "[gw] StopFailure timer expired but Claude is active (idle {}s) — cancelling kill",
-                        screen_idle_secs,
-                    );
-                    stop_failure_confirm_since = None;
-                }
-            } else {
-                debug!(
-                    remaining_secs = STOP_FAILURE_CONFIRM_SECS - confirm_elapsed,
-                    screen_idle_secs = screen_idle_secs,
-                    "StopFailure confirmation in progress"
-                );
+                pending_kill = Some(PendingKillRequest {
+                    reason,
+                    error_class: Some(error_class),
+                    outcome: "error",
+                    started_at: Instant::now(),
+                    nudge_sent: false,
+                });
             }
         }
 
@@ -387,12 +326,23 @@ pub(crate) fn monitor_session(
             last_activity = Instant::now();
         }
 
-        // Check total pipeline timeout
-        if pipeline_start.elapsed() > config.pipeline_timeout {
-            warn!("Pipeline timeout exceeded, killing session");
-            save_crash_dump(session_name, &config.working_dir, "Pipeline timeout exceeded");
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::Timeout);
+        // Check total pipeline timeout — route through kill gate
+        if pipeline_start.elapsed() > config.pipeline_timeout && pending_kill.is_none() {
+            warn!(
+                "Pipeline timeout exceeded — routing to kill gate ({}s wait)",
+                KILL_GATE_MIN_SECS,
+            );
+            println!(
+                "[gw] Pipeline timeout exceeded — waiting {}m for recovery before killing",
+                KILL_GATE_MIN_SECS / 60,
+            );
+            pending_kill = Some(PendingKillRequest {
+                reason: "Pipeline timeout exceeded".to_string(),
+                error_class: None,
+                outcome: "timeout",
+                started_at: Instant::now(),
+                nudge_sent: false,
+            });
         }
 
         // Check if session is still alive
@@ -1047,7 +997,7 @@ pub(crate) fn monitor_session(
 
         // Check if swarm teammates are running (lightweight: one tmux call)
         let swarm = check_swarm_activity(pid);
-        let swarm_active = swarm.is_some_and(|s| s.active_count > 0);
+        let swarm_active = swarm.as_ref().is_some_and(|s| s.has_working_teammates());
 
         let evidence = ErrorEvidence {
             keyword_match,
@@ -1074,21 +1024,23 @@ pub(crate) fn monitor_session(
                 // A new error type needs its own observation window.
                 // Exception: if the new class is fatal (skips_plan), act immediately.
                 if *prev_class != error_class {
-                    if error_class.skips_plan() {
+                    if error_class.skips_plan() && pending_kill.is_none() {
+                        // Fatal errors still go through the kill gate — no instant kills
                         warn!(
                             prev_class = ?prev_class,
                             new_class = ?error_class,
-                            "Error class escalated to fatal — acting immediately"
+                            "Error class escalated to fatal — routing to kill gate"
                         );
                         let reason = format!(
                             "Fatal error detected during confirmation: {:?} (was {:?})",
                             error_class, prev_class,
                         );
-                        save_crash_dump(session_name, &config.working_dir, &reason);
-                        kill_session(session_name)?;
-                        return Ok(SessionOutcome::ErrorDetected {
+                        pending_kill = Some(PendingKillRequest {
                             reason,
-                            error_class,
+                            error_class: Some(error_class),
+                            outcome: "error",
+                            started_at: Instant::now(),
+                            nudge_sent: false,
                         });
                     }
                     info!(
@@ -1101,29 +1053,29 @@ pub(crate) fn monitor_session(
                 }
                 // Already in confirmation period — check if time to act
                 let elapsed_confirm = started.elapsed().as_secs();
-                if elapsed_confirm >= confirmation_secs {
-                    // Confirmation period expired — act now
-                    warn!(
-                        error_class = ?error_class,
-                        confidence = conf,
-                        screen_stall_secs = screen_stall_secs,
-                        confirmation_secs = elapsed_confirm,
-                        "Error confirmed after {}s observation — killing session",
-                        elapsed_confirm,
-                    );
+                if elapsed_confirm >= confirmation_secs && pending_kill.is_none() {
+                    // Confirmation period expired — route through kill gate
                     let reason = format!(
                         "Error pattern confirmed: {:?} (confidence={:.1}, observed={}s, stall={}s)",
                         error_class, conf, elapsed_confirm, screen_stall_secs,
                     );
-                    println!(
-                        "[gw] Error confirmed: {:?} (confidence={:.1}, observed for {}s) — killing session",
-                        error_class, conf, elapsed_confirm,
+                    warn!(
+                        error_class = ?error_class,
+                        confidence = conf,
+                        confirmation_secs = elapsed_confirm,
+                        "Error confirmed after {}s — routing to kill gate",
+                        elapsed_confirm,
                     );
-                    save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
-                    return Ok(SessionOutcome::ErrorDetected {
+                    println!(
+                        "[gw] Error confirmed: {:?} ({:.1}, {}s) — waiting {}m more for recovery",
+                        error_class, conf, elapsed_confirm, KILL_GATE_MIN_SECS / 60,
+                    );
+                    pending_kill = Some(PendingKillRequest {
                         reason,
-                        error_class,
+                        error_class: Some(error_class),
+                        outcome: "error",
+                        started_at: Instant::now(),
+                        nudge_sent: false,
                     });
                 } else {
                     // Still in confirmation period — log and continue
@@ -1345,11 +1297,23 @@ pub(crate) fn monitor_session(
                     phase_elapsed / 60,
                     effective_phase_timeout / 60,
                 );
-                save_crash_dump(session_name, &config.working_dir, &format!(
-                    "Phase '{}' timeout: {}s > {}s budget", phase_name, phase_elapsed, effective_phase_timeout,
-                ));
-                kill_session(session_name)?;
-                return Ok(SessionOutcome::Stuck);
+                if pending_kill.is_none() {
+                    let reason = format!(
+                        "Phase '{}' timeout: {}s > {}s budget",
+                        phase_name, phase_elapsed, effective_phase_timeout,
+                    );
+                    println!(
+                        "[gw] Phase '{}' over budget — waiting {}m for recovery before killing",
+                        phase_name, KILL_GATE_MIN_SECS / 60,
+                    );
+                    pending_kill = Some(PendingKillRequest {
+                        reason,
+                        error_class: None,
+                        outcome: "stuck",
+                        started_at: Instant::now(),
+                        nudge_sent: false,
+                    });
+                }
             }
         }
 
@@ -1372,12 +1336,19 @@ pub(crate) fn monitor_session(
                     "[gw] Transition gap: {}m between phases — killing session",
                     gap_secs / 60,
                 );
-                save_crash_dump(session_name, &config.working_dir, &format!(
-                    "Transition gap timeout: {}s between phases (kill after {}s)",
-                    gap_secs, phase_nav::TRANSITION_KILL_SECS,
-                ));
-                kill_session(session_name)?;
-                return Ok(SessionOutcome::Stuck);
+                if pending_kill.is_none() {
+                    let reason = format!(
+                        "Transition gap timeout: {}s between phases",
+                        gap_secs,
+                    );
+                    pending_kill = Some(PendingKillRequest {
+                        reason,
+                        error_class: None,
+                        outcome: "stuck",
+                        started_at: Instant::now(),
+                        nudge_sent: false,
+                    });
+                }
             } else if gap_secs > phase_nav::TRANSITION_WARN_SECS && transition_nudge_count < 2 {
                 // WARN: stronger nudge
                 transition_nudge_count = 2;
@@ -1421,12 +1392,19 @@ pub(crate) fn monitor_session(
                     "[gw] Failed phase '{}': no recovery after {}m — killing session",
                     phase_name, gap_secs / 60,
                 );
-                save_crash_dump(session_name, &config.working_dir, &format!(
-                    "Failed phase '{}' not recovered: {}s (kill after {}s)",
-                    phase_name, gap_secs, phase_nav::FAILED_KILL_SECS,
-                ));
-                kill_session(session_name)?;
-                return Ok(SessionOutcome::Stuck);
+                if pending_kill.is_none() {
+                    let reason = format!(
+                        "Failed phase '{}' not recovered: {}s",
+                        phase_name, gap_secs,
+                    );
+                    pending_kill = Some(PendingKillRequest {
+                        reason,
+                        error_class: None,
+                        outcome: "stuck",
+                        started_at: Instant::now(),
+                        nudge_sent: false,
+                    });
+                }
             } else if gap_secs > phase_nav::FAILED_WARN_SECS && failed_nudge_count < 2 {
                 failed_nudge_count = 2;
                 info!(gap_secs = gap_secs, "Failed phase warn nudge");
@@ -1459,34 +1437,37 @@ pub(crate) fn monitor_session(
         let effective_kill_secs = current_profile.idle_kill_secs;
         let effective_nudge_secs = current_profile.idle_nudge_secs;
 
-        if idle_duration > Duration::from_secs(effective_kill_secs) {
+        if idle_duration > Duration::from_secs(effective_kill_secs) && pending_kill.is_none() {
+            let reason = format!(
+                "Session idle {}s > {}s {:?} limit",
+                idle_duration.as_secs(), effective_kill_secs, current_profile.category,
+            );
             warn!(
                 idle_secs = idle_duration.as_secs(),
                 phase = current_phase_name.as_deref().unwrap_or("unknown"),
                 category = ?current_profile.category,
                 limit = effective_kill_secs,
-                "Session stuck (idle too long for {:?} phase), killing",
-                current_profile.category,
+                "Session idle — requesting kill via gate (waiting {}s for recovery)",
+                KILL_GATE_MIN_SECS,
             );
             println!(
-                "[gw] Session stuck (idle {}s > {}s {:?} limit), killing...",
-                idle_duration.as_secs(),
-                effective_kill_secs,
-                current_profile.category,
+                "[gw] Session idle {}s > {}s {:?} limit — kill requested ({}m confirmation)",
+                idle_duration.as_secs(), effective_kill_secs,
+                current_profile.category, KILL_GATE_MIN_SECS / 60,
             );
-            save_crash_dump(session_name, &config.working_dir, &format!(
-                "Session idle {}s > {}s {:?} limit",
-                idle_duration.as_secs(), effective_kill_secs, current_profile.category,
-            ));
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::Stuck);
+            pending_kill = Some(PendingKillRequest {
+                reason,
+                error_class: None,
+                outcome: "stuck",
+                started_at: Instant::now(),
+                nudge_sent: false,
+            });
         }
 
         // Escalating nudge strategy (intervals scale with phase profile):
         //   Nudge 1 at effective_nudge_secs: "please continue"
         //   Nudge 2 at 2x: "are you stuck? please continue working"
         //   Nudge 3 at 3x: "/compact" to recover context
-        // After all nudges, effective_kill_secs still applies as hard kill.
         let nudge_interval = effective_nudge_secs;
         let next_nudge_at = nudge_interval * (nudge_count as u64 + 1);
         if idle_duration.as_secs() > next_nudge_at && nudge_count < 3 {
@@ -1507,6 +1488,121 @@ pub(crate) fn monitor_session(
                 idle_duration.as_secs(), nudge_count, nudge_msg,
             );
             let _ = send_keys_with_workaround(session_name, nudge_msg);
+        }
+
+        // ─── UNIFIED KILL GATE ───────────────────────────────────────────
+        //
+        // ALL kill requests pass through this single gate. No other code
+        // path may call kill_session() directly inside the monitor loop.
+        //
+        // Recovery signals that cancel a pending kill:
+        //   - Screen changed (pane output different from last poll)
+        //   - Checkpoint updated (phase status changed)
+        //   - Artifact directory changed (new files written)
+        //   - Loop state changed (iteration advanced)
+        //   - Swarm teammates active (Claude is waiting for agent results)
+        if let Some(ref pk) = pending_kill {
+            let gate_elapsed = pk.started_at.elapsed().as_secs();
+            let screen_idle = last_activity.elapsed().as_secs();
+            let checkpoint_idle = last_checkpoint_activity.elapsed().as_secs();
+            let artifact_idle = last_artifact_activity.elapsed().as_secs();
+            let loop_state_idle = last_loop_state_change.elapsed().as_secs();
+
+            // Check if swarm teammates are running — this is the strongest
+            // recovery signal. When Claude spawns agent teams, the main pane
+            // goes idle (waiting for results) but teammates are actively working
+            // in separate tmux sessions (claude-swarm-{pid}).
+            let swarm_running = check_swarm_activity(pid)
+                .is_some_and(|s| s.has_working_teammates());
+
+            // Recovery = ANY signal of life within the last 30 seconds,
+            // OR swarm teammates are actively running
+            const RECOVERY_WINDOW_SECS: u64 = 30;
+            let has_recovery = screen_idle < RECOVERY_WINDOW_SECS
+                || checkpoint_idle < RECOVERY_WINDOW_SECS
+                || artifact_idle < RECOVERY_WINDOW_SECS
+                || loop_state_idle < RECOVERY_WINDOW_SECS
+                || swarm_running;
+
+            if has_recovery && gate_elapsed > 10 {
+                // Recovery detected — cancel the pending kill
+                info!(
+                    reason = %pk.reason,
+                    gate_elapsed_secs = gate_elapsed,
+                    screen_idle = screen_idle,
+                    checkpoint_idle = checkpoint_idle,
+                    artifact_idle = artifact_idle,
+                    swarm_running = swarm_running,
+                    "Kill cancelled — recovery signal detected (Rune/Claude self-healed)"
+                );
+                if swarm_running {
+                    println!(
+                        "[gw] Kill cancelled — agent teammates still active (screen idle but swarm working)",
+                    );
+                } else {
+                    println!(
+                        "[gw] Kill cancelled — recovery detected after {}s (screen={}s, checkpoint={}s, artifact={}s)",
+                        gate_elapsed, screen_idle, checkpoint_idle, artifact_idle,
+                    );
+                }
+                pending_kill = None;
+            } else if gate_elapsed >= KILL_GATE_MIN_SECS {
+                // 5 minutes of silence — execute the kill
+                let reason = pk.reason.clone();
+                let error_class = pk.error_class.clone();
+                let outcome = pk.outcome;
+
+                warn!(
+                    reason = %reason,
+                    gate_elapsed_secs = gate_elapsed,
+                    screen_idle = screen_idle,
+                    checkpoint_idle = checkpoint_idle,
+                    "Kill gate: {}s elapsed with no recovery — executing kill",
+                    gate_elapsed,
+                );
+                println!(
+                    "[gw] Kill confirmed after {}m silence: {}",
+                    gate_elapsed / 60, reason,
+                );
+
+                save_crash_dump(session_name, &config.working_dir, &reason);
+                kill_session(session_name)?;
+
+                return Ok(match outcome {
+                    "error" => SessionOutcome::ErrorDetected {
+                        error_class: error_class.unwrap_or(ErrorClass::ApiOverload),
+                        reason,
+                    },
+                    "timeout" => SessionOutcome::Timeout,
+                    _ => SessionOutcome::Stuck,
+                });
+            } else {
+                // Still waiting — send a nudge at the halfway point
+                if !pk.nudge_sent && gate_elapsed >= KILL_GATE_MIN_SECS / 2 {
+                    info!(
+                        gate_elapsed_secs = gate_elapsed,
+                        "Kill gate halfway — sending nudge before kill"
+                    );
+                    println!(
+                        "[gw] Kill pending ({}s/{}s) — sending nudge to check recovery",
+                        gate_elapsed, KILL_GATE_MIN_SECS,
+                    );
+                    let _ = send_keys_with_workaround(session_name, "please continue");
+                    if let Some(ref mut pk) = pending_kill {
+                        pk.nudge_sent = true;
+                    }
+                }
+
+                // Periodic status during wait
+                if gate_elapsed % 60 < (POLL_INTERVAL_SECS + 1) && gate_elapsed > 0 {
+                    debug!(
+                        remaining_secs = KILL_GATE_MIN_SECS - gate_elapsed,
+                        screen_idle = screen_idle,
+                        "Kill gate: waiting for recovery ({}s remaining)",
+                        KILL_GATE_MIN_SECS - gate_elapsed,
+                    );
+                }
+            }
         }
     }
 }
