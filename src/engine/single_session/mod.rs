@@ -28,7 +28,7 @@
 
 mod monitor;
 mod orchestrator;
-mod util;
+pub(crate) mod util;
 
 use crate::config::watchdog::WatchdogConfig;
 use std::path::PathBuf;

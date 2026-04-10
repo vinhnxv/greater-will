@@ -183,7 +183,16 @@ async fn handle_connection(
             }
         };
 
+        let request_type = request_type_name(&request);
+        let start = std::time::Instant::now();
         let response = dispatch_request(request, &registry, &cancel).await;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        tracing::info!(
+            request_type = %request_type,
+            elapsed_ms = elapsed_ms,
+            "request handled"
+        );
 
         if let Err(e) = write_message(&mut writer, &response).await {
             tracing::debug!(error = %e, "failed to write response");
@@ -356,6 +365,18 @@ async fn dispatch_request(
                 message: "shutting down".into(),
             }
         }
+    }
+}
+
+/// Extract a short type label from a request for structured logging.
+fn request_type_name(req: &Request) -> &'static str {
+    match req {
+        Request::SubmitRun { .. } => "SubmitRun",
+        Request::ListRuns { .. } => "ListRuns",
+        Request::GetLogs { .. } => "GetLogs",
+        Request::StopRun { .. } => "StopRun",
+        Request::DaemonStatus => "DaemonStatus",
+        Request::Shutdown => "Shutdown",
     }
 }
 

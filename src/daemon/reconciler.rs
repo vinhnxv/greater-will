@@ -157,7 +157,14 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
         }
     }
 
-    info!(%report, "reconciliation complete");
+    info!(
+        sessions_scanned = report.sessions_scanned,
+        recovered = report.recovered,
+        cleaned = report.cleaned_up,
+        auto_resumed = report.auto_resumed,
+        marked_failed = report.marked_failed,
+        "reconciliation complete"
+    );
     report
 }
 

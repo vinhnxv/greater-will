@@ -91,10 +91,15 @@ pub async fn start_daemon() -> Result<()> {
     // Only set if not already set (tests may have their own subscriber)
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    info!(pid = our_pid, home = %home.display(), "daemon starting");
-
-    // 5. Load run registry from disk
+    // 5. Load config and registry from disk
     let config = GlobalConfig::load()?;
+
+    info!(
+        pid = our_pid,
+        home = %home.display(),
+        socket = %config.socket_path().display(),
+        "daemon starting"
+    );
     let registry = RunRegistry::load_from_disk()?;
     let registry = Arc::new(Mutex::new(registry));
 

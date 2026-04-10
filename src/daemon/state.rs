@@ -7,6 +7,7 @@ use crate::daemon::protocol::RunStatus;
 use color_eyre::{eyre::WrapErr, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 /// Default retention limit for completed runs.
@@ -24,8 +25,15 @@ const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 // ── Path helpers ─────────────────────────────────────────────────────
 
 /// Resolve the GW home directory: `$GW_HOME` or `~/.gw/`.
+///
+/// SEC-011: Logs a one-time warning when `GW_HOME` is overridden via
+/// environment variable, providing an audit trail for non-default paths.
 pub fn gw_home() -> PathBuf {
     if let Ok(home) = std::env::var("GW_HOME") {
+        static WARN_ONCE: OnceLock<()> = OnceLock::new();
+        WARN_ONCE.get_or_init(|| {
+            warn!(path = %home, "GW_HOME override active");
+        });
         PathBuf::from(home)
     } else {
         dirs::home_dir()
