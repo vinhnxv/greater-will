@@ -352,8 +352,8 @@ where
                 }
 
                 let bytes_available = file_len - last_offset;
-                // Cap pre-allocation to 16 MiB to avoid u64→usize overflow on 32-bit platforms.
-                let cap = (bytes_available as usize).min(16 * 1024 * 1024);
+                // Cap to 16 MiB before narrowing cast to avoid u64→usize overflow on 32-bit platforms.
+                let cap = bytes_available.min(16 * 1024 * 1024_u64) as usize;
                 let mut buf = Vec::with_capacity(cap);
                 if file.take(bytes_available).read_to_end(&mut buf).is_err() {
                     continue;
@@ -618,8 +618,8 @@ async fn dispatch_request(
 
         Request::DaemonStatus => {
             let reg = registry.lock().await;
-            let active = reg.list_runs(false).len();
-            let total = reg.list_runs(true).len();
+            let active = reg.count_runs(false);
+            let total = reg.count_runs(true);
             Response::Ok {
                 message: format!(
                     "daemon running — {active} active run(s), {total} total, pid {}",
@@ -682,6 +682,7 @@ fn read_log_tail(path: &Path, tail: Option<usize>) -> String {
     };
 
     let want_bytes: u64 = match tail {
+        Some(0) => return String::new(),
         Some(n) if n > 0 => n as u64,
         _ => DEFAULT_LOG_TAIL_BYTES,
     };

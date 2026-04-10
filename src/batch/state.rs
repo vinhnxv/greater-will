@@ -186,11 +186,14 @@ impl BatchState {
             }
         }
         self.results.push(result);
-        debug_assert!(
-            self.current_index < self.plans.len(),
-            "record_result called when current_index ({}) >= plans.len() ({})",
-            self.current_index, self.plans.len()
-        );
+        if self.current_index >= self.plans.len() {
+            tracing::error!(
+                current_index = self.current_index,
+                plans_len = self.plans.len(),
+                "record_result called when current_index >= plans.len() — skipping increment"
+            );
+            return;
+        }
         self.current_index += 1;
     }
 

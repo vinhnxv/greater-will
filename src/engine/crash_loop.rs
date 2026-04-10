@@ -67,8 +67,8 @@ impl CrashLoopDetector {
         self.crash_times.push_back(now);
         self.healthy_since = None; // Reset healthy tracking
 
-        // Prune entries outside the window
-        let cutoff = now - self.window;
+        // Prune entries outside the window (use checked_sub to handle early-boot / short uptime)
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
         while self.crash_times.front().is_some_and(|&t| t < cutoff) {
             self.crash_times.pop_front();
         }

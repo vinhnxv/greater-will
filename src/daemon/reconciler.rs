@@ -341,7 +341,7 @@ fn find_stale_runs(
     registry
         .list_runs(false)
         .iter()
-        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
+        .filter(|r| matches!(r.status, RunStatus::Running))
         .filter(|r| {
             // Check if tmux session is alive
             let tmux_name = format!("gw-{}", r.run_id);

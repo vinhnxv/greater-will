@@ -96,10 +96,10 @@ pub enum Commands {
         #[arg(long)]
         multi_group: bool,
 
-        /// Run via the background daemon instead of inline.
+        /// Force inline execution, bypassing the daemon even if one is running.
         ///
-        /// Submits the plan to the gw daemon for execution and returns
-        /// immediately. Use `gw ps` to monitor progress.
+        /// By default, `gw run` delegates to the daemon if one is active.
+        /// This flag forces the run to execute in the current process instead.
         #[arg(long)]
         foreground: bool,
     },

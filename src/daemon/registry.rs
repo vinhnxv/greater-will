@@ -286,8 +286,22 @@ impl RunRegistry {
         runs.iter().map(|r| r.to_run_info()).collect()
     }
 
+    /// Count runs without allocating RunInfo structs.
+    pub fn count_runs(&self, include_finished: bool) -> usize {
+        self.runs
+            .values()
+            .filter(|r| {
+                include_finished
+                    || matches!(r.status, RunStatus::Queued | RunStatus::Running)
+            })
+            .count()
+    }
+
     /// Find a run by ID prefix (like git short SHA).
     pub fn find_by_prefix(&self, prefix: &str) -> Option<&RunEntry> {
+        if prefix.is_empty() {
+            return None;
+        }
         let matches: Vec<_> = self
             .runs
             .values()

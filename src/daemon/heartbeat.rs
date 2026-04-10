@@ -152,7 +152,7 @@ impl HeartbeatMonitor {
                     p.into_inner()
                 });
                 let count = counts.entry(run_id.to_string()).or_insert(0);
-                *count += 1;
+                *count = count.saturating_add(1);
                 *count
             };
 
@@ -363,25 +363,34 @@ impl HeartbeatMonitor {
 
         if let Some(phase_name) = phase {
             let mut registry = self.registry.lock().await;
-            if let Some(entry) = registry.get_mut(run_id) {
+            let phase_changed = if let Some(entry) = registry.get_mut(run_id) {
                 if entry.current_phase.as_deref() != Some(&phase_name) {
                     debug!(run_id = %run_id, phase = %phase_name, "phase updated");
                     entry.current_phase = Some(phase_name.clone());
+                    true
+                } else {
+                    false
                 }
-            }
-            // Persist phase update to disk
-            if let Err(e) = registry.update_status(
-                run_id,
-                RunStatus::Running,
-                Some(phase_name.clone()),
-                None,
-            ) {
-                debug!(run_id = %run_id, error = %e, "failed to persist phase update");
-            }
+            } else {
+                false
+            };
 
-            // Log the phase transition as a structured event
-            drop(registry);
-            append_event(run_id, "phase_change", &phase_name);
+            // Only persist and log when the phase actually changed
+            if phase_changed {
+                if let Err(e) = registry.update_status(
+                    run_id,
+                    RunStatus::Running,
+                    Some(phase_name.clone()),
+                    None,
+                ) {
+                    debug!(run_id = %run_id, error = %e, "failed to persist phase update");
+                }
+
+                drop(registry);
+                append_event(run_id, "phase_change", &phase_name);
+            } else {
+                drop(registry);
+            }
         }
 
         // Check for pipeline completion
@@ -594,11 +603,14 @@ async fn spawn_recovery(
                 return;
             }
 
-            // Update registry with new tmux session
+            // Update registry with new tmux session and persist to disk
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
                 entry.tmux_session = Some(tmux_session.clone());
                 entry.current_phase = Some("resuming".to_string());
+            }
+            if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
+                warn!(run_id = %run_id, error = %e, "failed to persist recovery state to disk");
             }
 
             info!(run_id = %run_id, tmux_session = %tmux_session, "crash recovery started");

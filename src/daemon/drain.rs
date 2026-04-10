@@ -190,10 +190,11 @@ fn write_snapshot(snapshot: &SessionSnapshot) -> color_eyre::Result<()> {
     let tmp_path = run_dir.join("snapshot.json.tmp");
 
     let json = serde_json::to_string_pretty(snapshot)?;
-    std::fs::write(&tmp_path, &json)?;
 
-    // Fsync + atomic rename for crash safety
-    let f = std::fs::File::open(&tmp_path)?;
+    // Single-fd write + fsync + atomic rename for crash safety
+    use std::io::Write;
+    let mut f = std::fs::File::create(&tmp_path)?;
+    f.write_all(json.as_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp_path, &snapshot_path)?;
 
