@@ -21,6 +21,9 @@ pub enum Request {
         plan_path: PathBuf,
         repo_dir: PathBuf,
         session_name: Option<String>,
+        /// Optional CLAUDE_CONFIG_DIR override.
+        #[serde(default)]
+        config_dir: Option<PathBuf>,
     },
     /// List all known runs (optionally filtered by status).
     ListRuns {
@@ -191,6 +194,7 @@ mod tests {
                 plan_path: PathBuf::from("/tmp/plan.md"),
                 repo_dir: PathBuf::from("/home/user/repo"),
                 session_name: Some("test-session".into()),
+                config_dir: Some(PathBuf::from("/custom/.claude")),
             },
             Request::ListRuns { all: true },
             Request::GetLogs {
@@ -290,6 +294,7 @@ mod tests {
             plan_path: PathBuf::from("/tmp/plan.md"),
             repo_dir: PathBuf::from("/repo"),
             session_name: None,
+            config_dir: None,
         };
 
         // Write to an in-memory buffer

@@ -9,7 +9,7 @@ use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::RunRegistry;
 use crate::session::spawn::{self, SpawnConfig};
 use color_eyre::{eyre::eyre, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -37,6 +37,7 @@ pub async fn spawn_run(
     plan_path: &Path,
     repo_dir: &Path,
     session_name: Option<String>,
+    config_dir: Option<PathBuf>,
 ) -> Result<String> {
     // ── Pre-flight checks ───────────────────────────────────────────
     if !plan_path.exists() {
@@ -65,6 +66,7 @@ pub async fn spawn_run(
             plan_path.to_path_buf(),
             repo_dir.to_path_buf(),
             session_name,
+            config_dir.clone(),
         )?
     };
 
@@ -76,7 +78,7 @@ pub async fn spawn_run(
     let config = SpawnConfig {
         session_id: tmux_session.clone(),
         working_dir: repo_dir.to_path_buf(),
-        config_dir: None,
+        config_dir,
         claude_path: "claude".to_string(),
         mock: false,
     };

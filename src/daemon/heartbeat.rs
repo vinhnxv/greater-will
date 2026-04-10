@@ -218,6 +218,7 @@ impl HeartbeatMonitor {
             let repo_dir = entry.repo_dir.clone();
             let plan_path = entry.plan_path.clone();
             let session_name = entry.session_name.clone();
+            let config_dir = entry.config_dir.clone();
             let run_id_owned = run_id.to_string();
 
             // Persist the crash-restart count
@@ -241,6 +242,7 @@ impl HeartbeatMonitor {
                     &repo_dir,
                     &plan_path,
                     &session_name,
+                    config_dir,
                 )
                 .await;
             });
@@ -437,6 +439,7 @@ async fn spawn_recovery(
     repo_dir: &std::path::Path,
     plan_path: &std::path::Path,
     _session_name: &str,
+    config_dir: Option<std::path::PathBuf>,
 ) {
     let tmux_session = format!("gw-{}", run_id);
 
@@ -492,7 +495,7 @@ async fn spawn_recovery(
     let config = spawn::SpawnConfig {
         session_id: tmux_session.clone(),
         working_dir: repo_dir.to_path_buf(),
-        config_dir: None,
+        config_dir,
         claude_path: "claude".to_string(),
         mock: false,
     };

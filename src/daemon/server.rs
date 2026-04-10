@@ -422,6 +422,7 @@ async fn dispatch_request(
             plan_path,
             repo_dir,
             session_name,
+            config_dir,
         } => {
             // SEC-008: Validate repo_dir first, then ensure the plan_path
             // resolves *inside* the canonicalized repo root. Without this a
@@ -463,6 +464,7 @@ async fn dispatch_request(
                 &canonical_plan,
                 &canonical_repo,
                 session_name,
+                config_dir,
             )
             .await
             {
