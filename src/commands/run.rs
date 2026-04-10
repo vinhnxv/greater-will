@@ -36,6 +36,7 @@ pub fn execute(
     multi_group: bool,
     allow_dirty: bool,
     foreground: bool,
+    verbose: u8,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
 
@@ -58,7 +59,7 @@ pub fn execute(
     // receives the resolved config_dir (CLI flag or env var).
     if !foreground && !dry_run && mock.is_none() {
         if crate::client::socket::DaemonClient::is_daemon_running() {
-            return delegate_to_daemon(&plans, &cwd, config_dir.as_deref());
+            return delegate_to_daemon(&plans, &cwd, config_dir.as_deref(), verbose);
         }
     }
 
@@ -699,7 +700,7 @@ fn preflight_mock(mock_path: &PathBuf) -> Result<()> {
 ///
 /// Resolves plan paths to absolute, submits each to the daemon, and prints
 /// the run ID so the user can monitor with `gw ps` / `gw logs`.
-fn delegate_to_daemon(plans: &[String], cwd: &Path, config_dir: Option<&Path>) -> Result<()> {
+fn delegate_to_daemon(plans: &[String], cwd: &Path, config_dir: Option<&Path>, verbose: u8) -> Result<()> {
     use crate::client::socket::DaemonClient;
     use crate::daemon::protocol::{Request, Response};
     use crate::output::tags::tag;
@@ -725,6 +726,7 @@ fn delegate_to_daemon(plans: &[String], cwd: &Path, config_dir: Option<&Path>) -
             repo_dir: cwd.to_path_buf(),
             session_name: None,
             config_dir: config_dir.map(|p| p.to_path_buf()),
+            verbose,
         };
 
         match client.send(request)? {

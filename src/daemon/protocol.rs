@@ -24,6 +24,10 @@ pub enum Request {
         /// Optional CLAUDE_CONFIG_DIR override.
         #[serde(default)]
         config_dir: Option<PathBuf>,
+        /// Verbosity level (0=warn, 1=info, 2=debug, 3+=trace).
+        /// Controls per-run log detail in daemon event logs.
+        #[serde(default)]
+        verbose: u8,
     },
     /// List all known runs (optionally filtered by status).
     ListRuns {
@@ -195,6 +199,7 @@ mod tests {
                 repo_dir: PathBuf::from("/home/user/repo"),
                 session_name: Some("test-session".into()),
                 config_dir: Some(PathBuf::from("/custom/.claude")),
+                verbose: 2,
             },
             Request::ListRuns { all: true },
             Request::GetLogs {
@@ -295,6 +300,7 @@ mod tests {
             repo_dir: PathBuf::from("/repo"),
             session_name: None,
             config_dir: None,
+            verbose: 0,
         };
 
         // Write to an in-memory buffer

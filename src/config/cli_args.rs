@@ -249,6 +249,15 @@ pub enum DaemonAction {
         /// Run in the foreground instead of daemonizing.
         #[arg(long)]
         foreground: bool,
+
+        /// Increase daemon logging verbosity (-v, -vv, -vvv).
+        ///
+        /// Overrides the daemon's default log level (INFO):
+        /// - `-v`: INFO level
+        /// - `-vv`: DEBUG level
+        /// - `-vvv`: TRACE level
+        #[arg(short, long, action = ArgAction::Count)]
+        verbose: u8,
     },
     /// Stop the running daemon.
     Stop,

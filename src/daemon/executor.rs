@@ -38,6 +38,7 @@ pub async fn spawn_run(
     repo_dir: &Path,
     session_name: Option<String>,
     config_dir: Option<PathBuf>,
+    verbose: u8,
 ) -> Result<String> {
     // ── Pre-flight checks ───────────────────────────────────────────
     if !plan_path.exists() {
@@ -70,7 +71,13 @@ pub async fn spawn_run(
         )?
     };
 
-    info!(run_id = %run_id, plan = %plan_path.display(), "run registered");
+    let level_label = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    info!(run_id = %run_id, plan = %plan_path.display(), verbose = level_label, "run registered");
 
     // ── Spawn tmux session ──────────────────────────────────────────
     let tmux_session = format!("gw-{}", run_id);

@@ -18,7 +18,7 @@ use std::process::Command;
 /// Dispatch a daemon action.
 pub fn execute(action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Start { foreground } => start(foreground),
+        DaemonAction::Start { foreground, verbose } => start(foreground, verbose),
         DaemonAction::Stop => stop(),
         DaemonAction::Status => cmd_status(),
         DaemonAction::Restart => restart(),
@@ -28,7 +28,7 @@ pub fn execute(action: DaemonAction) -> Result<()> {
 }
 
 /// Start the daemon process.
-fn start(foreground: bool) -> Result<()> {
+fn start(foreground: bool, verbose: u8) -> Result<()> {
     // Ensure state directories exist
     ensure_gw_home()?;
 
@@ -40,21 +40,39 @@ fn start(foreground: bool) -> Result<()> {
     if foreground {
         println!("{} Starting daemon in foreground...", tag("RUN"));
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(crate::daemon::start_daemon())?;
+        rt.block_on(crate::daemon::start_daemon(verbose))?;
     } else {
         println!("{} Starting daemon in background...", tag("RUN"));
 
-        // Re-exec ourselves with `daemon start --foreground` as a detached process
+        // Re-exec ourselves with `daemon start --foreground` as a detached process,
+        // forwarding verbosity flags so the daemon subprocess logs at the same level.
         let exe = std::env::current_exe().wrap_err("failed to determine executable path")?;
+        let mut args = vec!["daemon", "start", "--foreground"];
+        let v_flag = match verbose {
+            1 => Some("-v"),
+            2 => Some("-vv"),
+            v if v >= 3 => Some("-vvv"),
+            _ => None,
+        };
+        if let Some(flag) = v_flag {
+            args.push(flag);
+        }
+
         let child = Command::new(&exe)
-            .args(["daemon", "start", "--foreground"])
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .wrap_err("failed to spawn daemon process")?;
 
-        println!("{} Daemon started (pid: {})", tag("OK"), child.id());
+        let level_label = match verbose {
+            0 => "info (default)",
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        };
+        println!("{} Daemon started (pid: {}, log level: {})", tag("OK"), child.id(), level_label);
         println!("  Socket: {}", GlobalConfig::load()?.socket_path().display());
 
         // Write PID file for tracking
@@ -258,7 +276,7 @@ fn restart() -> Result<()> {
         // Brief pause to allow socket cleanup
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    start(false)
+    start(false, 0)
 }
 
 /// Install the daemon as a macOS launchd service.

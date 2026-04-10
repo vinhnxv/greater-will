@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             multi_group,
             allow_dirty,
             foreground,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground),
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground, cli.verbose),
         commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
                 commands::elden::install()
