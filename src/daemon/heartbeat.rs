@@ -58,21 +58,22 @@ impl HeartbeatMonitor {
     async fn check_all_runs(&self) {
         let registry = self.registry.lock().await;
 
-        // Collect run IDs to check (avoid holding lock during tmux calls)
-        let running: Vec<(String, Option<String>)> = registry
+        // Collect run IDs to check (avoid holding lock during tmux calls).
+        // Only include entries with a tmux session — entries without one
+        // (e.g., queued runs) are skipped to avoid inflating the dead count.
+        let running: Vec<String> = registry
             .list_runs(false)
             .iter()
             .filter(|r| r.status == RunStatus::Running)
-            .map(|r| (r.run_id.clone(), r.session_name.clone().into()))
+            .map(|r| r.run_id.clone())
             .collect();
 
         drop(registry); // Release lock before I/O
 
-        let total = running.len();
         let mut alive = 0u32;
         let mut dead = 0u32;
 
-        for (run_id, _session_name) in &running {
+        for run_id in &running {
             let was_alive = self.check_run(run_id).await;
             if was_alive {
                 alive += 1;
@@ -81,7 +82,7 @@ impl HeartbeatMonitor {
             }
         }
 
-        if total > 0 {
+        if !running.is_empty() {
             debug!(alive = alive, dead = dead, "heartbeat tick");
         }
     }
