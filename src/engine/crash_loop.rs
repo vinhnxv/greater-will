@@ -241,8 +241,10 @@ impl CrashLoopDetector {
             );
         }
 
-        // Clean up the history file after loading
-        let _ = std::fs::remove_file(&path);
+        // Don't delete the file here — persist() will overwrite it when called,
+        // and clear_history() handles intentional cleanup. Deleting on load means
+        // a crash between load and the first persist loses all crash history,
+        // allowing infinite restarts.
     }
 
     /// Remove persisted crash history (call on clean completion).
@@ -350,8 +352,8 @@ mod tests {
         assert_eq!(d2.total_restarts(), 2);
         assert_eq!(d2.crashes_in_window(), 2);
 
-        // History file should be cleaned up after load
-        assert!(!dir.path().join(".gw").join("crash-history.json").exists());
+        // History file is preserved until persist() overwrites or clear_history() deletes
+        assert!(dir.path().join(".gw").join("crash-history.json").exists());
     }
 
     #[test]

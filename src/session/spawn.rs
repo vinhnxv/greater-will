@@ -198,19 +198,51 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
 pub fn has_session(session_id: &str) -> bool {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: Duration = Duration::from_millis(500);
+    const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
     for attempt in 0..MAX_ATTEMPTS {
+        // Use timeout-protected spawn to avoid hanging on unresponsive tmux server
         let result = Command::new("tmux")
             .args(["has-session", "-t", session_id])
-            .output();
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
 
         match result {
-            Ok(output) if output.status.success() => return true,
-            _ => {
-                if attempt < MAX_ATTEMPTS - 1 {
-                    std::thread::sleep(RETRY_DELAY);
+            Ok(mut child) => {
+                match child.try_wait() {
+                    // Already exited
+                    Ok(Some(status)) => {
+                        if status.success() { return true; }
+                    }
+                    // Still running — wait with timeout
+                    Ok(None) => {
+                        let start = std::time::Instant::now();
+                        loop {
+                            if start.elapsed() >= CMD_TIMEOUT {
+                                // Timeout — kill and treat as failure
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break;
+                            }
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    if status.success() { return true; }
+                                    break;
+                                }
+                                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
+            Err(_) => {}
+        }
+
+        if attempt < MAX_ATTEMPTS - 1 {
+            std::thread::sleep(RETRY_DELAY);
         }
     }
 
@@ -338,28 +370,40 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
     );
 
     // Step 1: Send text literally (no Enter)
-    Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["send-keys", "-t", &target, "-l", text])
         .output()
         .wrap_err("Failed to send text literally")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("tmux send-keys failed (text): {}", stderr.trim()));
+    }
 
     // Step 2: Wait for autocomplete to render
     std::thread::sleep(Duration::from_millis(SEND_DELAY_MS));
 
     // Step 3: Send Escape to dismiss autocomplete
-    Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["send-keys", "-t", &target, "Escape"])
         .output()
         .wrap_err("Failed to send Escape")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("tmux send-keys failed (Escape): {}", stderr.trim()));
+    }
 
     // Step 4: Brief wait for Ink to process
     std::thread::sleep(Duration::from_millis(ESCAPE_DELAY_MS));
 
     // Step 5: Send Enter to submit
-    Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["send-keys", "-t", &target, "Enter"])
         .output()
         .wrap_err("Failed to send Enter")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("tmux send-keys failed (Enter): {}", stderr.trim()));
+    }
 
     Ok(())
 }
@@ -367,10 +411,14 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 /// Send a simple command (without workaround) to the session.
 pub fn send_simple_command(session_id: &str, cmd: &str) -> Result<()> {
     let target = format!("{}:0.0", session_id);
-    Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["send-keys", "-t", &target, cmd, "Enter"])
         .output()
         .wrap_err("Failed to send command")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("tmux send-keys failed: {}", stderr.trim()));
+    }
 
     Ok(())
 }
@@ -401,6 +449,36 @@ pub fn get_pane_pid(session_id: &str) -> Result<u32> {
         .wrap_err_with(|| format!("Invalid PID: {}", pid_str))?;
 
     Ok(pid)
+}
+
+/// Get the PID of the Claude Code process running inside a tmux session.
+///
+/// Finds the actual Claude child process via `pgrep -P <shell_pid>`.
+/// Returns `None` if no Claude process is found (crashed or not yet started).
+pub fn get_claude_pid(session_id: &str) -> Option<u32> {
+    let shell_pid = get_pane_pid(session_id).ok()?;
+
+    let output = Command::new("pgrep")
+        .args(["-P", &shell_pid.to_string(), "-f", "claude"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Check if the Claude process (not just the shell) is alive in a session.
+///
+/// More accurate than checking the shell PID, which stays alive
+/// even after Claude crashes.
+pub fn is_claude_alive(session_id: &str) -> bool {
+    get_claude_pid(session_id).is_some()
 }
 
 /// Kill a tmux session.

@@ -79,6 +79,9 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     pid_file
         .flush()
         .wrap_err("failed to flush daemon PID file")?;
+    pid_file
+        .sync_all()
+        .wrap_err("failed to fsync daemon PID file")?;
 
     // 4. Init tracing to daemon.log with daily rotation.
     //    Verbosity controls the log level (matching `gw run -v/-vv/-vvv`):
@@ -141,7 +144,7 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
 
     // 7b. Start heartbeat monitor (captures pane logs, tracks phases, detects crashes)
     let heartbeat = HeartbeatMonitor::new(Arc::clone(&registry));
-    let _heartbeat_handle = heartbeat.start();
+    let heartbeat_handle = heartbeat.start();
     info!("heartbeat monitor spawned");
 
     // 8. Wait for shutdown signal
@@ -168,7 +171,8 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     // Wait for server to finish (it exits when cancel fires)
     let _ = server_handle.await;
 
-    // 9. Graceful shutdown: drain running sessions, clean up old runs, release lock, remove PID file.
+    // 9. Graceful shutdown: stop heartbeat, drain running sessions, clean up.
+    heartbeat_handle.abort(); // Stop heartbeat before draining to avoid interference
     info!("daemon shutting down — draining running sessions");
     let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
     info!(drained = drained, "drain complete");

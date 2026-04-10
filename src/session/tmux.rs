@@ -73,6 +73,9 @@ impl Tmux {
             .stderr(std::process::Stdio::piped())
             .spawn()?;
 
+        // Capture child PID before moving ownership, so we can kill on timeout.
+        let child_id = child.id();
+
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let result = child.wait_with_output();
@@ -85,8 +88,14 @@ impl Tmux {
                 Ok(result?)
             }
             Err(_) => {
-                // Timeout — try to kill via the PID we no longer own.
-                // The thread owns the child, so just let it clean up.
+                // Timeout — kill the child process by PID to avoid leaking
+                // both the OS thread and the zombie tmux process.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(child_id as i32, libc::SIGKILL);
+                }
+                // Join the thread (it will return now that the child is killed)
+                let _ = thread.join();
                 color_eyre::eyre::bail!("tmux command timed out after {:?}", TMUX_CMD_TIMEOUT)
             }
         }

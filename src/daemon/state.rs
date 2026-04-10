@@ -40,9 +40,19 @@ pub fn gw_home() -> PathBuf {
         }
         PathBuf::from(home)
     } else {
-        dirs::home_dir()
-            .expect("could not determine home directory")
-            .join(".gw")
+        match dirs::home_dir() {
+            Some(h) => h.join(".gw"),
+            None => {
+                // Last resort: use /tmp/.gw instead of panicking the daemon.
+                // This can happen in container/CI environments without $HOME.
+                tracing::error!(
+                    "could not determine home directory — $HOME is not set. \
+                     Falling back to /tmp/.gw which will lose data across reboots. \
+                     Set $GW_HOME or $HOME to fix this."
+                );
+                PathBuf::from("/tmp/.gw")
+            }
+        }
     }
 }
 

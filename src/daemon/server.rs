@@ -580,8 +580,8 @@ async fn dispatch_request(
                 }
             };
 
-            // Step 2: Drain snapshot (re-acquires lock internally)
-            crate::daemon::drain::drain_running_sessions(Arc::clone(registry)).await;
+            // Step 2: Snapshot only the detached run (not all running sessions)
+            crate::daemon::drain::drain_single_session(Arc::clone(registry), &actual_id).await;
 
             // Step 3: Mark as Stopped but do NOT kill tmux
             crate::daemon::heartbeat::append_event(&actual_id, "detached", &format!(

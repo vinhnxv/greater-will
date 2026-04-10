@@ -148,6 +148,9 @@ impl RunRegistry {
     }
 
     /// Generate an 8-character hex run ID.
+    ///
+    /// Uses nanosecond timestamp + PID + random bytes to avoid collisions
+    /// on systems with low-resolution clocks or rapid sequential calls.
     fn generate_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
@@ -155,9 +158,19 @@ impl RunRegistry {
             .unwrap_or_default()
             .as_nanos();
         let pid = std::process::id();
+        // Add random bytes to prevent collisions on low-resolution clocks
+        let random: u64 = {
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            let s = RandomState::new();
+            let mut h = s.build_hasher();
+            h.write_u128(nanos);
+            h.finish()
+        };
         let mut hasher = Sha256::new();
         hasher.update(nanos.to_le_bytes());
         hasher.update(pid.to_le_bytes());
+        hasher.update(random.to_le_bytes());
         let hash = hasher.finalize();
         hex::encode(&hash[..4])
     }
@@ -298,6 +311,34 @@ impl RunRegistry {
         self.runs.get_mut(run_id)
     }
 
+    /// Acquire a repo lock for adoption. Unlike `acquire_repo_lock`, this does
+    /// not fail if the lock is already held by this daemon instance (the same
+    /// repo may have a terminated run that hasn't released its lock yet).
+    pub fn acquire_repo_lock_for_adopt(&mut self, repo_dir: &Path) -> Result<()> {
+        let repo_hash = Self::repo_hash(repo_dir);
+
+        // Already holding — this is fine for adoption
+        if self.repo_locks.contains_key(&repo_hash) {
+            return Ok(());
+        }
+
+        let lock_dir = gw_home().join("repos").join(&repo_hash);
+        fs::create_dir_all(&lock_dir).wrap_err("failed to create repo lock directory")?;
+
+        let lock_path = lock_dir.join("lock");
+        let lock_file = fs::File::create(&lock_path).wrap_err("failed to create repo lock file")?;
+
+        lock_file.try_lock_exclusive().map_err(|_| {
+            color_eyre::eyre::eyre!(
+                "repository is locked by another daemon instance: {}",
+                repo_dir.display()
+            )
+        })?;
+
+        self.repo_locks.insert(repo_hash, lock_file);
+        Ok(())
+    }
+
     /// Adopt a run entry that was loaded from disk (e.g., during orphan recovery).
     ///
     /// Inserts the entry into the in-memory registry and persists it.
@@ -362,12 +403,16 @@ impl RunRegistry {
 
         let json = serde_json::to_string_pretty(entry).wrap_err("failed to serialize run entry")?;
 
-        fs::write(&tmp_path, &json)
-            .wrap_err_with(|| format!("failed to write tmp meta: {}", tmp_path.display()))?;
-
-        // Fsync before rename for crash safety
-        let f = fs::File::open(&tmp_path)?;
-        f.sync_all().wrap_err("failed to fsync meta.json")?;
+        // Open → write → fsync → rename for crash safety.
+        // Using a single fd avoids the TOCTOU of write-then-reopen.
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp_path)
+                .wrap_err_with(|| format!("failed to create tmp meta: {}", tmp_path.display()))?;
+            f.write_all(json.as_bytes())
+                .wrap_err("failed to write meta.json")?;
+            f.sync_all().wrap_err("failed to fsync meta.json")?;
+        }
 
         fs::rename(&tmp_path, &meta_path).wrap_err("failed to atomically rename meta.json")?;
 
