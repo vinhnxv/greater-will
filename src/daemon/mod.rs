@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_appender::rolling;
 
+use crate::daemon::heartbeat::HeartbeatMonitor;
 use crate::daemon::registry::RunRegistry;
 use crate::daemon::server::DaemonServer;
 use crate::daemon::state::{gw_home, ensure_gw_home, GlobalConfig};
@@ -107,6 +108,11 @@ pub async fn start_daemon() -> Result<()> {
             error!(error = %e, "server exited with error");
         }
     });
+
+    // 6b. Start heartbeat monitor (captures pane logs, tracks phases, detects crashes)
+    let heartbeat = HeartbeatMonitor::new(Arc::clone(&registry));
+    let _heartbeat_handle = heartbeat.start();
+    info!("heartbeat monitor spawned");
 
     // 7. Wait for shutdown signal
     let shutdown_cancel = cancel.clone();

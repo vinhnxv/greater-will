@@ -72,7 +72,7 @@ fn main() -> Result<()> {
         }
         commands::Commands::Daemon { action } => commands::daemon::execute(action),
         commands::Commands::Ps { all, json } => commands::ps::execute(all, json),
-        commands::Commands::Logs { run_id, follow, tail } => commands::logs::execute(run_id, follow, tail),
+        commands::Commands::Logs { run_id, follow, tail, pane } => commands::logs::execute(run_id, follow, tail, pane),
         commands::Commands::Stop { run_id } => commands::stop::execute(run_id),
         commands::Commands::Clean => commands::clean::execute(),
     }

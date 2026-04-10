@@ -272,23 +272,24 @@ async fn dispatch_request(
             run_id,
             follow: _,
             tail,
+            pane,
         } => {
             let reg = registry.lock().await;
             match reg.find_by_prefix(&run_id) {
                 Some(entry) => {
-                    // FLAW-002: Read the file the heartbeat monitor actually
-                    // writes to (`<gw_home>/runs/<id>/logs/session.log`).
-                    // The previous path (`output.log`) was never produced
-                    // by any component, so `get-logs` always returned "".
-                    let log_path = crate::daemon::state::gw_home()
+                    let log_dir = crate::daemon::state::gw_home()
                         .join("runs")
                         .join(&entry.run_id)
-                        .join("logs")
-                        .join("session.log");
+                        .join("logs");
+                    // Default: structured event log (events.jsonl)
+                    // --pane: raw tmux pane capture (pane.log)
+                    let log_path = if pane {
+                        log_dir.join("pane.log")
+                    } else {
+                        log_dir.join("events.jsonl")
+                    };
                     // SEC-004: Read only the last `tail` bytes (or a 1 MB
-                    // cap when unset). Previously `std::fs::read_to_string`
-                    // loaded the entire file, so a multi-GB log could OOM
-                    // the daemon process.
+                    // cap when unset) to prevent OOM on large log files.
                     let data = read_log_tail(&log_path, tail);
                     Response::LogChunk {
                         run_id: entry.run_id.clone(),

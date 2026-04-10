@@ -31,6 +31,8 @@ pub enum Request {
         run_id: String,
         follow: bool,
         tail: Option<usize>,
+        /// If true, return raw tmux pane capture; otherwise return structured events.
+        pane: bool,
     },
     /// Stop a running arc.
     StopRun {
@@ -164,6 +166,7 @@ mod tests {
                 run_id: "run-123".into(),
                 follow: true,
                 tail: Some(50),
+                pane: false,
             },
             Request::StopRun {
                 run_id: "run-456".into(),

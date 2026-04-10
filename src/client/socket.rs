@@ -212,6 +212,7 @@ impl DaemonClient {
             run_id,
             follow: true,
             tail: None,
+            pane: false,
         };
 
         self.send_streaming(request, |resp| match resp {

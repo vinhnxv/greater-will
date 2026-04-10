@@ -136,6 +136,9 @@ pub async fn spawn_run(
         "run started successfully"
     );
 
+    // Log structured event for `gw logs`
+    crate::daemon::heartbeat::log_run_started(&run_id, &plan_str);
+
     Ok(run_id)
 }
 
@@ -216,6 +219,7 @@ pub async fn stop_run(
     }
 
     info!(run_id = %run_id, "run stopped");
+    crate::daemon::heartbeat::log_run_stopped(run_id);
     Ok(())
 }
 

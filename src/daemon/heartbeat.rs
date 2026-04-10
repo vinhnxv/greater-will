@@ -24,8 +24,8 @@ const MAX_CRASH_RESTARTS: u32 = 3;
 ///
 /// Spawns a background tokio task that periodically:
 /// 1. Checks if each Running entry's tmux session is still alive
-/// 2. Captures pane output and appends to session logs
-/// 3. Updates the current phase based on pane content
+/// 2. Captures pane output and appends to pane log
+/// 3. Detects phase transitions and logs structured events
 /// 4. Performs crash recovery when a tmux session dies unexpectedly
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
@@ -107,7 +107,7 @@ impl HeartbeatMonitor {
         // Capture pane output for log archival
         match spawn::capture_pane(tmux_session) {
             Ok(content) => {
-                self.append_session_log(run_id, &content);
+                self.append_pane_log(run_id, &content);
                 self.update_phase_from_pane(run_id, &content).await;
             }
             Err(e) => {
@@ -137,6 +137,11 @@ impl HeartbeatMonitor {
             );
             entry.crash_restarts += 1;
             entry.current_phase = Some("recovering".to_string());
+
+            // Log the crash recovery event
+            append_event(run_id, "crash_recovery", &format!(
+                "tmux session died, attempting restart #{}", entry.crash_restarts
+            ));
 
             // Clone what we need before dropping the lock
             let repo_dir = entry.repo_dir.clone();
@@ -179,6 +184,7 @@ impl HeartbeatMonitor {
             };
 
             warn!(run_id = %run_id, reason = %reason);
+            append_event(run_id, "failed", &reason);
 
             if let Err(e) = registry.update_status(
                 run_id,
@@ -191,15 +197,15 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Append captured pane content to the session log.
-    fn append_session_log(&self, run_id: &str, content: &str) {
+    /// Append captured pane content to the pane log (raw tmux capture).
+    fn append_pane_log(&self, run_id: &str, content: &str) {
         let log_dir = gw_home().join("runs").join(run_id).join("logs");
         if let Err(e) = std::fs::create_dir_all(&log_dir) {
             debug!(error = %e, "failed to create log directory");
             return;
         }
 
-        let log_path = log_dir.join("session.log");
+        let log_path = log_dir.join("pane.log");
         use std::io::Write;
         match std::fs::OpenOptions::new()
             .create(true)
@@ -211,7 +217,7 @@ impl HeartbeatMonitor {
                 let _ = write!(f, "{content}");
             }
             Err(e) => {
-                debug!(error = %e, "failed to append to session log");
+                debug!(error = %e, "failed to append to pane log");
             }
         }
     }
@@ -242,6 +248,10 @@ impl HeartbeatMonitor {
                 if entry.current_phase.as_deref() != Some(phase_name) {
                     debug!(run_id = %run_id, phase = %phase_name, "phase updated");
                     entry.current_phase = Some(phase_name.to_string());
+
+                    // Log the phase transition as a structured event
+                    drop(registry);
+                    append_event(run_id, "phase_change", phase_name);
                 }
             }
         }
@@ -271,9 +281,59 @@ impl HeartbeatMonitor {
                 Some("complete".to_string()),
                 None,
             );
+            drop(registry);
+            append_event(run_id, "completed", "pipeline finished successfully");
         }
     }
 }
+
+// ── Structured event logging ───────────────────────────────────────
+
+/// Append a structured event to the run's event log (events.jsonl).
+///
+/// Each line is a JSON object with timestamp, event type, and message.
+/// This is the primary data source for `gw logs <id>`.
+fn append_event(run_id: &str, event: &str, message: &str) {
+    let log_dir = gw_home().join("runs").join(run_id).join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        debug!(error = %e, "failed to create log directory for events");
+        return;
+    }
+
+    let log_path = log_dir.join("events.jsonl");
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let line = serde_json::json!({
+        "ts": timestamp,
+        "event": event,
+        "msg": message,
+    });
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", line);
+        }
+        Err(e) => {
+            debug!(error = %e, "failed to append event");
+        }
+    }
+}
+
+/// Log the initial "run started" event. Called from executor after spawn.
+pub fn log_run_started(run_id: &str, plan_path: &str) {
+    append_event(run_id, "started", &format!("plan: {plan_path}"));
+}
+
+/// Log a run stopped event.
+pub fn log_run_stopped(run_id: &str) {
+    append_event(run_id, "stopped", "stopped by user");
+}
+
+// ── Pipeline completion detection ──────────────────────────────────
 
 /// Check pane output for signals that the arc pipeline has completed.
 ///
@@ -359,6 +419,7 @@ async fn spawn_recovery(
             }
 
             info!(run_id = %run_id, tmux_session = %tmux_session, "crash recovery started");
+            append_event(run_id, "recovery_started", &format!("new session: {tmux_session}"));
         }
         Err(e) => {
             warn!(run_id = %run_id, error = %e, "failed to spawn recovery session");
@@ -369,7 +430,7 @@ async fn spawn_recovery(
                 None,
                 Some(format!("crash recovery spawn failed: {e}")),
             );
+            append_event(run_id, "recovery_failed", &e.to_string());
         }
     }
 }
-

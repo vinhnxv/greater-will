@@ -180,6 +180,9 @@ pub enum Commands {
     },
 
     /// View logs for a specific run.
+    ///
+    /// By default shows structured event logs (phase transitions, status
+    /// changes, errors). Use --pane to see the raw tmux pane capture instead.
     Logs {
         /// The run ID to view logs for.
         run_id: String,
@@ -191,6 +194,10 @@ pub enum Commands {
         /// Show only the last N lines.
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
+
+        /// Show raw tmux pane capture instead of structured events.
+        #[arg(long)]
+        pane: bool,
     },
 
     /// Stop a running arc.
