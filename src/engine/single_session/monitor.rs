@@ -9,8 +9,8 @@
 //! - Transition/failed gap escalation
 
 use super::util::{
-    check_swarm_activity, find_artifact_dir_cached, is_pipeline_complete, read_cached_checkpoint,
-    scan_artifact_dir, ArtifactSnapshot,
+    check_swarm_activity, find_artifact_dir_cached, is_pipeline_complete,
+    preserve_checkpoint, read_cached_checkpoint, scan_artifact_dir, ArtifactSnapshot,
 };
 use super::{SingleSessionConfig, SessionOutcome, POLL_INTERVAL_SECS, STATUS_LOG_INTERVAL_SECS};
 use crate::cleanup;
@@ -29,6 +29,22 @@ use tracing::{debug, info, warn};
 /// "likely completed" rather than "crashed".  Used in multiple check branches.
 const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
 
+/// Kill a tmux session safely: preserve checkpoint BEFORE killing.
+///
+/// Rune's Stop hook (`on-session-stop.sh`) cancels `in_progress` phases when
+/// a session exits. This wrapper preserves the checkpoint so GW can restore
+/// it after the hook corrupts it.
+fn safe_kill_session(session_name: &str, working_dir: &std::path::Path) -> Result<()> {
+    preserve_checkpoint(working_dir);
+    kill_session(session_name)
+}
+
+/// Like `safe_kill_session` but ignores errors (for cleanup paths).
+fn safe_kill_session_ignore(session_name: &str, working_dir: &std::path::Path) {
+    preserve_checkpoint(working_dir);
+    let _ = kill_session(session_name);
+}
+
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
 pub(crate) fn run_session_attempt(
     session_name: &str,
@@ -40,7 +56,7 @@ pub(crate) fn run_session_attempt(
     // Kill any existing session with the same name
     if has_session(session_name) {
         info!(session = %session_name, "Killing existing session before restart");
-        kill_session(session_name)?;
+        safe_kill_session(session_name, &config.working_dir)?;
         std::thread::sleep(Duration::from_secs(2));
     }
 
@@ -86,7 +102,7 @@ pub(crate) fn run_session_attempt(
     if let Err(e) = send_keys_with_workaround(session_name, command) {
         let reason = format!("Failed to send command: {}", e);
         save_crash_dump(session_name, &config.working_dir, &reason);
-        kill_session(session_name)?;
+        safe_kill_session(session_name, &config.working_dir)?;
         return Ok(SessionOutcome::Crashed { reason });
     }
 
@@ -296,7 +312,7 @@ pub(crate) fn monitor_session(
                     );
                     println!("[gw] {} — killing session", reason);
                     save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
+                    safe_kill_session(session_name, &config.working_dir)?;
                     return Ok(SessionOutcome::ErrorDetected {
                         error_class,
                         reason,
@@ -352,7 +368,7 @@ pub(crate) fn monitor_session(
                     );
                     println!("[gw] {} — killing session", reason);
                     save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
+                    safe_kill_session(session_name, &config.working_dir)?;
                     return Ok(SessionOutcome::ErrorDetected {
                         error_class,
                         reason,
@@ -391,7 +407,7 @@ pub(crate) fn monitor_session(
         if pipeline_start.elapsed() > config.pipeline_timeout {
             warn!("Pipeline timeout exceeded, killing session");
             save_crash_dump(session_name, &config.working_dir, "Pipeline timeout exceeded");
-            kill_session(session_name)?;
+            safe_kill_session(session_name, &config.working_dir)?;
             return Ok(SessionOutcome::Timeout);
         }
 
@@ -519,7 +535,7 @@ pub(crate) fn monitor_session(
                     "[gw] Arc completed {}m ago — killing tmux session",
                     grace_elapsed / 60,
                 );
-                let _ = kill_session(session_name);
+                safe_kill_session_ignore(session_name, &config.working_dir);
                 return Ok(SessionOutcome::Completed);
             }
 
@@ -842,7 +858,7 @@ pub(crate) fn monitor_session(
                                     current, session_age.as_secs(),
                                 );
                                 save_crash_dump(session_name, &config.working_dir, &reason);
-                                let _ = kill_session(session_name);
+                                safe_kill_session_ignore(session_name, &config.working_dir);
                                 return Ok(SessionOutcome::Crashed { reason });
                             }
                         }
@@ -877,7 +893,7 @@ pub(crate) fn monitor_session(
                             session_age.as_secs(),
                         );
                         save_crash_dump(session_name, &config.working_dir, &reason);
-                        let _ = kill_session(session_name);
+                        safe_kill_session_ignore(session_name, &config.working_dir);
                         return Ok(SessionOutcome::Crashed { reason });
                     }
                 }
@@ -945,7 +961,7 @@ pub(crate) fn monitor_session(
                             session_age.as_secs(),
                         );
                         save_crash_dump(session_name, &config.working_dir, &reason);
-                        kill_session(session_name)?;
+                        safe_kill_session(session_name, &config.working_dir)?;
                         return Ok(SessionOutcome::ErrorDetected {
                             error_class: ErrorClass::BootstrapError,
                             reason,
@@ -968,7 +984,7 @@ pub(crate) fn monitor_session(
                         session_age.as_secs(), screen_idle_secs,
                     );
                     save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
+                    safe_kill_session(session_name, &config.working_dir)?;
                     // Classify as BootstrapError — Rune failed to initialize arc.
                     // This is likely a deterministic failure (plugin not loaded, bad
                     // command, config issue) that won't resolve by retrying.
@@ -1085,7 +1101,7 @@ pub(crate) fn monitor_session(
                             error_class, prev_class,
                         );
                         save_crash_dump(session_name, &config.working_dir, &reason);
-                        kill_session(session_name)?;
+                        safe_kill_session(session_name, &config.working_dir)?;
                         return Ok(SessionOutcome::ErrorDetected {
                             reason,
                             error_class,
@@ -1120,7 +1136,7 @@ pub(crate) fn monitor_session(
                         error_class, conf, elapsed_confirm,
                     );
                     save_crash_dump(session_name, &config.working_dir, &reason);
-                    kill_session(session_name)?;
+                    safe_kill_session(session_name, &config.working_dir)?;
                     return Ok(SessionOutcome::ErrorDetected {
                         reason,
                         error_class,
@@ -1205,7 +1221,7 @@ pub(crate) fn monitor_session(
             save_crash_dump(session_name, &config.working_dir, &format!(
                 "Claude process (pid={}) died after {}s grace", pid, gone_duration.as_secs(),
             ));
-            kill_session(session_name)?;
+            safe_kill_session(session_name, &config.working_dir)?;
 
             if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
                 return Ok(SessionOutcome::Crashed {
@@ -1348,7 +1364,7 @@ pub(crate) fn monitor_session(
                 save_crash_dump(session_name, &config.working_dir, &format!(
                     "Phase '{}' timeout: {}s > {}s budget", phase_name, phase_elapsed, effective_phase_timeout,
                 ));
-                kill_session(session_name)?;
+                safe_kill_session(session_name, &config.working_dir)?;
                 return Ok(SessionOutcome::Stuck);
             }
         }
@@ -1376,7 +1392,7 @@ pub(crate) fn monitor_session(
                     "Transition gap timeout: {}s between phases (kill after {}s)",
                     gap_secs, phase_nav::TRANSITION_KILL_SECS,
                 ));
-                kill_session(session_name)?;
+                safe_kill_session(session_name, &config.working_dir)?;
                 return Ok(SessionOutcome::Stuck);
             } else if gap_secs > phase_nav::TRANSITION_WARN_SECS && transition_nudge_count < 2 {
                 // WARN: stronger nudge
@@ -1425,7 +1441,7 @@ pub(crate) fn monitor_session(
                     "Failed phase '{}' not recovered: {}s (kill after {}s)",
                     phase_name, gap_secs, phase_nav::FAILED_KILL_SECS,
                 ));
-                kill_session(session_name)?;
+                safe_kill_session(session_name, &config.working_dir)?;
                 return Ok(SessionOutcome::Stuck);
             } else if gap_secs > phase_nav::FAILED_WARN_SECS && failed_nudge_count < 2 {
                 failed_nudge_count = 2;
@@ -1478,7 +1494,7 @@ pub(crate) fn monitor_session(
                 "Session idle {}s > {}s {:?} limit",
                 idle_duration.as_secs(), effective_kill_secs, current_profile.category,
             ));
-            kill_session(session_name)?;
+            safe_kill_session(session_name, &config.working_dir)?;
             return Ok(SessionOutcome::Stuck);
         }
 

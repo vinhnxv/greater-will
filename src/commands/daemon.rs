@@ -54,7 +54,23 @@ fn start(foreground: bool) -> Result<()> {
             .spawn()
             .wrap_err("failed to spawn daemon process")?;
 
-        println!("{} Daemon started (pid: {})", tag("OK"), child.id());
+        let pid = child.id();
+
+        // Brief pause to let the daemon bind its socket, then verify it
+        // actually came up. Without this, a socket conflict (EADDRINUSE)
+        // in the child process would go unnoticed since stderr is null.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !DaemonClient::is_daemon_running() {
+            println!("{} Daemon process exited immediately (pid: {}).", tag("FAIL"), pid);
+            println!("  Possible causes:");
+            println!("    - Socket already in use (another daemon or stale socket)");
+            println!("    - Permission denied on GW_HOME directory");
+            println!("  Try: gw daemon status  or  rm {} && gw daemon start",
+                GlobalConfig::load()?.socket_path().display());
+            return Ok(());
+        }
+
+        println!("{} Daemon started (pid: {})", tag("OK"), pid);
         println!("  Socket: {}", GlobalConfig::load()?.socket_path().display());
 
         // Write PID file for tracking

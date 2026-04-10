@@ -20,6 +20,7 @@ use std::io::{self, Write};
 pub fn execute(run_id: String, force: bool, detach: bool) -> Result<()> {
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
+        println!("  Start with: gw daemon start");
         return Ok(());
     }
 
@@ -70,6 +71,7 @@ pub fn execute(run_id: String, force: bool, detach: bool) -> Result<()> {
                 match code {
                     ErrorCode::RunNotFound => {
                         println!("{} Run {} not found.", tag("WARN"), short);
+                        println!("  Use `gw ps --all` to see all runs.");
                     }
                     _ => {
                         println!("{} {}", tag("FAIL"), message);

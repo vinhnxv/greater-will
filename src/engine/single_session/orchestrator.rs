@@ -409,6 +409,9 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
 
                 // Cooldown before restart — give system time to stabilize
                 std::thread::sleep(Duration::from_secs(config.watchdog.restart_cooldown_secs));
+
+                // Restore checkpoint if Rune's Stop hook corrupted it
+                super::util::restore_checkpoint_if_corrupted(&config.working_dir);
             }
             SessionOutcome::Timeout => {
                 return Ok(PipelineResult {
@@ -446,6 +449,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                     config.watchdog.restart_cooldown_secs,
                 );
                 std::thread::sleep(Duration::from_secs(config.watchdog.restart_cooldown_secs));
+                super::util::restore_checkpoint_if_corrupted(&config.working_dir);
             }
             SessionOutcome::ErrorDetected { error_class, reason } => {
                 // Auth/billing errors are fatal — skip immediately, no retry
@@ -521,6 +525,7 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 }
 
                 std::thread::sleep(backoff);
+                super::util::restore_checkpoint_if_corrupted(&config.working_dir);
             }
         }
     }
