@@ -157,6 +157,20 @@ pub(crate) fn monitor_session(
     let error_confirm_medium_secs = wd.error_confirm_medium_secs;
     let error_confirm_high_secs = wd.error_confirm_high_secs;
 
+    // StopFailure confirmation state: when a StopFailure signal is detected,
+    // we DON'T kill immediately. Instead, start a confirmation timer and
+    // verify the error is real (screen stalled, no new activity).
+    // This prevents false kills from transient API errors that Claude recovers from.
+    let mut stop_failure_confirm_since: Option<(Instant, ErrorClass)> = None;
+    /// Confirmation period for StopFailure signals (seconds).
+    /// Shorter than general error confirmation because the signal is from Claude itself,
+    /// but still gives time to verify the session is actually stuck.
+    const STOP_FAILURE_CONFIRM_SECS: u64 = 60; // 1 minute
+
+    // Track Claude Code's session_id from arc-phase-loop.local.md.
+    // Used to filter out stale signals from previous sessions.
+    let mut claude_session_id: Option<String> = None;
+
     // Phase-aware monitoring: track current phase and apply per-phase thresholds.
     // When the phase is unknown (early in pipeline), use watchdog defaults.
     use crate::engine::phase_profile::{self, PhaseProfile};
@@ -228,26 +242,141 @@ pub(crate) fn monitor_session(
         }
 
         // SIGNAL CHECK: StopFailure — API error reported by Claude Code itself.
-        // This is far more reliable than pane text matching because Claude Code
-        // explicitly tells us the turn failed via the StopFailure hook.
-        if let Some(_signal) = crate::commands::elden::read_stop_failure_signal() {
-            info!("StopFailure signal detected — API error reported by Claude Code");
-            // Clear the signal so we don't re-detect on restart
+        //
+        // IMPORTANT: We do NOT kill immediately. Transient API errors (overload,
+        // network blips) are common and Claude Code often recovers on retry.
+        // Instead, we start a confirmation timer and verify the error is real:
+        //   1. Signal must belong to the current session (session_id check)
+        //   2. Screen must be stalled (no new output)
+        //   3. Confirmation period must expire (STOP_FAILURE_CONFIRM_SECS)
+        //   4. Any new screen activity cancels the pending kill
+        if let Some(signal) = crate::commands::elden::read_stop_failure_signal() {
+            // Clear the signal file immediately to prevent re-reading
             crate::commands::elden::clear_signals();
-            // Classify from pane output — StopFailure confirms a real error,
-            // so we can trust keyword matching without stall evidence.
-            // Fall back to ApiOverload if no specific pattern matches.
-            let pane_for_classify = capture_pane(session_name).unwrap_or_default();
-            let error_class = ErrorClass::from_pane_output(&pane_for_classify, true)
-                .unwrap_or(ErrorClass::ApiOverload);
-            let reason = format!("StopFailure hook — classified as {:?}", error_class);
-            println!("[gw] {} — killing session", reason);
-            save_crash_dump(session_name, &config.working_dir, &reason);
-            kill_session(session_name)?;
-            return Ok(SessionOutcome::ErrorDetected {
-                error_class,
-                reason,
-            });
+
+            let signal_session = signal.get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Filter stale signals from previous sessions
+            let is_current_session = match &claude_session_id {
+                Some(current_id) => signal_session == current_id
+                    || signal_session == "unknown"
+                    || current_id == "unknown",
+                None => true, // No session_id yet (early startup) — accept
+            };
+
+            if !is_current_session {
+                info!(
+                    signal_session = signal_session,
+                    current_session = claude_session_id.as_deref().unwrap_or("none"),
+                    "StopFailure signal from different session — ignoring stale signal"
+                );
+                println!(
+                    "[gw] Ignoring stale StopFailure signal (session {} != current {})",
+                    signal_session,
+                    claude_session_id.as_deref().unwrap_or("none"),
+                );
+            } else if stop_failure_confirm_since.is_none() {
+                // Start confirmation timer — don't kill yet
+                let pane_for_classify = capture_pane(session_name).unwrap_or_default();
+                let error_class = ErrorClass::from_pane_output(&pane_for_classify, true)
+                    .unwrap_or(ErrorClass::ApiOverload);
+
+                // Fatal errors (auth, billing) skip confirmation — they won't recover
+                if error_class.skips_plan() {
+                    let reason = format!(
+                        "StopFailure hook — fatal {:?} (no confirmation needed)",
+                        error_class,
+                    );
+                    warn!(
+                        error_class = ?error_class,
+                        signal_session = signal_session,
+                        "Fatal StopFailure — killing immediately"
+                    );
+                    println!("[gw] {} — killing session", reason);
+                    save_crash_dump(session_name, &config.working_dir, &reason);
+                    kill_session(session_name)?;
+                    return Ok(SessionOutcome::ErrorDetected {
+                        error_class,
+                        reason,
+                    });
+                }
+
+                warn!(
+                    error_class = ?error_class,
+                    signal_session = signal_session,
+                    confirm_secs = STOP_FAILURE_CONFIRM_SECS,
+                    "StopFailure detected — starting {}s confirmation (NOT killing yet)",
+                    STOP_FAILURE_CONFIRM_SECS,
+                );
+                println!(
+                    "[gw] StopFailure signal ({:?}) — watching for {}s before killing (may recover)",
+                    error_class, STOP_FAILURE_CONFIRM_SECS,
+                );
+                stop_failure_confirm_since = Some((Instant::now(), error_class));
+            }
+        }
+
+        // StopFailure confirmation check: if the timer is running,
+        // verify the session is still stuck before killing.
+        if let Some((confirm_start, ref error_class)) = stop_failure_confirm_since {
+            let confirm_elapsed = confirm_start.elapsed().as_secs();
+            let screen_idle_secs = last_activity.elapsed().as_secs();
+
+            // Cancel if screen shows new activity (Claude recovered from the error)
+            if screen_idle_secs < 10 && confirm_elapsed > 5 {
+                info!(
+                    screen_idle_secs = screen_idle_secs,
+                    "Screen active after StopFailure — Claude recovered, cancelling kill"
+                );
+                println!(
+                    "[gw] StopFailure cleared — Claude recovered (screen active, idle {}s)",
+                    screen_idle_secs,
+                );
+                stop_failure_confirm_since = None;
+            } else if confirm_elapsed >= STOP_FAILURE_CONFIRM_SECS {
+                // Confirmation expired — verify screen is truly stalled
+                if screen_idle_secs >= STOP_FAILURE_CONFIRM_SECS / 2 {
+                    let error_class = error_class.clone();
+                    let reason = format!(
+                        "StopFailure confirmed: {:?} (observed={}s, screen idle={}s)",
+                        error_class, confirm_elapsed, screen_idle_secs,
+                    );
+                    warn!(
+                        error_class = ?error_class,
+                        confirm_secs = confirm_elapsed,
+                        screen_idle_secs = screen_idle_secs,
+                        "StopFailure confirmed after {}s — killing session",
+                        confirm_elapsed,
+                    );
+                    println!("[gw] {} — killing session", reason);
+                    save_crash_dump(session_name, &config.working_dir, &reason);
+                    kill_session(session_name)?;
+                    return Ok(SessionOutcome::ErrorDetected {
+                        error_class,
+                        reason,
+                    });
+                } else {
+                    // Screen is active despite expired timer — Claude recovered
+                    info!(
+                        screen_idle_secs = screen_idle_secs,
+                        confirm_elapsed = confirm_elapsed,
+                        "StopFailure timer expired but screen is active — Claude recovered"
+                    );
+                    println!(
+                        "[gw] StopFailure timer expired but Claude is active (idle {}s) — cancelling kill",
+                        screen_idle_secs,
+                    );
+                    stop_failure_confirm_since = None;
+                }
+            } else {
+                debug!(
+                    remaining_secs = STOP_FAILURE_CONFIRM_SECS - confirm_elapsed,
+                    screen_idle_secs = screen_idle_secs,
+                    "StopFailure confirmation in progress"
+                );
+            }
         }
 
         // SIGNAL CHECK: Permission pending — reset idle timer.
@@ -583,6 +712,18 @@ pub(crate) fn monitor_session(
 
             loop_state_ever_seen = true;
             loop_state_gone_since = None; // Reset grace timer — file is back
+
+            // Track Claude's session_id for signal filtering
+            if claude_session_id.as_deref() != Some(&current.session_id) {
+                if claude_session_id.is_some() {
+                    info!(
+                        old = claude_session_id.as_deref().unwrap_or("none"),
+                        new = %current.session_id,
+                        "Claude session_id changed"
+                    );
+                }
+                claude_session_id = Some(current.session_id.clone());
+            }
 
             // Content change detection: compare all fields with previous snapshot
             if let Some(ref prev) = prev_loop_state {

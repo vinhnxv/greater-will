@@ -268,15 +268,18 @@ impl NudgeManager {
 /// Same logic as session::spawn::send_keys_with_workaround,
 /// duplicated here to avoid circular dependencies.
 fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
+    // Always target window 0, pane 0 to avoid sending keys to a teammate pane
+    let target = format!("{}:0.0", session_id);
     debug!(
         session_id = %session_id,
+        target = %target,
         text = %text,
-        "Sending keys with Ink workaround"
+        "Sending keys with Ink workaround (targeting main pane)"
     );
 
     // Step 1: Send text literally (no Enter)
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "-l", text])
+        .args(["send-keys", "-t", &target, "-l", text])
         .output()?;
 
     // Step 2: Wait for autocomplete to render
@@ -284,7 +287,7 @@ fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 
     // Step 3: Send Escape to dismiss autocomplete
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Escape"])
+        .args(["send-keys", "-t", &target, "Escape"])
         .output()?;
 
     // Step 4: Brief wait for Ink to process
@@ -292,7 +295,7 @@ fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 
     // Step 5: Send Enter to submit
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Enter"])
+        .args(["send-keys", "-t", &target, "Enter"])
         .output()?;
 
     Ok(())
@@ -306,8 +309,9 @@ pub fn is_session_idle(
     previous_hash: Option<u64>,
     _threshold: Duration,
 ) -> Result<(bool, u64)> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
+        .args(["capture-pane", "-t", &target, "-p"])
         .output()?;
 
     let content = String::from_utf8_lossy(&output.stdout);
