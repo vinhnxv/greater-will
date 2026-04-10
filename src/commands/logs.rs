@@ -61,8 +61,9 @@ pub fn execute(run_id: String, follow: bool, tail: Option<usize>, pane: bool) ->
                     println!("{} {}", tag("DONE"), message);
                     false
                 }
-                Response::Error { message, .. } => {
+                Response::Error { code, message } => {
                     println!("{} {}", tag("FAIL"), message);
+                    println!("  {}", code.suggestion(&run_id));
                     false
                 }
                 _ => false,
@@ -88,8 +89,9 @@ pub fn execute(run_id: String, follow: bool, tail: Option<usize>, pane: bool) ->
                     print_formatted_events(&data);
                 }
             }
-            Response::Error { message, .. } => {
+            Response::Error { code, message } => {
                 println!("{} {}", tag("FAIL"), message);
+                println!("  {}", code.suggestion(&run_id));
             }
             _ => {
                 println!("{} Unexpected response from daemon", tag("WARN"));

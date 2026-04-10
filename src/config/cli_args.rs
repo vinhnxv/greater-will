@@ -177,6 +177,14 @@ pub enum Commands {
         /// Output as JSON for scripting.
         #[arg(long)]
         json: bool,
+
+        /// Show only running runs.
+        #[arg(long)]
+        running: bool,
+
+        /// Show only failed runs.
+        #[arg(long)]
+        failed: bool,
     },
 
     /// View logs for a specific run.
@@ -201,9 +209,20 @@ pub enum Commands {
     },
 
     /// Stop a running arc.
+    ///
+    /// By default, prompts for confirmation and kills the tmux session.
+    /// Use `--force` to skip confirmation.
+    /// Use `--detach` to stop tracking but keep the tmux session alive.
     Stop {
         /// The run ID to stop.
         run_id: String,
+        /// Skip confirmation prompt.
+        #[arg(long, short)]
+        force: bool,
+        /// Stop GW tracking but keep the tmux session alive.
+        /// The session can be re-adopted on next daemon restart.
+        #[arg(long, short)]
+        detach: bool,
     },
 
     /// Clean up temporary files and tmux sessions.

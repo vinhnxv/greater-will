@@ -191,12 +191,30 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
 }
 
 /// Check if a tmux session exists.
+///
+/// Retries up to 3 times with a short delay to avoid false negatives
+/// when the tmux server is temporarily busy (e.g., during agent team spawning).
+/// A single transient failure must never trigger destructive recovery.
 pub fn has_session(session_id: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", session_id])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = Command::new("tmux")
+            .args(["has-session", "-t", session_id])
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => return true,
+            _ => {
+                if attempt < MAX_ATTEMPTS - 1 {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Create a new detached tmux session.

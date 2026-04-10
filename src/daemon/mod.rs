@@ -1,3 +1,4 @@
+pub mod drain;
 pub mod executor;
 pub mod heartbeat;
 pub mod protocol;
@@ -154,8 +155,11 @@ pub async fn start_daemon() -> Result<()> {
     // Wait for server to finish (it exits when cancel fires)
     let _ = server_handle.await;
 
-    // 9. Graceful shutdown: clean up old runs, release lock, remove PID file.
-    info!("daemon shutting down");
+    // 9. Graceful shutdown: drain running sessions, clean up old runs, release lock, remove PID file.
+    info!("daemon shutting down — draining running sessions");
+    let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
+    info!(drained = drained, "drain complete");
+
     state::cleanup_old_runs(config.retention)?;
 
     // Explicitly release the exclusive lock before unlinking the PID file.

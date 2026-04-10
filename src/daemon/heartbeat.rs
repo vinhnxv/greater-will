@@ -30,12 +30,19 @@ const MAX_CRASH_RESTARTS: u32 = 3;
 /// 4. Performs crash recovery when a tmux session dies unexpectedly
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
+    /// Consecutive dead-tick counts per run. A run is only declared dead
+    /// after reaching DEAD_TICKS_THRESHOLD consecutive failures, preventing
+    /// transient `has_session` failures from triggering destructive recovery.
+    dead_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl HeartbeatMonitor {
     /// Create a new heartbeat monitor wrapping the shared registry.
     pub fn new(registry: Arc<Mutex<RunRegistry>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            dead_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Start the heartbeat loop as a background tokio task.
@@ -107,13 +114,44 @@ impl HeartbeatMonitor {
             }
         };
 
-        // Check if tmux session is alive (sync call, but fast)
+        // Check if tmux session is alive (sync call, with retry).
         let session_alive = spawn::has_session(&tmux_session);
 
         if session_alive {
+            // Reset dead counter on success
+            if let Ok(mut counts) = self.dead_counts.lock() {
+                counts.remove(run_id);
+            }
             self.handle_alive_session(run_id, &tmux_session).await;
         } else {
-            self.handle_dead_session(run_id, &tmux_session).await;
+            // Grace period: require 3 consecutive dead ticks before recovery.
+            // Prevents transient tmux failures (server busy during agent team
+            // spawning) from triggering destructive kill+restart.
+            const DEAD_TICKS_THRESHOLD: u32 = 3;
+
+            let consecutive = {
+                let mut counts = self.dead_counts.lock().unwrap_or_else(|p| p.into_inner());
+                let count = counts.entry(run_id.to_string()).or_insert(0);
+                *count += 1;
+                *count
+            };
+
+            if consecutive >= DEAD_TICKS_THRESHOLD {
+                warn!(
+                    run_id = %run_id,
+                    consecutive = consecutive,
+                    "session confirmed dead after {} ticks — triggering recovery",
+                    DEAD_TICKS_THRESHOLD
+                );
+                self.handle_dead_session(run_id, &tmux_session).await;
+            } else {
+                debug!(
+                    run_id = %run_id,
+                    consecutive = consecutive,
+                    threshold = DEAD_TICKS_THRESHOLD,
+                    "session appears dead — waiting for confirmation"
+                );
+            }
         }
 
         session_alive
@@ -239,36 +277,29 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Update the run's current phase based on pane content heuristics.
+    /// Update the run's current phase from checkpoint.json (ground truth),
+    /// falling back to pane content heuristics when no checkpoint is available.
     async fn update_phase_from_pane(&self, run_id: &str, pane_content: &str) {
-        // Look for phase markers in the last few lines
-        let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
-        let tail = last_lines.join("\n").to_lowercase();
+        // Try checkpoint.json first — this is the authoritative source
+        let checkpoint_phase = self.read_phase_from_checkpoint(run_id).await;
 
-        let phase = if tail.contains("phase_1") || tail.contains("plan") {
-            Some("plan")
-        } else if tail.contains("phase_2") || tail.contains("work") {
-            Some("work")
-        } else if tail.contains("phase_3") || tail.contains("review") {
-            Some("review")
-        } else if tail.contains("phase_4") || tail.contains("test") {
-            Some("test")
-        } else if tail.contains("phase_5") || tail.contains("ship") || tail.contains("merge") {
-            Some("ship")
+        // Fall back to pane heuristics only when checkpoint is unavailable
+        let phase = if let Some(cp_phase) = checkpoint_phase {
+            Some(cp_phase)
         } else {
-            None
+            phase_from_pane_heuristic(pane_content)
         };
 
         if let Some(phase_name) = phase {
             let mut registry = self.registry.lock().await;
             if let Some(entry) = registry.get_mut(run_id) {
-                if entry.current_phase.as_deref() != Some(phase_name) {
+                if entry.current_phase.as_deref() != Some(&phase_name) {
                     debug!(run_id = %run_id, phase = %phase_name, "phase updated");
-                    entry.current_phase = Some(phase_name.to_string());
+                    entry.current_phase = Some(phase_name.clone());
 
                     // Log the phase transition as a structured event
                     drop(registry);
-                    append_event(run_id, "phase_change", phase_name);
+                    append_event(run_id, "phase_change", &phase_name);
                 }
             }
         }
@@ -300,6 +331,32 @@ impl HeartbeatMonitor {
             );
             drop(registry);
             append_event(run_id, "completed", "pipeline finished successfully");
+        }
+    }
+
+    /// Read the current phase directly from checkpoint.json in the repo.
+    ///
+    /// This is the ground truth — it knows the exact phase name from the 41-phase
+    /// PHASE_ORDER, not just the 5 coarse buckets from pane heuristics.
+    async fn read_phase_from_checkpoint(&self, run_id: &str) -> Option<String> {
+        let repo_dir = {
+            let registry = self.registry.lock().await;
+            registry.get(run_id).map(|e| e.repo_dir.clone())?
+        };
+
+        // Scan .rune/arc/*/checkpoint.json for the most recent checkpoint
+        let arc_dir = repo_dir.join(".rune").join("arc");
+        let checkpoint_path = find_latest_checkpoint(&arc_dir)?;
+
+        match crate::checkpoint::reader::read_checkpoint(&checkpoint_path) {
+            Ok(cp) => {
+                let position = cp.infer_phase_position();
+                Some(position.effective_phase()?.to_string())
+            }
+            Err(e) => {
+                debug!(run_id = %run_id, error = %e, "failed to read checkpoint");
+                None
+            }
         }
     }
 }
@@ -352,7 +409,8 @@ pub fn log_run_stopped(run_id: &str) {
 
 /// Spawn a crash recovery session for a failed run.
 ///
-/// Creates a new tmux session and runs the arc command with `--resume`.
+/// If a checkpoint exists, runs with `--resume` to continue where it left off.
+/// Otherwise, starts a fresh arc run from scratch (re-spawn).
 async fn spawn_recovery(
     registry: Arc<Mutex<RunRegistry>>,
     run_id: &str,
@@ -362,25 +420,49 @@ async fn spawn_recovery(
 ) {
     let tmux_session = format!("gw-{}", run_id);
 
-    // Clear any lingering tmux session with the same name before recreating.
-    // This is idempotent: kill_session returns Err if the session does not
-    // exist, which we deliberately ignore.
-    let _ = spawn::kill_session(&tmux_session);
+    // Only kill the tmux session if it is truly dead (no claude process running).
+    // A transient has_session failure could trigger recovery even when the
+    // session is alive; killing it would be destructive.
+    if spawn::has_session(&tmux_session) {
+        // Session is still alive — check if claude is running inside it.
+        // If claude is alive, abort recovery (false positive crash detection).
+        if is_claude_alive_in_session(&tmux_session) {
+            info!(
+                run_id = %run_id,
+                tmux_session = %tmux_session,
+                "ABORT recovery: session and claude are alive — false positive crash"
+            );
+            // Reset status back to Running (undo the crash_restarts increment)
+            let mut reg = registry.lock().await;
+            if let Some(entry) = reg.get_mut(run_id) {
+                entry.crash_restarts = entry.crash_restarts.saturating_sub(1);
+                entry.current_phase = Some("running".to_string());
+            }
+            return;
+        }
+        // Claude is dead but session alive — kill to recreate cleanly
+        let _ = spawn::kill_session(&tmux_session);
+    }
+
+    let has_checkpoint = crate::daemon::reconciler::check_checkpoint(repo_dir);
 
     info!(
         run_id = %run_id,
         tmux_session = %tmux_session,
+        has_checkpoint = has_checkpoint,
         "starting crash recovery"
     );
 
-    // Build the resume command
+    // Build the command: --resume if checkpoint exists, fresh start otherwise
     let plan_str = plan_path
         .to_str()
         .unwrap_or("plan.md");
-    let cmd = format!(
-        "/rune:arc '{}' --resume",
-        plan_str
-    );
+    let cmd = if has_checkpoint {
+        format!("/rune:arc '{}' --resume", plan_str)
+    } else {
+        info!(run_id = %run_id, "no checkpoint — starting fresh arc run");
+        format!("/rune:arc '{}'", plan_str)
+    };
 
     // Spawn tmux session
     let config = spawn::SpawnConfig {
@@ -428,4 +510,84 @@ async fn spawn_recovery(
             append_event(run_id, "recovery_failed", &e.to_string());
         }
     }
+}
+
+/// Fallback: extract a coarse phase name from pane content heuristics.
+///
+/// Used only when checkpoint.json is not available (e.g., session just started
+/// and Rune hasn't written a checkpoint yet).
+fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
+    let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
+    let tail = last_lines.join("\n").to_lowercase();
+
+    if tail.contains("phase_1") || tail.contains("plan") {
+        Some("plan".to_string())
+    } else if tail.contains("phase_2") || tail.contains("work") {
+        Some("work".to_string())
+    } else if tail.contains("phase_3") || tail.contains("review") {
+        Some("review".to_string())
+    } else if tail.contains("phase_4") || tail.contains("test") {
+        Some("test".to_string())
+    } else if tail.contains("phase_5") || tail.contains("ship") || tail.contains("merge") {
+        Some("ship".to_string())
+    } else {
+        None
+    }
+}
+
+/// Find the most recently modified checkpoint.json under .rune/arc/*/
+fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !arc_dir.is_dir() {
+        return None;
+    }
+
+    std::fs::read_dir(arc_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let cp = e.path().join("checkpoint.json");
+            if cp.exists() {
+                let mtime = std::fs::metadata(&cp).ok()?.modified().ok()?;
+                Some((cp, mtime))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(path, _)| path)
+}
+
+
+/// Check if a claude process is running inside a tmux session.
+///
+/// Uses `tmux list-panes` to get the pane PID, then checks if it has
+/// a claude child process via `pgrep -P`.
+fn is_claude_alive_in_session(tmux_session: &str) -> bool {
+    use std::process::Command;
+
+    // Get pane PID
+    let output = Command::new("tmux")
+        .args(["list-panes", "-t", tmux_session, "-F", "#{pane_pid}"])
+        .output();
+
+    let pane_pid = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        }
+        _ => None,
+    };
+
+    let Some(pid) = pane_pid else {
+        return false;
+    };
+
+    // Check if pane's shell has a claude child process
+    Command::new("pgrep")
+        .args(["-P", &pid.to_string(), "-f", "claude"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }

@@ -34,8 +34,13 @@ pub enum Request {
         /// If true, return raw tmux pane capture; otherwise return structured events.
         pane: bool,
     },
-    /// Stop a running arc.
+    /// Stop a running arc (kills the tmux session).
     StopRun {
+        run_id: String,
+    },
+    /// Detach a run: stop GW tracking but keep the tmux session alive.
+    /// The session can be re-adopted on next daemon restart via reconciler.
+    DetachRun {
         run_id: String,
     },
     /// Query daemon health and version.
@@ -98,6 +103,32 @@ pub enum ErrorCode {
     DaemonBusy,
     InvalidRequest,
     InternalError,
+}
+
+impl ErrorCode {
+    /// Return an actionable suggestion for the user based on the error variant.
+    ///
+    /// `context` is typically a run ID or resource name to interpolate into the
+    /// message so the user gets a copy-pasteable remediation command.
+    pub fn suggestion(&self, context: &str) -> String {
+        match self {
+            ErrorCode::RepoLocked => {
+                format!("Repository is locked by {context}. Wait or run: `gw stop {context}`")
+            }
+            ErrorCode::RunNotFound => {
+                format!("No run matching '{context}'. Run `gw ps` to see active runs.")
+            }
+            ErrorCode::DaemonBusy => {
+                "Daemon is busy. Try again in a moment.".to_string()
+            }
+            ErrorCode::InvalidRequest => {
+                format!("Invalid request: {context}. Run `gw --help` for usage.")
+            }
+            ErrorCode::InternalError => {
+                "Internal daemon error. Check with: `gw daemon status`".to_string()
+            }
+        }
+    }
 }
 
 // ── Length-prefixed framing ──────────────────────────────────────────
@@ -170,6 +201,9 @@ mod tests {
             },
             Request::StopRun {
                 run_id: "run-456".into(),
+            },
+            Request::DetachRun {
+                run_id: "run-789".into(),
             },
             Request::DaemonStatus,
             Request::Shutdown,

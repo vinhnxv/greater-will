@@ -45,6 +45,14 @@ pub struct RunEntry {
     pub config_dir: Option<PathBuf>,
     /// Error message on failure.
     pub error_message: Option<String>,
+    /// Whether this run can be re-spawned from scratch on daemon restart.
+    /// Defaults to `true` for backward compatibility with existing meta.json.
+    #[serde(default = "default_restartable")]
+    pub restartable: bool,
+}
+
+fn default_restartable() -> bool {
+    true
 }
 
 impl RunEntry {
@@ -180,6 +188,7 @@ impl RunRegistry {
             crash_restarts: 0,
             config_dir: None,
             error_message: None,
+            restartable: true,
         };
 
         // Persist to disk
@@ -286,6 +295,18 @@ impl RunRegistry {
     /// Get a mutable run by exact ID.
     pub fn get_mut(&mut self, run_id: &str) -> Option<&mut RunEntry> {
         self.runs.get_mut(run_id)
+    }
+
+    /// Adopt a run entry that was loaded from disk (e.g., during orphan recovery).
+    ///
+    /// Inserts the entry into the in-memory registry and persists it.
+    /// Unlike `register_run`, this does NOT generate a new ID or acquire repo locks.
+    pub fn adopt(&mut self, entry: RunEntry) {
+        let run_id = entry.run_id.clone();
+        if let Err(e) = self.write_meta(&entry) {
+            tracing::warn!(run_id = %run_id, error = %e, "failed to persist adopted entry");
+        }
+        self.runs.insert(run_id, entry);
     }
 
     // ── Internal helpers ────────────────────────────────────────────
