@@ -29,3 +29,4 @@ tmp/
 .rune/talisman.yml
 .rune/talisman.integrations.yml
 .gw/
+.rune/arc-integrity-failure.txt
