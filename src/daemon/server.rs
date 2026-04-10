@@ -580,6 +580,10 @@ async fn dispatch_request(
             crate::daemon::drain::drain_running_sessions(Arc::clone(registry)).await;
 
             // Step 3: Mark as Stopped but do NOT kill tmux
+            crate::daemon::heartbeat::append_event(&actual_id, "detached", &format!(
+                "detached by user — tmux session '{}' kept alive (gw no longer tracking)",
+                tmux.as_deref().unwrap_or("unknown"),
+            ));
             {
                 let mut reg = registry.lock().await;
                 if let Err(e) = reg.update_status(

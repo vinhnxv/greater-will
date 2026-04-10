@@ -205,11 +205,16 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
                     tmux = ?tmux_session,
                     "STALE: tmux dead, no checkpoint, not restartable — marking failed"
                 );
+                let reason = format!(
+                    "tmux session '{}' lost with no checkpoint — marked failed by reconciler on daemon startup",
+                    tmux_session.as_deref().unwrap_or("unknown"),
+                );
+                crate::daemon::heartbeat::append_event(run_id, "session_died", &reason);
                 if let Err(e) = registry.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
-                    Some("tmux session lost with no checkpoint (reconciler)".to_string()),
+                    Some(reason),
                 ) {
                     warn!(run_id = %run_id, error = %e, "failed to mark stale run as failed");
                 }

@@ -88,12 +88,14 @@ pub async fn spawn_run(
         Err(e) => {
             // Spawn failed — clean up registry entry
             warn!(run_id = %run_id, error = %e, "failed to spawn tmux session");
+            let reason = format!("tmux spawn failed: {e}");
+            crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
             let mut reg = registry.lock().await;
             let _ = reg.update_status(
                 &run_id,
                 RunStatus::Failed,
                 None,
-                Some(format!("tmux spawn failed: {e}")),
+                Some(reason),
             );
             return Err(e);
         }
@@ -105,13 +107,18 @@ pub async fn spawn_run(
 
     if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &arc_cmd) {
         warn!(error = %e, "failed to send arc command — killing session");
+        let reason = format!("failed to send arc command: {e}");
+        crate::daemon::heartbeat::append_event(&run_id, "kill_session", &format!(
+            "gw killed session '{}' — reason: {} (killed by: executor/send_keys_failed)",
+            tmux_session, reason,
+        ));
         let _ = spawn::kill_session(&tmux_session);
         let mut reg = registry.lock().await;
         let _ = reg.update_status(
             &run_id,
             RunStatus::Failed,
             None,
-            Some(format!("failed to send arc command: {e}")),
+            Some(reason),
         );
         return Err(e);
     }
@@ -175,6 +182,7 @@ pub async fn stop_run(
         Some(s) => s,
         None => {
             // No tmux session — just mark as stopped
+            crate::daemon::heartbeat::append_event(run_id, "stopped", "stopped by user (no tmux session to kill)");
             let mut reg = registry.lock().await;
             reg.update_status(
                 run_id,
@@ -202,9 +210,18 @@ pub async fn stop_run(
     // Step 3: Force-kill if still alive
     if !stopped && spawn::has_session(&tmux_session) {
         warn!(tmux = %tmux_session, "session still alive after grace period — force killing");
+        crate::daemon::heartbeat::append_event(run_id, "kill_session", &format!(
+            "gw force-killed session '{}' — reason: user requested stop, session did not exit within {}s grace (killed by: executor/stop_run)",
+            tmux_session, GRACEFUL_STOP_TIMEOUT.as_secs(),
+        ));
         if let Err(e) = spawn::kill_session(&tmux_session) {
             warn!(error = %e, "failed to force-kill tmux session");
         }
+    } else {
+        crate::daemon::heartbeat::append_event(run_id, "stopped", &format!(
+            "stopped by user — session '{}' exited gracefully after /exit",
+            tmux_session,
+        ));
     }
 
     // Step 4: Update registry

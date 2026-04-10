@@ -171,6 +171,11 @@ fn event_display(event: &str) -> (&str, Style) {
         "crash_recovery" => ("CRASH", Style::new().red()),
         "recovery_started" => ("RECOV", Style::new().cyan()),
         "recovery_failed" => ("FAIL", Style::new().red().bold()),
+        "kill_session" => ("KILL", Style::new().red().bold()),
+        "session_died" => ("DIED", Style::new().red()),
+        "spawn_failed" => ("SPNFAIL", Style::new().red().bold()),
+        "completion_detected" => ("DETECT", Style::new().green()),
+        "detached" => ("DETACH", Style::new().yellow()),
         _ => (event, Style::new()),
     }
 }

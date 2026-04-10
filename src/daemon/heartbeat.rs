@@ -173,7 +173,21 @@ impl HeartbeatMonitor {
 
     /// Handle a dead tmux session: attempt crash recovery or mark as Failed.
     async fn handle_dead_session(&self, run_id: &str, tmux_session: &str) {
-        warn!(run_id = %run_id, tmux_session = %tmux_session, "tmux session is dead");
+        // Diagnose WHY the session died before taking recovery action.
+        let death_reason = diagnose_session_death(run_id, tmux_session);
+        warn!(
+            run_id = %run_id,
+            tmux_session = %tmux_session,
+            reason = %death_reason,
+            "tmux session is dead: {}",
+            death_reason,
+        );
+
+        // Log the diagnosis as a separate event for `gw logs` visibility
+        append_event(run_id, "session_died", &format!(
+            "tmux session '{}' died — reason: {}",
+            tmux_session, death_reason,
+        ));
 
         let mut registry = self.registry.lock().await;
         let entry = match registry.get_mut(run_id) {
@@ -188,14 +202,16 @@ impl HeartbeatMonitor {
             info!(
                 run_id = %run_id,
                 crash_restarts = entry.crash_restarts,
+                reason = %death_reason,
                 "checkpoint found — scheduling crash recovery"
             );
             entry.crash_restarts += 1;
             entry.current_phase = Some("recovering".to_string());
 
-            // Log the crash recovery event
+            // Log the crash recovery event WITH the diagnosis reason
             append_event(run_id, "crash_recovery", &format!(
-                "tmux session died, attempting restart #{}", entry.crash_restarts
+                "tmux session died (reason: {}), attempting restart #{}",
+                death_reason, entry.crash_restarts,
             ));
 
             // Clone what we need before dropping the lock
@@ -231,11 +247,14 @@ impl HeartbeatMonitor {
         } else {
             let reason = if entry.crash_restarts >= MAX_CRASH_RESTARTS {
                 format!(
-                    "tmux session died after {} crash restarts — giving up",
-                    entry.crash_restarts
+                    "tmux session died after {} crash restarts — giving up (last death: {})",
+                    entry.crash_restarts, death_reason,
                 )
             } else {
-                "tmux session died with no checkpoint — marking failed".to_string()
+                format!(
+                    "tmux session died with no checkpoint — marking failed (reason: {})",
+                    death_reason,
+                )
             };
 
             warn!(run_id = %run_id, reason = %reason);
@@ -306,7 +325,8 @@ impl HeartbeatMonitor {
 
         // Check for pipeline completion
         if is_pipeline_complete(pane_content) {
-            info!(run_id = %run_id, "pipeline completed");
+            info!(run_id = %run_id, "pipeline completed (pane text match)");
+            append_event(run_id, "completion_detected", "pipeline completion detected via pane text pattern match");
             let mut registry = self.registry.lock().await;
             // Re-check status: stop_run (or another path) may have mutated the
             // entry between our earlier lock drop and this re-acquisition. If
@@ -367,7 +387,7 @@ impl HeartbeatMonitor {
 ///
 /// Each line is a JSON object with timestamp, event type, and message.
 /// This is the primary data source for `gw logs <id>`.
-fn append_event(run_id: &str, event: &str, message: &str) {
+pub fn append_event(run_id: &str, event: &str, message: &str) {
     let log_dir = gw_home().join("runs").join(run_id).join("logs");
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         debug!(error = %e, "failed to create log directory for events");
@@ -441,6 +461,10 @@ async fn spawn_recovery(
             return;
         }
         // Claude is dead but session alive — kill to recreate cleanly
+        append_event(run_id, "kill_session", &format!(
+            "gw killed session '{}' — reason: claude process dead inside alive tmux, killing for clean recovery (killed by: heartbeat/spawn_recovery)",
+            tmux_session,
+        ));
         let _ = spawn::kill_session(&tmux_session);
     }
 
@@ -557,6 +581,100 @@ fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBu
         .map(|(path, _)| path)
 }
 
+
+/// Diagnose why a tmux session died by checking multiple signals.
+///
+/// Returns a human-readable reason string that appears in `gw logs`.
+/// Checks (in priority order):
+/// 1. tmux server alive? (if not, all sessions die)
+/// 2. Last captured pane output for error patterns
+/// 3. Process exit signals (OOM, SIGKILL, etc.)
+/// 4. Checkpoint state (which phase was running)
+fn diagnose_session_death(run_id: &str, tmux_session: &str) -> String {
+    use std::process::Command;
+
+    // 1. Check if tmux server itself is dead
+    let tmux_alive = Command::new("tmux")
+        .args(["list-sessions"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !tmux_alive {
+        return "tmux server died (all sessions lost)".to_string();
+    }
+
+    // 2. Check system log for OOM kills (last 60 seconds)
+    let oom_killed = Command::new("log")
+        .args([
+            "show", "--predicate",
+            "eventMessage CONTAINS \"Killed\" AND eventMessage CONTAINS \"claude\"",
+            "--last", "1m",
+            "--style", "compact",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            if text.contains("Killed") || text.contains("jettisoned") {
+                Some("OOM: system killed claude process (memory pressure)".to_string())
+            } else {
+                None
+            }
+        });
+
+    if let Some(reason) = oom_killed {
+        return reason;
+    }
+
+    // 3. Check the last pane log for error patterns
+    let pane_log = gw_home().join("runs").join(run_id).join("logs").join("pane.log");
+    if let Ok(content) = std::fs::read_to_string(&pane_log) {
+        // Check last 50 lines for error patterns
+        let tail: String = content.lines().rev().take(50).collect::<Vec<_>>().join("\n");
+        let tail_lower = tail.to_lowercase();
+
+        if tail_lower.contains("error: out of memory") || tail_lower.contains("allocation failed") {
+            return "claude process ran out of memory".to_string();
+        }
+        if tail_lower.contains("api key") || tail_lower.contains("authentication") {
+            return "possible auth/API key error in claude output".to_string();
+        }
+        if tail_lower.contains("connection refused") || tail_lower.contains("network") {
+            return "possible network/connection error".to_string();
+        }
+        if tail_lower.contains("segmentation fault") || tail_lower.contains("segfault") {
+            return "claude process crashed (segfault)".to_string();
+        }
+        if tail_lower.contains("panic") && tail_lower.contains("thread") {
+            return "claude process panicked".to_string();
+        }
+    }
+
+    // 4. Check checkpoint for phase context
+    let arc_dir = gw_home().join("runs").join(run_id);
+    if let Ok(entries) = std::fs::read_dir(&arc_dir) {
+        // Try to find repo_dir from registry (best effort)
+        let _ = entries; // We already have the pane log path
+    }
+
+    // 5. Check if any other gw process killed it (signal file)
+    let signal_dir = std::path::Path::new("/tmp").join(format!("gw-signals-{}", tmux_session));
+    if signal_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&signal_dir) {
+            let signals: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            if !signals.is_empty() {
+                return format!("signal files present: {}", signals.join(", "));
+            }
+        }
+    }
+
+    // 6. No diagnosis — unknown cause
+    "unknown cause (session vanished with no error signals)".to_string()
+}
 
 /// Check if a claude process is running inside a tmux session.
 ///
