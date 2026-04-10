@@ -352,7 +352,9 @@ where
                 }
 
                 let bytes_available = file_len - last_offset;
-                let mut buf = Vec::with_capacity(bytes_available as usize);
+                // Cap pre-allocation to 16 MiB to avoid u64→usize overflow on 32-bit platforms.
+                let cap = (bytes_available as usize).min(16 * 1024 * 1024);
+                let mut buf = Vec::with_capacity(cap);
                 if file.take(bytes_available).read_to_end(&mut buf).is_err() {
                     continue;
                 }
