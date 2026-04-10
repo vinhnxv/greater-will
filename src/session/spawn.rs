@@ -225,15 +225,25 @@ fn create_tmux_session(session_id: &str, working_dir: &Path) -> Result<()> {
         "Creating tmux session"
     );
 
-    let output = Command::new("tmux")
-        .args([
+    let mut cmd = Command::new("tmux");
+    cmd.args([
             "new-session",
             "-d",                       // Detached
             "-s", session_id,           // Session name
             "-x", "200",                // Width (stable output)
             "-y", "50",                 // Height
             "-c", &working_dir.to_string_lossy(), // Working directory
-        ])
+        ]);
+
+    // Put the tmux server in its own process group so launchd/parent
+    // SIGTERM on our process group does not kill the tmux server.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let output = cmd
         .output()
         .wrap_err_with(|| format!("Failed to create tmux session '{}'", session_id))?;
 

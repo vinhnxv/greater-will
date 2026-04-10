@@ -311,6 +311,10 @@ fn install() -> Result<()> {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>{stdout}</string>
     <key>StandardErrorPath</key>
