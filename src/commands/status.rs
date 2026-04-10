@@ -18,6 +18,11 @@ use std::path::Path;
 /// - Machine health (CPU, RAM, disk)
 /// - Pass/Fail/Remaining counts
 pub fn execute() -> Result<()> {
+    // If the daemon is running, show daemon status + run list instead
+    if crate::client::socket::DaemonClient::is_daemon_running() {
+        return show_daemon_status();
+    }
+
     let state_path = Path::new(".gw/batch-state.json");
 
     if !state_path.exists() {
@@ -33,6 +38,53 @@ pub fn execute() -> Result<()> {
     print_plan_progress(&state);
     print_machine_health();
 
+    Ok(())
+}
+
+/// Show status from the daemon, including active runs.
+fn show_daemon_status() -> Result<()> {
+    use crate::client::socket::DaemonClient;
+    use crate::daemon::protocol::{Request, Response, RunStatus};
+
+    println!("{} Daemon mode active", tag("OK"));
+    println!();
+
+    let client = DaemonClient::new()?;
+    match client.send(Request::DaemonStatus)? {
+        Response::Ok { message } => println!("  {}", message),
+        _ => {}
+    }
+
+    // Show runs like `gw ps`
+    let client = DaemonClient::new()?;
+    match client.send(Request::ListRuns { all: false })? {
+        Response::RunList { runs } => {
+            if runs.is_empty() {
+                println!("  No active runs.");
+            } else {
+                println!();
+                for run in &runs {
+                    let short = crate::commands::util::short_id(&run.run_id);
+                    let status_tag = match run.status {
+                        RunStatus::Running => tag("RUN"),
+                        RunStatus::Queued => tag("WARN"),
+                        RunStatus::Succeeded => tag("OK"),
+                        RunStatus::Failed => tag("FAIL"),
+                        RunStatus::Stopped => tag("SKIP"),
+                    };
+                    println!("  {} {} {} ({})",
+                        status_tag,
+                        short,
+                        run.plan_path.display(),
+                        run.current_phase.as_deref().unwrap_or("pending"),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    print_machine_health();
     Ok(())
 }
 

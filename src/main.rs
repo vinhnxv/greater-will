@@ -21,6 +21,9 @@ mod monitor;
 mod output;
 mod session;
 
+mod client;
+mod daemon;
+
 use clap::Parser;
 use color_eyre::Result;
 
@@ -48,7 +51,8 @@ fn main() -> Result<()> {
             resume,
             multi_group,
             allow_dirty,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty),
+            foreground,
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground),
         commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
                 commands::elden::install()
@@ -66,6 +70,10 @@ fn main() -> Result<()> {
         commands::Commands::Replay { checkpoint, resume, force } => {
             commands::replay::execute(checkpoint, resume, force)
         }
+        commands::Commands::Daemon { action } => commands::daemon::execute(action),
+        commands::Commands::Ps { all, json } => commands::ps::execute(all, json),
+        commands::Commands::Logs { run_id, follow, tail } => commands::logs::execute(run_id, follow, tail),
+        commands::Commands::Stop { run_id } => commands::stop::execute(run_id),
         commands::Commands::Clean => commands::clean::execute(),
     }
 }
