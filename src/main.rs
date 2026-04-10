@@ -24,7 +24,7 @@ mod session;
 mod client;
 mod daemon;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use color_eyre::Result;
 
 use crate::config::cli_args::Cli;
@@ -74,6 +74,11 @@ fn main() -> Result<()> {
         commands::Commands::Ps { all, json, running, failed } => commands::ps::execute(all, json, running, failed),
         commands::Commands::Logs { run_id, follow, tail, pane } => commands::logs::execute(run_id, follow, tail, pane),
         commands::Commands::Stop { run_id, force, detach } => commands::stop::execute(run_id, force, detach),
+        commands::Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "gw", &mut std::io::stdout());
+            Ok(())
+        }
         commands::Commands::Clean => commands::clean::execute(),
     }
 }

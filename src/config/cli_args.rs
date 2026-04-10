@@ -225,6 +225,13 @@ pub enum Commands {
         detach: bool,
     },
 
+    /// Generate shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Clean up temporary files and tmux sessions.
     ///
     /// Removes:
