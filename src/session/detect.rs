@@ -217,20 +217,28 @@ impl OutputVelocity {
 }
 
 /// Capture the current pane content.
+///
+/// Always targets window 0, pane 0 (`session:0.0`) to avoid capturing
+/// output from teammate panes or windows that might be active.
+/// Claude Code's main process runs in the first pane of the first window.
 pub fn capture_pane(session_id: &str) -> Result<String> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
+        .args(["capture-pane", "-t", &target, "-p"])
         .output()?;
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Capture the last N lines of the pane.
+///
+/// Always targets window 0, pane 0 to avoid teammate pane confusion.
 pub fn capture_pane_lines(session_id: &str, lines: i32) -> Result<String> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
         .args([
             "capture-pane",
-            "-t", session_id,
+            "-t", &target,
             "-p",
             "-S", &format!("-{}", lines),
         ])
@@ -244,11 +252,14 @@ pub fn capture_pane_lines(session_id: &str, lines: i32) -> Result<String> {
 /// Unlike `capture_pane` (visible viewport only), this captures from the
 /// beginning of scrollback (`-S -`) to the end, giving the complete history
 /// of what happened in the session.
+///
+/// Always targets window 0, pane 0 to avoid teammate pane confusion.
 pub fn capture_full_scrollback(session_id: &str) -> Result<String> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
         .args([
             "capture-pane",
-            "-t", session_id,
+            "-t", &target,
             "-p",
             "-S", "-",  // From start of scrollback
         ])

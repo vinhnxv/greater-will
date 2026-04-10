@@ -45,6 +45,14 @@ pub struct RunEntry {
     pub config_dir: Option<PathBuf>,
     /// Error message on failure.
     pub error_message: Option<String>,
+    /// Whether this run can be re-spawned from scratch on daemon restart.
+    /// Defaults to `true` for backward compatibility with existing meta.json.
+    #[serde(default = "default_restartable")]
+    pub restartable: bool,
+}
+
+fn default_restartable() -> bool {
+    true
 }
 
 impl RunEntry {
@@ -160,6 +168,7 @@ impl RunRegistry {
         plan_path: PathBuf,
         repo_dir: PathBuf,
         session_name: Option<String>,
+        config_dir: Option<PathBuf>,
     ) -> Result<String> {
         // Acquire per-repo lock first
         self.acquire_repo_lock(&repo_dir)?;
@@ -178,8 +187,9 @@ impl RunRegistry {
             started_at: Utc::now(),
             finished_at: None,
             crash_restarts: 0,
-            config_dir: None,
+            config_dir,
             error_message: None,
+            restartable: true,
         };
 
         // Persist to disk
@@ -288,6 +298,18 @@ impl RunRegistry {
         self.runs.get_mut(run_id)
     }
 
+    /// Adopt a run entry that was loaded from disk (e.g., during orphan recovery).
+    ///
+    /// Inserts the entry into the in-memory registry and persists it.
+    /// Unlike `register_run`, this does NOT generate a new ID or acquire repo locks.
+    pub fn adopt(&mut self, entry: RunEntry) {
+        let run_id = entry.run_id.clone();
+        if let Err(e) = self.write_meta(&entry) {
+            tracing::warn!(run_id = %run_id, error = %e, "failed to persist adopted entry");
+        }
+        self.runs.insert(run_id, entry);
+    }
+
     // ── Internal helpers ────────────────────────────────────────────
 
     /// Compute SHA-256 hash of a repo path for the lock filename.
@@ -394,6 +416,7 @@ mod tests {
                     PathBuf::from("plans/test.md"),
                     PathBuf::from("/tmp/repo"),
                     Some("test-session".into()),
+                    None,
                 )
                 .unwrap();
 
@@ -414,6 +437,7 @@ mod tests {
                 .register_run(
                     PathBuf::from("plans/a.md"),
                     PathBuf::from("/tmp/repo-a"),
+                    None,
                     None,
                 )
                 .unwrap();
@@ -436,6 +460,7 @@ mod tests {
                     PathBuf::from("plans/b.md"),
                     PathBuf::from("/tmp/repo-b"),
                     None,
+                    None,
                 )
                 .unwrap();
 
@@ -454,6 +479,7 @@ mod tests {
                 .register_run(
                     PathBuf::from("plans/c.md"),
                     PathBuf::from("/tmp/repo-c"),
+                    None,
                     None,
                 )
                 .unwrap();
@@ -476,6 +502,7 @@ mod tests {
                     PathBuf::from("plans/d.md"),
                     PathBuf::from("/tmp/repo-d"),
                     Some("disk-test".into()),
+                    None,
                 )
                 .unwrap();
 
@@ -499,6 +526,7 @@ mod tests {
                 PathBuf::from("plans/e.md"),
                 PathBuf::from("/tmp/repo-lock-test"),
                 None,
+                None,
             )
             .unwrap();
 
@@ -506,6 +534,7 @@ mod tests {
             let result = reg.register_run(
                 PathBuf::from("plans/f.md"),
                 PathBuf::from("/tmp/repo-lock-test"),
+                None,
                 None,
             );
             assert!(result.is_err());
@@ -521,12 +550,14 @@ mod tests {
                     PathBuf::from("p1.md"),
                     PathBuf::from("/tmp/r1"),
                     None,
+                    None,
                 )
                 .unwrap();
             let _id2 = reg
                 .register_run(
                     PathBuf::from("p2.md"),
                     PathBuf::from("/tmp/r2"),
+                    None,
                     None,
                 )
                 .unwrap();

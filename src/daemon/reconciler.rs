@@ -5,8 +5,10 @@
 //! scans tmux sessions matching `gw-*` and cross-references with
 //! `~/.gw/runs/*/meta.json` to bring everything into a consistent state.
 
+use crate::daemon::drain;
 use crate::daemon::protocol::RunStatus;
-use crate::daemon::registry::RunRegistry;
+use crate::daemon::registry::{RunEntry, RunRegistry};
+use crate::daemon::state::gw_home;
 use crate::session::spawn;
 use std::collections::HashSet;
 use std::process::Command;
@@ -15,14 +17,18 @@ use tracing::{debug, info, warn};
 /// Report of reconciliation actions taken.
 #[derive(Debug, Default)]
 pub struct ReconciliationReport {
-    /// Runs re-registered (tmux alive + Running state).
+    /// Runs re-registered (tmux alive + Running state in registry).
     pub recovered: u32,
-    /// Sessions killed (tmux alive + terminal state or no state).
+    /// Orphaned sessions adopted (tmux alive + no registry but disk meta exists).
+    pub adopted: u32,
+    /// Sessions killed (tmux alive + terminal state or truly unrecoverable orphan).
     pub cleaned_up: u32,
     /// Runs marked for auto-resume (no tmux + Running + checkpoint exists).
     pub auto_resumed: u32,
-    /// Runs marked as Failed (no tmux + Running + no checkpoint).
+    /// Runs marked as Failed (no tmux + Running + no checkpoint + not restartable).
     pub marked_failed: u32,
+    /// Runs scheduled for fresh re-spawn (no tmux + no checkpoint + restartable).
+    pub respawned: u32,
     /// Total tmux sessions scanned.
     pub sessions_scanned: u32,
 }
@@ -31,11 +37,13 @@ impl std::fmt::Display for ReconciliationReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reconciled: {} scanned, {} recovered, {} cleaned, {} auto-resumed, {} failed",
+            "reconciled: {} scanned, {} recovered, {} adopted, {} cleaned, {} auto-resumed, {} respawned, {} failed",
             self.sessions_scanned,
             self.recovered,
+            self.adopted,
             self.cleaned_up,
             self.auto_resumed,
+            self.respawned,
             self.marked_failed,
         )
     }
@@ -50,7 +58,8 @@ impl std::fmt::Display for ReconciliationReport {
 /// |------------|---------------------|-------------------------------|
 /// | yes        | Running             | RECOVER: re-register          |
 /// | yes        | Completed/Failed    | CLEANUP: kill tmux session    |
-/// | yes        | (none)              | ORPHAN: kill tmux session     |
+/// | yes        | (none)              | ADOPT: re-register from disk  |
+/// | yes        | (none, no disk)     | ORPHAN: kill tmux session     |
 /// | no         | Running             | STALE: check checkpoint       |
 pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
     let mut report = ReconciliationReport::default();
@@ -95,13 +104,28 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
                 }
             }
             None => {
-                // ORPHAN: tmux alive but no registry entry → kill
-                warn!(
-                    tmux = %tmux_name,
-                    "ORPHAN: killing tmux session with no registry entry"
-                );
-                kill_tmux_session(tmux_name);
-                report.cleaned_up += 1;
+                // tmux alive but no registry entry — try to adopt before killing.
+                //
+                // Extract run_id from session name (gw-{run_id}), check if
+                // meta.json exists on disk. If so, re-load the entry into
+                // the registry and continue monitoring. This preserves the
+                // running Claude session instead of wastefully killing it.
+                if let Some(adopted_id) = try_adopt_orphan(registry, tmux_name) {
+                    info!(
+                        run_id = %adopted_id,
+                        tmux = %tmux_name,
+                        "ADOPT: re-registered orphaned session into registry"
+                    );
+                    report.adopted += 1;
+                } else {
+                    // Truly orphaned: no meta.json on disk either. Kill it.
+                    warn!(
+                        tmux = %tmux_name,
+                        "ORPHAN: no recoverable meta on disk — killing tmux session"
+                    );
+                    kill_tmux_session(tmux_name);
+                    report.cleaned_up += 1;
+                }
             }
         }
     }
@@ -139,29 +163,73 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
             }
             report.auto_resumed += 1;
         } else {
-            // STALE without checkpoint → mark Failed
-            warn!(
-                run_id = %run_id,
-                tmux = ?tmux_session,
-                "STALE: tmux dead and no checkpoint — marking failed"
-            );
-            if let Err(e) = registry.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some("tmux session lost with no checkpoint (reconciler)".to_string()),
-            ) {
-                warn!(run_id = %run_id, error = %e, "failed to mark stale run as failed");
+            // STALE without checkpoint — check if we can re-spawn
+            let is_restartable = registry
+                .get(run_id)
+                .map(|e| e.restartable)
+                .unwrap_or(false);
+            let has_snapshot = drain::read_snapshot(run_id).is_some();
+
+            if is_restartable {
+                // RESPAWN: Mark for fresh re-spawn via heartbeat.
+                //
+                // Set tmux_session to the canonical name so the heartbeat
+                // detects it as "dead" and triggers spawn_recovery. The
+                // recovery path will start a fresh arc run (not --resume)
+                // since no checkpoint exists.
+                info!(
+                    run_id = %run_id,
+                    has_snapshot = has_snapshot,
+                    "STALE: tmux dead, no checkpoint, but restartable — scheduling re-spawn"
+                );
+                if let Some(entry) = registry.get_mut(run_id) {
+                    entry.tmux_session = Some(format!("gw-{run_id}"));
+                    // Reset crash counter for a clean re-spawn
+                    entry.crash_restarts = 0;
+                }
+                if let Err(e) = registry.update_status(
+                    run_id,
+                    RunStatus::Running,
+                    Some("pending-respawn".to_string()),
+                    None,
+                ) {
+                    warn!(run_id = %run_id, error = %e, "failed to update for re-spawn");
+                }
+                // Clear snapshot after scheduling (it was consumed)
+                drain::clear_snapshot(run_id);
+                report.respawned += 1;
+            } else {
+                // Not restartable → mark Failed
+                warn!(
+                    run_id = %run_id,
+                    tmux = ?tmux_session,
+                    "STALE: tmux dead, no checkpoint, not restartable — marking failed"
+                );
+                let reason = format!(
+                    "tmux session '{}' lost with no checkpoint — marked failed by reconciler on daemon startup",
+                    tmux_session.as_deref().unwrap_or("unknown"),
+                );
+                crate::daemon::heartbeat::append_event(run_id, "session_died", &reason);
+                if let Err(e) = registry.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(reason),
+                ) {
+                    warn!(run_id = %run_id, error = %e, "failed to mark stale run as failed");
+                }
+                report.marked_failed += 1;
             }
-            report.marked_failed += 1;
         }
     }
 
     info!(
         sessions_scanned = report.sessions_scanned,
         recovered = report.recovered,
+        adopted = report.adopted,
         cleaned = report.cleaned_up,
         auto_resumed = report.auto_resumed,
+        respawned = report.respawned,
         marked_failed = report.marked_failed,
         "reconciliation complete"
     );
@@ -169,6 +237,41 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
 }
 
 // ── Helper functions ────────────────────────────────────────────────
+
+/// Try to adopt an orphaned tmux session by loading its meta.json from disk.
+///
+/// Extracts the run_id from the tmux session name (e.g., `gw-abc12345` → `abc12345`),
+/// reads `~/.gw/runs/{run_id}/meta.json`, and re-inserts the entry into the
+/// in-memory registry. Returns `Some(run_id)` on success.
+///
+/// This preserves the running Claude session instead of killing it — the daemon
+/// simply re-attaches as a monitor.
+fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<String> {
+    // Extract run_id from "gw-{run_id}"
+    let run_id = tmux_name.strip_prefix("gw-")?;
+
+    // Already in registry (shouldn't happen, but guard)
+    if registry.get(run_id).is_some() {
+        return Some(run_id.to_string());
+    }
+
+    // Try to load from disk
+    let meta_path = gw_home().join("runs").join(run_id).join("meta.json");
+    let content = std::fs::read_to_string(&meta_path).ok()?;
+    let mut entry: RunEntry = serde_json::from_str(&content).ok()?;
+
+    // Update the entry to reflect reality: tmux is alive, mark as Running
+    entry.tmux_session = Some(tmux_name.to_string());
+    entry.status = RunStatus::Running;
+    entry.current_phase = Some("adopted".to_string());
+    entry.error_message = None;
+    entry.finished_at = None;
+
+    // Re-insert into registry (persists to disk)
+    registry.adopt(entry);
+
+    Some(run_id.to_string())
+}
 
 /// List all tmux sessions matching the `gw-*` prefix.
 fn list_gw_tmux_sessions() -> Vec<String> {
@@ -276,9 +379,11 @@ mod tests {
     fn reconciliation_report_display() {
         let report = ReconciliationReport {
             recovered: 2,
+            adopted: 0,
             cleaned_up: 1,
             auto_resumed: 1,
             marked_failed: 0,
+            respawned: 0,
             sessions_scanned: 5,
         };
         let s = format!("{report}");

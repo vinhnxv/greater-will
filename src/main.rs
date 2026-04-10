@@ -24,7 +24,7 @@ mod session;
 mod client;
 mod daemon;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use color_eyre::Result;
 
 use crate::config::cli_args::Cli;
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             multi_group,
             allow_dirty,
             foreground,
-        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground),
+        } => commands::run::execute(plans, dry_run, mock, group, config_dir, resume, multi_group, allow_dirty, foreground, cli.verbose),
         commands::Commands::Elden { install, uninstall, status, event } => {
             if install {
                 commands::elden::install()
@@ -71,9 +71,14 @@ fn main() -> Result<()> {
             commands::replay::execute(checkpoint, resume, force)
         }
         commands::Commands::Daemon { action } => commands::daemon::execute(action),
-        commands::Commands::Ps { all, json } => commands::ps::execute(all, json),
+        commands::Commands::Ps { all, json, running, failed } => commands::ps::execute(all, json, running, failed),
         commands::Commands::Logs { run_id, follow, tail, pane } => commands::logs::execute(run_id, follow, tail, pane),
-        commands::Commands::Stop { run_id } => commands::stop::execute(run_id),
+        commands::Commands::Stop { run_id, force, detach } => commands::stop::execute(run_id, force, detach),
+        commands::Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "gw", &mut std::io::stdout());
+            Ok(())
+        }
         commands::Commands::Clean => commands::clean::execute(),
     }
 }

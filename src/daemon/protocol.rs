@@ -21,6 +21,13 @@ pub enum Request {
         plan_path: PathBuf,
         repo_dir: PathBuf,
         session_name: Option<String>,
+        /// Optional CLAUDE_CONFIG_DIR override.
+        #[serde(default)]
+        config_dir: Option<PathBuf>,
+        /// Verbosity level (0=warn, 1=info, 2=debug, 3+=trace).
+        /// Controls per-run log detail in daemon event logs.
+        #[serde(default)]
+        verbose: u8,
     },
     /// List all known runs (optionally filtered by status).
     ListRuns {
@@ -34,8 +41,13 @@ pub enum Request {
         /// If true, return raw tmux pane capture; otherwise return structured events.
         pane: bool,
     },
-    /// Stop a running arc.
+    /// Stop a running arc (kills the tmux session).
     StopRun {
+        run_id: String,
+    },
+    /// Detach a run: stop GW tracking but keep the tmux session alive.
+    /// The session can be re-adopted on next daemon restart via reconciler.
+    DetachRun {
         run_id: String,
     },
     /// Query daemon health and version.
@@ -100,6 +112,32 @@ pub enum ErrorCode {
     InternalError,
 }
 
+impl ErrorCode {
+    /// Return an actionable suggestion for the user based on the error variant.
+    ///
+    /// `context` is typically a run ID or resource name to interpolate into the
+    /// message so the user gets a copy-pasteable remediation command.
+    pub fn suggestion(&self, context: &str) -> String {
+        match self {
+            ErrorCode::RepoLocked => {
+                format!("Repository is locked by {context}. Wait or run: `gw stop {context}`")
+            }
+            ErrorCode::RunNotFound => {
+                format!("No run matching '{context}'. Run `gw ps` to see active runs.")
+            }
+            ErrorCode::DaemonBusy => {
+                "Daemon is busy. Try again in a moment.".to_string()
+            }
+            ErrorCode::InvalidRequest => {
+                format!("Invalid request: {context}. Run `gw --help` for usage.")
+            }
+            ErrorCode::InternalError => {
+                "Internal daemon error. Check with: `gw daemon status`".to_string()
+            }
+        }
+    }
+}
+
 // ── Length-prefixed framing ──────────────────────────────────────────
 
 /// Write a serializable message with 4-byte big-endian length prefix.
@@ -160,6 +198,8 @@ mod tests {
                 plan_path: PathBuf::from("/tmp/plan.md"),
                 repo_dir: PathBuf::from("/home/user/repo"),
                 session_name: Some("test-session".into()),
+                config_dir: Some(PathBuf::from("/custom/.claude")),
+                verbose: 2,
             },
             Request::ListRuns { all: true },
             Request::GetLogs {
@@ -170,6 +210,9 @@ mod tests {
             },
             Request::StopRun {
                 run_id: "run-456".into(),
+            },
+            Request::DetachRun {
+                run_id: "run-789".into(),
             },
             Request::DaemonStatus,
             Request::Shutdown,
@@ -256,6 +299,8 @@ mod tests {
             plan_path: PathBuf::from("/tmp/plan.md"),
             repo_dir: PathBuf::from("/repo"),
             session_name: None,
+            config_dir: None,
+            verbose: 0,
         };
 
         // Write to an in-memory buffer

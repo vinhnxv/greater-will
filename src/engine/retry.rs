@@ -56,10 +56,10 @@ pub const ERROR_STALL_THRESHOLD_SECS: u64 = 60;
 
 /// Grace period before declaring a process crash (D7).
 ///
-/// Claude Code self-updates can take 45-90s on slow connections. Using 60s
-/// grace period to avoid false positive crash detection during updates.
-/// Ported from torrent's `CRASH_GRACE_SECS`.
-pub const CRASH_GRACE_SECS: u64 = 60;
+/// Claude Code self-updates, Rune plugin recovery, and teammate shutdown
+/// can take several minutes. Using 5-minute grace period to avoid false
+/// positive crash detection. Minimum 5 minutes per GW kill gate rule.
+pub const CRASH_GRACE_SECS: u64 = 300;
 
 /// Evidence collected for error diagnosis.
 ///
@@ -1001,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_crash_grace_period_constant() {
-        assert_eq!(CRASH_GRACE_SECS, 60);
+        assert_eq!(CRASH_GRACE_SECS, 300);
     }
 
     // --- ErrorEvidence confidence tests ---

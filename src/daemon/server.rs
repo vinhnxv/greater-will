@@ -13,12 +13,15 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::protocol::{
-    read_message, write_message, ErrorCode, Request, Response,
+    read_message, write_message, ErrorCode, Request, Response, RunStatus,
 };
 use crate::daemon::registry::RunRegistry;
 
 /// Per-request timeout: 30 seconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval for `--follow` mode (300ms).
+const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 // ── Server ──────────────────────────────────────────────────────────
 
@@ -126,8 +129,15 @@ impl DaemonServer {
                 std::fs::remove_file(socket_path)
                     .wrap_err("failed to remove stale socket file")?;
             } else {
+                // Read PID for actionable error message
+                let pid_info = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|p| format!(" (PID {})", p))
+                    .unwrap_or_default();
                 return Err(color_eyre::eyre::eyre!(
-                    "another daemon is already running (socket exists with live PID)"
+                    "Another daemon is already running{}. Run `gw daemon stop` first.",
+                    pid_info
                 ));
             }
         }
@@ -183,6 +193,35 @@ async fn handle_connection(
             }
         };
 
+        // Follow mode: intercept GetLogs with follow=true and enter a
+        // streaming loop instead of the normal single-response dispatch.
+        if let Request::GetLogs {
+            ref run_id,
+            follow: true,
+            tail,
+            pane,
+        } = request
+        {
+            tracing::info!(run_id = %run_id, "entering follow mode");
+            match handle_follow_logs(
+                &mut writer,
+                &registry,
+                &cancel,
+                run_id,
+                tail,
+                pane,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "follow mode ended");
+                }
+            }
+            // Follow mode consumes the connection — no further requests.
+            break;
+        }
+
         let request_type = request_type_name(&request);
         let start = std::time::Instant::now();
         let response = dispatch_request(request, &registry, &cancel).await;
@@ -203,6 +242,175 @@ async fn handle_connection(
     Ok(())
 }
 
+// ── Follow-mode handler ───────────────────────────────────────────
+
+/// Stream log output for a run, polling for new bytes at a fixed interval.
+///
+/// Tracks a byte offset into the log file and on each tick reads only the
+/// newly-appended bytes. Incomplete trailing lines (no terminating newline)
+/// are buffered until the next tick so the client never sees a partial line.
+///
+/// Handles log rotation (file truncated / replaced) by resetting the offset
+/// to zero when the file shrinks.
+async fn handle_follow_logs<W>(
+    writer: &mut W,
+    registry: &Arc<Mutex<RunRegistry>>,
+    cancel: &CancellationToken,
+    run_id: &str,
+    tail: Option<usize>,
+    pane: bool,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Resolve the run_id prefix once and determine the log path.
+    let (actual_id, log_path) = {
+        let reg = registry.lock().await;
+        match reg.find_by_prefix(run_id) {
+            Some(entry) => {
+                let log_dir = crate::daemon::state::gw_home()
+                    .join("runs")
+                    .join(&entry.run_id)
+                    .join("logs");
+                let path = if pane {
+                    log_dir.join("pane.log")
+                } else {
+                    log_dir.join("events.jsonl")
+                };
+                (entry.run_id.clone(), path)
+            }
+            None => {
+                let resp = Response::Error {
+                    code: ErrorCode::RunNotFound,
+                    message: format!("no run matching prefix: {run_id}"),
+                };
+                write_message(writer, &resp).await?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Send the initial tail chunk so the client sees recent history first.
+    let initial_data = read_log_tail(&log_path, tail);
+    if !initial_data.is_empty() {
+        let resp = Response::LogChunk {
+            run_id: actual_id.clone(),
+            data: initial_data,
+        };
+        write_message(writer, &resp).await?;
+    }
+
+    // Initialise the byte offset to the current end of file.
+    let mut last_offset: u64 = std::fs::metadata(&log_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Buffer for bytes that don't end with a newline (incomplete line).
+    let mut pending = Vec::new();
+
+    let mut interval = tokio::time::interval(FOLLOW_POLL_INTERVAL);
+    // The first tick fires immediately; skip it so we don't duplicate the
+    // initial tail chunk we just sent.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                // Open the file each tick — handles rotation (new inode).
+                let mut file = match std::fs::File::open(&log_path) {
+                    Ok(f) => f,
+                    Err(_) => continue, // file doesn't exist (yet)
+                };
+
+                let file_len = match file.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+
+                // Rotation detection: file shrank → reset.
+                if file_len < last_offset {
+                    tracing::debug!(
+                        old_offset = last_offset,
+                        new_len = file_len,
+                        "log rotation detected, resetting offset"
+                    );
+                    last_offset = 0;
+                    pending.clear();
+                }
+
+                // No new data since last poll.
+                if file_len == last_offset {
+                    continue;
+                }
+
+                // Seek to where we left off and read new bytes.
+                if file.seek(SeekFrom::Start(last_offset)).is_err() {
+                    continue;
+                }
+
+                let bytes_available = file_len - last_offset;
+                // Cap pre-allocation to 16 MiB to avoid u64→usize overflow on 32-bit platforms.
+                let cap = (bytes_available as usize).min(16 * 1024 * 1024);
+                let mut buf = Vec::with_capacity(cap);
+                if file.take(bytes_available).read_to_end(&mut buf).is_err() {
+                    continue;
+                }
+
+                last_offset = file_len;
+
+                // Prepend any buffered incomplete line from the previous tick.
+                if !pending.is_empty() {
+                    let mut merged = std::mem::take(&mut pending);
+                    merged.extend_from_slice(&buf);
+                    buf = merged;
+                }
+
+                // Split off an incomplete trailing line (no terminating \n).
+                if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
+                    // Everything after the last newline is incomplete.
+                    if last_nl + 1 < buf.len() {
+                        pending = buf[last_nl + 1..].to_vec();
+                        buf.truncate(last_nl + 1);
+                    }
+                } else {
+                    // No newline at all — buffer everything for next tick.
+                    pending = buf;
+                    continue;
+                }
+
+                if buf.is_empty() {
+                    continue;
+                }
+
+                let data = String::from_utf8_lossy(&buf).into_owned();
+                let resp = Response::LogChunk {
+                    run_id: actual_id.clone(),
+                    data,
+                };
+                // Client disconnect will surface as a write error.
+                if let Err(e) = write_message(writer, &resp).await {
+                    tracing::debug!(error = %e, "follow: client disconnected");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Send a final message so the client knows the stream ended cleanly.
+    let _ = write_message(
+        writer,
+        &Response::Ok {
+            message: "follow ended".into(),
+        },
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Dispatch a request to the appropriate handler.
 async fn dispatch_request(
     request: Request,
@@ -214,6 +422,8 @@ async fn dispatch_request(
             plan_path,
             repo_dir,
             session_name,
+            config_dir,
+            verbose,
         } => {
             // SEC-008: Validate repo_dir first, then ensure the plan_path
             // resolves *inside* the canonicalized repo root. Without this a
@@ -255,6 +465,8 @@ async fn dispatch_request(
                 &canonical_plan,
                 &canonical_repo,
                 session_name,
+                config_dir,
+                verbose,
             )
             .await
             {
@@ -346,6 +558,64 @@ async fn dispatch_request(
             }
         }
 
+        Request::DetachRun { run_id } => {
+            // Detach: stop tracking but keep the tmux session alive.
+            // The session can be re-adopted on the next daemon restart.
+
+            // Step 1: Resolve prefix and snapshot pane under one lock scope
+            let resolved = {
+                let reg = registry.lock().await;
+                reg.find_by_prefix(&run_id).map(|entry| {
+                    (entry.run_id.clone(), entry.tmux_session.clone())
+                })
+            };
+
+            let (actual_id, tmux) = match resolved {
+                Some(pair) => pair,
+                None => {
+                    return Response::Error {
+                        code: ErrorCode::RunNotFound,
+                        message: format!("no run matching prefix: {run_id}"),
+                    };
+                }
+            };
+
+            // Step 2: Drain snapshot (re-acquires lock internally)
+            crate::daemon::drain::drain_running_sessions(Arc::clone(registry)).await;
+
+            // Step 3: Mark as Stopped but do NOT kill tmux
+            crate::daemon::heartbeat::append_event(&actual_id, "detached", &format!(
+                "detached by user — tmux session '{}' kept alive (gw no longer tracking)",
+                tmux.as_deref().unwrap_or("unknown"),
+            ));
+            {
+                let mut reg = registry.lock().await;
+                if let Err(e) = reg.update_status(
+                    &actual_id,
+                    RunStatus::Stopped,
+                    Some("detached".to_string()),
+                    Some("detached by user — tmux session kept alive".to_string()),
+                ) {
+                    return Response::Error {
+                        code: ErrorCode::InternalError,
+                        message: e.to_string(),
+                    };
+                }
+            }
+
+            tracing::info!(
+                run_id = %actual_id,
+                tmux = ?tmux,
+                "run detached — tmux session preserved"
+            );
+
+            Response::Ok {
+                message: format!(
+                    "run {actual_id} detached (tmux session kept alive)"
+                ),
+            }
+        }
+
         Request::DaemonStatus => {
             let reg = registry.lock().await;
             let active = reg.list_runs(false).len();
@@ -375,6 +645,7 @@ fn request_type_name(req: &Request) -> &'static str {
         Request::ListRuns { .. } => "ListRuns",
         Request::GetLogs { .. } => "GetLogs",
         Request::StopRun { .. } => "StopRun",
+        Request::DetachRun { .. } => "DetachRun",
         Request::DaemonStatus => "DaemonStatus",
         Request::Shutdown => "Shutdown",
     }

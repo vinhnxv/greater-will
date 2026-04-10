@@ -1,3 +1,4 @@
+pub mod drain;
 pub mod executor;
 pub mod heartbeat;
 pub mod protocol;
@@ -15,6 +16,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_appender::rolling;
+use tracing_subscriber::EnvFilter;
 
 use crate::daemon::heartbeat::HeartbeatMonitor;
 use crate::daemon::registry::RunRegistry;
@@ -34,7 +36,7 @@ use crate::daemon::state::{ensure_gw_home, GlobalConfig};
 /// 7. Start socket server + heartbeat monitor
 /// 8. Wait for shutdown signal (SIGTERM/SIGINT)
 /// 9. Graceful shutdown
-pub async fn start_daemon() -> Result<()> {
+pub async fn start_daemon(verbosity: u8) -> Result<()> {
     // 1. Ensure directory structure
     let home = ensure_gw_home()?;
 
@@ -78,12 +80,24 @@ pub async fn start_daemon() -> Result<()> {
         .flush()
         .wrap_err("failed to flush daemon PID file")?;
 
-    // 4. Init tracing to daemon.log with daily rotation
+    // 4. Init tracing to daemon.log with daily rotation.
+    //    Verbosity controls the log level (matching `gw run -v/-vv/-vvv`):
+    //    0 = info (daemon default), 1 = info, 2 = debug, 3+ = trace.
+    //    RUST_LOG env var overrides when set.
+    let level = match verbosity {
+        0 | 1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_env("RUST_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(level));
+
     let log_dir = home.clone();
     let file_appender = rolling::daily(&log_dir, "daemon.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_subscriber::fmt()
         .with_writer(non_blocking)
+        .with_env_filter(filter)
         .with_ansi(false)
         .with_target(true)
         .with_thread_ids(true)
@@ -154,8 +168,11 @@ pub async fn start_daemon() -> Result<()> {
     // Wait for server to finish (it exits when cancel fires)
     let _ = server_handle.await;
 
-    // 9. Graceful shutdown: clean up old runs, release lock, remove PID file.
-    info!("daemon shutting down");
+    // 9. Graceful shutdown: drain running sessions, clean up old runs, release lock, remove PID file.
+    info!("daemon shutting down — draining running sessions");
+    let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
+    info!(drained = drained, "drain complete");
+
     state::cleanup_old_runs(config.retention)?;
 
     // Explicitly release the exclusive lock before unlinking the PID file.

@@ -345,28 +345,60 @@ pub(crate) fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working
 /// Claude Code spawns `tmux -L claude-swarm-{lead_pid}` for agent teams.
 /// Each pane runs a teammate. If teammates are running, the system is working
 /// even if the main screen is stalled (team lead waiting for agents).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # Teammate states
+///
+/// | State | Claude child | Output | Meaning |
+/// |-------|-------------|--------|---------|
+/// | Working | alive | changing | Teammate actively processing |
+/// | Idle | alive | prompt (❯) visible | Teammate done, waiting for input |
+/// | Done | dead | any | Teammate finished, pane still open |
+/// | Stuck | alive | stalled (no prompt) | Teammate may be hung |
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SwarmSnapshot {
     /// Number of tmux panes in the swarm server.
     pub pane_count: u32,
-    /// Number of panes with a live Claude child process.
-    pub active_count: u32,
+    /// Panes with a live Claude child process.
+    pub alive_count: u32,
+    /// Panes actively producing output (no prompt visible, process alive).
+    /// This is the best signal that work is happening.
+    pub working_count: u32,
+    /// Panes where Claude child is alive but showing prompt (❯) — done/idle.
+    pub idle_count: u32,
+    /// Panes where Claude child has exited (shell still running).
+    pub done_count: u32,
+}
+
+impl SwarmSnapshot {
+    /// True if at least one teammate is genuinely working (not just alive).
+    pub fn has_working_teammates(&self) -> bool {
+        self.working_count > 0
+    }
+
+    /// True if all teammates have finished (all done or idle).
+    pub fn all_finished(&self) -> bool {
+        self.pane_count > 0 && self.working_count == 0
+    }
 }
 
 /// Check swarm activity for a Claude Code process.
 ///
-/// Looks for `claude-swarm-{pid}` tmux server and counts active panes.
-/// Returns `None` if no swarm server exists (not running agent teams).
+/// Looks for `claude-swarm-{pid}` tmux server and inspects each pane:
+/// - Is the Claude child process alive?
+/// - Is the pane showing a prompt (❯) — meaning teammate is idle/done?
+/// - Or is output still being produced — meaning teammate is working?
 ///
-/// Lightweight: one `tmux list-panes` call + one `ps` per pane.
+/// Returns `None` if no swarm server exists (not running agent teams).
 pub(crate) fn check_swarm_activity(claude_pid: u32) -> Option<SwarmSnapshot> {
     use std::process::Command;
 
     let socket_name = format!("claude-swarm-{}", claude_pid);
 
-    // Check if the swarm server exists by listing panes
+    // Check if the swarm server exists by listing panes with their PIDs
+    // and session:window.pane identifiers for targeted capture
     let output = Command::new("tmux")
-        .args(["-L", &socket_name, "list-panes", "-a", "-F", "#{pane_pid}"])
+        .args(["-L", &socket_name, "list-panes", "-a",
+               "-F", "#{pane_pid}\t#{session_name}:#{window_index}.#{pane_index}"])
         .output()
         .ok()?;
 
@@ -375,33 +407,69 @@ pub(crate) fn check_swarm_activity(claude_pid: u32) -> Option<SwarmSnapshot> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pane_pids: Vec<u32> = stdout
+    let panes: Vec<(u32, String)> = stdout
         .lines()
-        .filter_map(|line| line.trim().parse().ok())
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let pid: u32 = parts.next()?.trim().parse().ok()?;
+            let target = parts.next()?.trim().to_string();
+            Some((pid, target))
+        })
         .collect();
 
-    if pane_pids.is_empty() {
+    if panes.is_empty() {
         return None;
     }
 
-    // Count panes with active Claude child processes
-    // Each pane runs a shell → claude child. Check if claude child is alive.
-    let mut active_count = 0u32;
-    for &shell_pid in &pane_pids {
+    let mut alive_count = 0u32;
+    let mut working_count = 0u32;
+    let mut idle_count = 0u32;
+    let mut done_count = 0u32;
+
+    for (shell_pid, pane_target) in &panes {
         // Check if shell has a claude child via pgrep
-        let child_check = Command::new("pgrep")
+        let child_alive = Command::new("pgrep")
             .args(["-P", &shell_pid.to_string(), "-x", "claude"])
-            .output();
-        if let Ok(out) = child_check {
-            if out.status.success() {
-                active_count += 1;
-            }
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !child_alive {
+            done_count += 1;
+            continue;
+        }
+
+        alive_count += 1;
+
+        // Capture last 5 lines of teammate pane to check for prompt
+        let pane_output = Command::new("tmux")
+            .args(["-L", &socket_name, "capture-pane", "-t", pane_target, "-p",
+                   "-S", "-5"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        // Check if prompt (❯) is visible in last non-empty lines
+        let has_prompt = pane_output
+            .lines()
+            .rev()
+            .take(5)
+            .any(|line| line.contains('❯'));
+
+        if has_prompt {
+            idle_count += 1; // Claude alive but showing prompt — done/waiting
+        } else {
+            working_count += 1; // Claude alive, no prompt — actively working
         }
     }
 
     Some(SwarmSnapshot {
-        pane_count: pane_pids.len() as u32,
-        active_count,
+        pane_count: panes.len() as u32,
+        alive_count,
+        working_count,
+        idle_count,
+        done_count,
     })
 }
 

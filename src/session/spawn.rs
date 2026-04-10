@@ -191,12 +191,30 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
 }
 
 /// Check if a tmux session exists.
+///
+/// Retries up to 3 times with a short delay to avoid false negatives
+/// when the tmux server is temporarily busy (e.g., during agent team spawning).
+/// A single transient failure must never trigger destructive recovery.
 pub fn has_session(session_id: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", session_id])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = Command::new("tmux")
+            .args(["has-session", "-t", session_id])
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => return true,
+            _ => {
+                if attempt < MAX_ATTEMPTS - 1 {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Create a new detached tmux session.
@@ -300,15 +318,18 @@ fn start_mock_session(session_id: &str) -> Result<()> {
 /// 4. Wait 100ms
 /// 5. Send Enter to submit
 pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
+    // Always target window 0, pane 0 to avoid sending keys to a teammate pane
+    let target = format!("{}:0.0", session_id);
     debug!(
         session_id = %session_id,
+        target = %target,
         text = %text,
-        "Sending keys with Ink workaround"
+        "Sending keys with Ink workaround (targeting main pane)"
     );
 
     // Step 1: Send text literally (no Enter)
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "-l", text])
+        .args(["send-keys", "-t", &target, "-l", text])
         .output()
         .wrap_err("Failed to send text literally")?;
 
@@ -317,7 +338,7 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 
     // Step 3: Send Escape to dismiss autocomplete
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Escape"])
+        .args(["send-keys", "-t", &target, "Escape"])
         .output()
         .wrap_err("Failed to send Escape")?;
 
@@ -326,7 +347,7 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 
     // Step 5: Send Enter to submit
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, "Enter"])
+        .args(["send-keys", "-t", &target, "Enter"])
         .output()
         .wrap_err("Failed to send Enter")?;
 
@@ -335,8 +356,9 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 
 /// Send a simple command (without workaround) to the session.
 pub fn send_simple_command(session_id: &str, cmd: &str) -> Result<()> {
+    let target = format!("{}:0.0", session_id);
     Command::new("tmux")
-        .args(["send-keys", "-t", session_id, cmd, "Enter"])
+        .args(["send-keys", "-t", &target, cmd, "Enter"])
         .output()
         .wrap_err("Failed to send command")?;
 
@@ -469,9 +491,12 @@ pub fn wait_for_prompt(session_id: &str, timeout: Duration) -> Result<()> {
 }
 
 /// Check if the prompt (❯) is visible in the session.
+///
+/// Always targets window 0, pane 0 (main Claude Code pane).
 fn has_prompt(session_id: &str) -> Result<bool> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
+        .args(["capture-pane", "-t", &target, "-p"])
         .output()
         .wrap_err("Failed to capture pane")?;
 
@@ -488,9 +513,12 @@ fn has_prompt(session_id: &str) -> Result<bool> {
 }
 
 /// Capture the current pane content.
+///
+/// Always targets window 0, pane 0 (main Claude Code pane).
 pub fn capture_pane(session_id: &str) -> Result<String> {
+    let target = format!("{}:0.0", session_id);
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_id, "-p"])
+        .args(["capture-pane", "-t", &target, "-p"])
         .output()
         .wrap_err("Failed to capture pane")?;
 
