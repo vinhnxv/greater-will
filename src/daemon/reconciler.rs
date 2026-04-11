@@ -257,10 +257,40 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
         return Some(run_id.to_string());
     }
 
-    // Try to load from disk
+    // Try to load from disk. Two failure modes are distinguished:
+    //
+    //   1. meta.json does not exist at all → truly orphaned tmux session
+    //      with no recoverable metadata. Return None so the caller kills it.
+    //
+    //   2. meta.json exists but is not valid JSON → most likely a torn write
+    //      from disk-full or a crash mid-write. A running Claude session is
+    //      almost certainly still alive in the tmux session — killing it to
+    //      "clean up" would destroy live work. Return Some(run_id) so the
+    //      caller preserves the session (untracked, but alive). A future
+    //      reconcile pass can re-try adoption if meta.json is repaired.
     let meta_path = gw_home().join("runs").join(run_id).join("meta.json");
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let mut entry: RunEntry = serde_json::from_str(&content).ok()?;
+    let content = match std::fs::read_to_string(&meta_path) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                run_id = %run_id,
+                error = %e,
+                "meta.json not readable — treating tmux session as truly orphaned"
+            );
+            return None;
+        }
+    };
+    let mut entry: RunEntry = match serde_json::from_str(&content) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                run_id = %run_id,
+                error = %e,
+                "meta.json corrupt — preserving live tmux session, skipping adopt"
+            );
+            return Some(run_id.to_string());
+        }
+    };
 
     // Update the entry to reflect reality: tmux is alive, mark as Running
     entry.tmux_session = Some(tmux_name.to_string());
@@ -334,6 +364,13 @@ fn find_run_by_tmux_session(
 }
 
 /// Find Running/Queued entries whose tmux session is not in the live set.
+///
+/// Queued entries are included because a crash between `register_run()`
+/// (which writes status=Queued) and the first `update_status(Running)` would
+/// otherwise leave the entry invisible to this scan — the run stays Queued
+/// with no tmux session forever. Queued entries fall through to the same
+/// checkpoint / restartable / fail branches as Running entries in the caller,
+/// so no new code path is required here.
 fn find_stale_runs(
     registry: &RunRegistry,
     live_sessions: &HashSet<&str>,
@@ -341,7 +378,7 @@ fn find_stale_runs(
     registry
         .list_runs(false)
         .iter()
-        .filter(|r| matches!(r.status, RunStatus::Running))
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
         .filter(|r| {
             // Check if tmux session is alive
             let tmux_name = format!("gw-{}", r.run_id);

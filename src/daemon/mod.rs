@@ -168,7 +168,13 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     let flag_path = crashloop_flag_path(&home);
     let running_marker = running_marker_path(&home);
     {
-        let mut detector = CrashLoopDetector::new(5, 30, 300);
+        // Window widened from 30s → 120s: launchd can respawn the daemon up
+        // to 5 times in 30 seconds for transient errors (socket bind fail,
+        // momentary disk full) and the old setting would halt the daemon
+        // permanently via `crashloop.flag`, killing all arc runs with no
+        // recovery path until manual intervention. 120s is still tight
+        // enough to catch a real crash loop while tolerating transient blips.
+        let mut detector = CrashLoopDetector::new(5, 120, 300);
         detector.load_history(&home);
 
         if running_marker.exists() {
@@ -178,7 +184,7 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
                     write_crashloop_flag(&flag_path, crashes)?;
                     let _ = detector.persist(&home);
                     return Err(color_eyre::eyre::eyre!(
-                        "crash loop detected: {} crashes within 30s window — \
+                        "crash loop detected: {} crashes within 120s window — \
                          wrote {} and halting launchd respawn",
                         crashes,
                         flag_path.display()
@@ -349,6 +355,27 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
             sigterm.recv().await;
             info!("received SIGTERM");
             term_cancel.cancel();
+        });
+
+        // SIGHUP handler: log and ignore. Default kernel disposition for
+        // SIGHUP is to terminate the process — which would tear down the
+        // daemon without removing `daemon.running`, causing the next start
+        // to count it as a crash and inflate the crash-loop detector.
+        // Explicitly handling and ignoring SIGHUP closes that path. Use
+        // SIGTERM to stop the daemon cleanly.
+        tokio::spawn(async move {
+            let mut sighup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "failed to register SIGHUP handler");
+                    return;
+                }
+            };
+            while sighup.recv().await.is_some() {
+                info!("received SIGHUP — ignoring (use SIGTERM to stop daemon)");
+            }
         });
     }
 
