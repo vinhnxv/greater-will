@@ -408,6 +408,9 @@ impl DaemonRunMonitor {
     async fn send_nudge(&self, msg: &str) {
         let session = self.tmux_session.clone();
         let msg_owned = msg.to_string();
+        // INSP-RP-003: Truncate to 40 chars to prevent secret leakage in logs.
+        // send_keys is called with arbitrary content including potential auth tokens
+        // (e.g., `/auth login <token>`). Never log the full message — only a short prefix.
         let prefix: String = msg_owned.chars().take(40).collect();
         match tokio::task::spawn_blocking(move || {
             crate::session::spawn::send_keys_with_workaround(&session, &msg_owned)
@@ -708,6 +711,21 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
+    /// Poll the arc-phase-loop state file and return a terminal outcome if
+    /// the loop has ended.
+    ///
+    /// **Critical disambiguation**: when the active state is absent, the
+    /// distinction between "completion" and "crash" is determined by whether
+    /// the file exists at all:
+    /// - `file_on_disk && !active` → intentional deactivation by Rune itself
+    ///   → wait `COMPLETION_GRACE_SECS` then return [`DaemonRunOutcome::Completed`]
+    /// - `!file_on_disk` → file deleted (likely crash)
+    ///   → wait `LOOP_STATE_GONE_GRACE_SECS` then return [`DaemonRunOutcome::Crashed`]
+    ///
+    /// During warmup (before the first active state is observed), this
+    /// function tolerates absence as long as the screen is changing. Once the
+    /// warmup window expires AND the screen is idle, it returns
+    /// [`DaemonRunOutcome::Failed`] with a bootstrap-error reason.
     fn poll_loop_state(&mut self) -> Option<DaemonRunOutcome> {
         let read = read_arc_loop_state(&self.repo_dir);
         let file_on_disk = !matches!(
@@ -816,6 +834,21 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
+    /// Evaluate error evidence and route confirmed errors to the kill gate.
+    ///
+    /// Builds an [`ErrorEvidence`] from the current pane content + monitoring
+    /// state, runs the classifier, and manages a confirmation timer keyed on
+    /// `(start, ErrorClass, confidence)`. The timer enforces a confidence-
+    /// weighted minimum confirmation window (high-confidence: shorter wait;
+    /// medium: longer wait), with `KILL_GATE_MIN_SECS` as a floor. A class
+    /// change mid-confirmation resets the timer to prevent oscillating-error
+    /// gaming.
+    ///
+    /// **Simplified state machine**: this is REFINE-004 in its initial form.
+    /// The full per-class confidence math from `monitor.rs:982-1122` is
+    /// deferred to Shard 4 — current implementation uses a fixed 0.9 stand-in
+    /// confidence. The structural pieces (timer, class-change reset, threshold
+    /// floor, kill gate routing) are in place.
     fn evaluate_error_evidence(&mut self, pane_content: &str) {
         let screen_stall = self.last_activity.elapsed().as_secs();
 
@@ -927,6 +960,19 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
+    /// Evaluate the unified kill gate against any active `pending_kill`.
+    ///
+    /// All lethal paths (stuck idle, phase timeout, error-detected) route
+    /// through a single 5-minute confirmation window. The gate fires only if
+    /// silence persists for the full window. 5 recovery signals — pane
+    /// activity, checkpoint advance, artifact growth, loop state change, and
+    /// active swarm teammates — cancel the kill if observed after the first
+    /// 10 seconds (the early-grace window prevents racing the kill with a
+    /// late-arriving signal). A midway nudge fires at 50% of the gate.
+    ///
+    /// Returns `Some(DaemonRunOutcome)` only when the kill executes; otherwise
+    /// returns `None` and leaves `self.pending_kill` either unchanged (still
+    /// counting down) or cleared (recovered).
     async fn evaluate_kill_gate(&mut self) -> Option<DaemonRunOutcome> {
         // Snapshot what we need from pending_kill so we can drop the borrow
         // before taking mutable references elsewhere.
@@ -1015,6 +1061,13 @@ impl DaemonRunMonitor {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────
 
+/// Hash a string for in-process change detection only.
+///
+/// **Do not persist or compare across processes.** `DefaultHasher`'s output is
+/// explicitly unstable across Rust versions and process restarts — using it for
+/// pane-content equality checks within a single monitor task is fine, but the
+/// resulting `u64` must never be written to disk, sent over the network, or
+/// compared against a hash from another process.
 fn hash_str(s: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
