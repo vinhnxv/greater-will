@@ -209,6 +209,25 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
         .sync_all()
         .wrap_err("failed to fsync daemon PID file")?;
 
+    // 3b. Write the "daemon.running" marker IMMEDIATELY after the PID
+    //     flock is held, BEFORE tracing / registry / heartbeat / server
+    //     initialization.  This closes the early-startup blind spot in
+    //     crash-loop detection: any crash during the remaining startup
+    //     steps (or later runtime) leaves the marker in place so the
+    //     next process counts it via `CrashLoopDetector::record_restart`.
+    //     Best-effort — failing to write the marker degrades crash-loop
+    //     detection but must not prevent startup.  Tracing is not yet
+    //     initialized, so `warn!` will no-op here; the error is still
+    //     propagated to stderr via eprintln as a last-resort signal.
+    if let Err(e) = std::fs::write(&running_marker, our_pid.to_string()) {
+        eprintln!(
+            "gw daemon: failed to write daemon.running marker at {}: {}",
+            running_marker.display(),
+            e
+        );
+        warn!(error = %e, path = %running_marker.display(), "failed to write daemon.running marker");
+    }
+
     // 4. Init tracing to daemon.log with daily rotation.
     //    Verbosity controls the log level (matching `gw run -v/-vv/-vvv`):
     //    0 = info (daemon default), 1 = info, 2 = debug, 3+ = trace.
@@ -272,11 +291,9 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     let heartbeat_handle = heartbeat.start();
     info!("heartbeat monitor spawned");
 
-    // 7c. Write the "daemon.running" marker so crash-loop detection can
-    //     observe an unclean exit on next startup.  Non-fatal on failure.
-    if let Err(e) = std::fs::write(&running_marker, our_pid.to_string()) {
-        warn!(error = %e, path = %running_marker.display(), "failed to write daemon.running marker");
-    }
+    // Note: the `daemon.running` marker was written earlier (step 3b)
+    // immediately after the PID flock.  Do NOT write it here — that would
+    // reintroduce the early-startup crash blind spot that CDX-GAP-001 fixed.
 
     // 8. Wait for shutdown signal
     let shutdown_cancel = cancel.clone();
