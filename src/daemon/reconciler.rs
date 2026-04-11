@@ -64,6 +64,44 @@ impl std::fmt::Display for ReconciliationReport {
 pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
     let mut report = ReconciliationReport::default();
 
+    // Step 0: Re-acquire repo locks for all Running/Queued entries loaded from disk.
+    //
+    // After `load_from_disk`, the in-memory `repo_locks` HashMap is empty even
+    // though the on-disk meta.json still records entries as Running. Without
+    // this step, a subsequent `register_run()` for the same repo would succeed
+    // — causing a double-run. We idempotently re-acquire via
+    // `acquire_repo_lock_for_adopt`, which returns Ok if the lock is already
+    // held by this process.
+    //
+    // Gathered as (run_id, repo_dir) pairs first so we don't hold an immutable
+    // borrow of `registry` across the `&mut self` acquire call.
+    let running_repos: Vec<(String, std::path::PathBuf)> = registry
+        .list_runs(false)
+        .iter()
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
+        .map(|r| (r.run_id.clone(), r.repo_dir.clone()))
+        .collect();
+
+    for (run_id, repo_dir) in &running_repos {
+        match registry.acquire_repo_lock_for_adopt(repo_dir) {
+            Ok(()) => {
+                debug!(
+                    run_id = %run_id,
+                    repo = %repo_dir.display(),
+                    "re-acquired repo lock on startup"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    repo = %repo_dir.display(),
+                    error = %e,
+                    "cannot re-acquire repo lock — another process may have it"
+                );
+            }
+        }
+    }
+
     // Step 1: Discover all gw-* tmux sessions
     let live_sessions = list_gw_tmux_sessions();
     report.sessions_scanned = live_sessions.len() as u32;

@@ -60,6 +60,15 @@ pub async fn spawn_run(
         warn!(repo = %repo_dir.display(), "{warning}");
     }
 
+    // Pre-flight disk space gate on BOTH the repo volume and GW_HOME.
+    // Daemon-managed runs may target a repo on a different filesystem than
+    // ~/.gw, so both must be checked. Bail out cleanly rather than spawn a
+    // process that will fail mid-write.
+    crate::cleanup::health::check_disk_space_at(repo_dir)
+        .map_err(|e| eyre!("repo disk space check failed: {e}"))?;
+    crate::cleanup::health::check_disk_space_at(&crate::daemon::state::gw_home())
+        .map_err(|e| eyre!("GW_HOME disk space check failed: {e}"))?;
+
     // ── Register run ────────────────────────────────────────────────
     let run_id = {
         let mut reg = registry.lock().await;
@@ -93,6 +102,13 @@ pub async fn spawn_run(
     match spawn::spawn_claude_session(&config) {
         Ok(pid) => {
             debug!(run_id = %run_id, pid = pid, tmux = %tmux_session, "tmux session spawned");
+            // Persist claude PID for downstream liveness checks (DaemonRunMonitor).
+            // Held only for the mutation and released before any tmux I/O.
+            let mut reg = registry.lock().await;
+            if let Some(entry) = reg.get_mut(&run_id) {
+                entry.claude_pid = Some(pid);
+            }
+            drop(reg);
         }
         Err(e) => {
             // Spawn failed — clean up registry entry

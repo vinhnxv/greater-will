@@ -16,6 +16,29 @@ use std::path::{Path, PathBuf};
 use crate::daemon::protocol::{RunInfo, RunStatus};
 use crate::daemon::state::gw_home;
 
+// ── Shared repo hash ────────────────────────────────────────────────
+
+/// Compute the canonical repo hash used for daemon per-repo lock paths.
+///
+/// Shared between [`RunRegistry`] (which creates and holds the lock) and
+/// `commands::run::check_daemon_repo_lock` (which probes the lock from the
+/// foreground run path). Both call sites MUST use this function — any drift
+/// would silently break the foreground-vs-daemon collision guard by making
+/// it check a non-existent lock file path.
+///
+/// Format: SHA-256 of the canonical path as UTF-8, first 16 bytes hex-encoded
+/// (32 characters). Canonicalization falls back to the input path if the
+/// target doesn't exist, so the function is infallible and usable from any
+/// call site, including pre-creation foreground guards.
+pub(crate) fn repo_hash(repo_dir: &Path) -> String {
+    let canonical = repo_dir
+        .canonicalize()
+        .unwrap_or_else(|_| repo_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 // ── Run entry ───────────────────────────────────────────────────────
 
 /// Persistent metadata for a single arc run.
@@ -49,6 +72,14 @@ pub struct RunEntry {
     /// Defaults to `true` for backward compatibility with existing meta.json.
     #[serde(default = "default_restartable")]
     pub restartable: bool,
+    /// PID of the `claude` child process inside the tmux session.
+    ///
+    /// Stored after a successful spawn so the monitor loop can check whether
+    /// the Claude process is alive without shell-wrangling tmux. `None` for
+    /// runs that existed before this field was added (`#[serde(default)]`)
+    /// and for runs whose spawn failed before a PID was captured.
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
 }
 
 fn default_restartable() -> bool {
@@ -203,6 +234,7 @@ impl RunRegistry {
             config_dir,
             error_message: None,
             restartable: true,
+            claude_pid: None,
         };
 
         // Persist to disk
@@ -368,13 +400,12 @@ impl RunRegistry {
     // ── Internal helpers ────────────────────────────────────────────
 
     /// Compute SHA-256 hash of a repo path for the lock filename.
+    ///
+    /// Delegates to the module-level [`repo_hash`] function so that the
+    /// foreground collision guard at `commands::run::check_daemon_repo_lock`
+    /// and the daemon's lock acquisition share exactly one definition.
     fn repo_hash(repo_dir: &Path) -> String {
-        let canonical = repo_dir
-            .canonicalize()
-            .unwrap_or_else(|_| repo_dir.to_path_buf());
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        hex::encode(&hasher.finalize()[..16])
+        repo_hash(repo_dir)
     }
 
     /// Acquire a per-repo advisory lock.
@@ -597,6 +628,63 @@ mod tests {
                 None,
             );
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn claude_pid_backward_compat_missing_field() {
+        // Simulate a pre-shard-2 meta.json that predates the claude_pid field.
+        // Deserializing it must succeed and yield None (#[serde(default)]),
+        // preserving the on-disk format — old daemon files remain readable.
+        let legacy_json = serde_json::json!({
+            "run_id": "abcd1234",
+            "plan_path": "plans/legacy.md",
+            "repo_dir": "/tmp/repo-legacy",
+            "session_name": "gw-abcd1234",
+            "tmux_session": null,
+            "status": "Running",
+            "current_phase": null,
+            "started_at": "2026-04-11T00:00:00Z",
+            "finished_at": null,
+            "crash_restarts": 0,
+            "config_dir": null,
+            "error_message": null,
+            "restartable": true
+            // NOTE: no claude_pid field
+        });
+        let entry: RunEntry = serde_json::from_value(legacy_json)
+            .expect("legacy meta.json must deserialize with no claude_pid");
+        assert_eq!(entry.claude_pid, None);
+    }
+
+    #[test]
+    fn claude_pid_serializes_and_deserializes() {
+        // New entries with claude_pid set round-trip through JSON correctly.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let id = reg
+                .register_run(
+                    PathBuf::from("plans/pid-test.md"),
+                    PathBuf::from("/tmp/repo-pid"),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            // Mutate the PID as the executor would
+            if let Some(entry) = reg.get_mut(&id) {
+                entry.claude_pid = Some(98765);
+            }
+            // Force a disk write via update_status (it re-serializes)
+            reg.update_status(&id, RunStatus::Running, Some("testing".into()), None)
+                .unwrap();
+            // Release lock so load_from_disk doesn't collide
+            reg.update_status(&id, RunStatus::Succeeded, None, None)
+                .unwrap();
+
+            let loaded = RunRegistry::load_from_disk().unwrap();
+            let entry = loaded.get(&id).unwrap();
+            assert_eq!(entry.claude_pid, Some(98765));
         });
     }
 
