@@ -114,6 +114,11 @@ fn run_single(
 ) -> Result<()> {
     use crate::engine::single_session::{run_single_session, run_single_session_batch, SingleSessionConfig};
 
+    // Guard: if the daemon already holds a per-repo lock for this working
+    // directory, refuse to run in foreground mode — two concurrent runs on
+    // the same repo would corrupt branches, checkpoints, and tmux state.
+    check_daemon_repo_lock(cwd)?;
+
     preflight_tmux()?;
 
     let mut ss_config = SingleSessionConfig::new(cwd);
@@ -210,6 +215,11 @@ fn run_multi_group(
     resume: bool,
     cwd: &Path,
 ) -> Result<()> {
+    // Same foreground-vs-daemon collision guard as run_single. Placed here
+    // (not in each delegate helper) so resume, batch, and real-run paths all
+    // get checked exactly once.
+    check_daemon_repo_lock(cwd)?;
+
     // Validate group if specified
     if let Some(ref g) = group {
         let valid_groups: Vec<&str> = config.groups.iter().map(|grp| grp.name.as_str()).collect();
@@ -473,6 +483,78 @@ fn preflight_tmux() -> Result<()> {
         Ok(out) => {
             let version = String::from_utf8_lossy(&out.stdout);
             tracing::info!("tmux version: {}", version.trim());
+            Ok(())
+        }
+    }
+}
+
+/// Prevent foreground run collisions with the daemon.
+///
+/// The daemon serializes runs per repository via an exclusive file lock at
+/// `$GW_HOME/repos/{hash}/lock`. A foreground `gw run --foreground` bypasses
+/// the daemon entirely, so two concurrent processes could end up mutating
+/// the same working tree, branches, and checkpoints.
+///
+/// This helper probes the daemon's lock file without blocking: if the file
+/// exists and is exclusive-locked, we know the daemon (or another process)
+/// is already running against this repo and we bail out. If we *can* acquire
+/// the lock, we release it immediately — the real owner is whoever holds it
+/// next.
+///
+/// Hash format must match `RunRegistry::repo_hash` (SHA-256 of the
+/// canonical path, first 16 bytes hex-encoded — 32 chars). Any drift would
+/// make the check a silent no-op.
+///
+/// Missing lock file == no daemon run == pass. We do NOT create the lock.
+fn check_daemon_repo_lock(cwd: &Path) -> Result<()> {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+
+    // Canonicalize to match the daemon's path resolution. If canonicalization
+    // fails (e.g., the path is newly created or a symlink target is missing),
+    // fall back to the as-provided path — the hash will simply not match the
+    // daemon's, so we pass through instead of producing a false positive.
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let repo_hash = hex::encode(&hasher.finalize()[..16]);
+
+    let lock_path = crate::daemon::state::gw_home()
+        .join("repos")
+        .join(&repo_hash)
+        .join("lock");
+
+    // No lock file → nothing running for this repo → allow.
+    if !lock_path.exists() {
+        return Ok(());
+    }
+
+    // Lock file exists. Try to take an exclusive lock:
+    //   - success → whoever wrote the file is NOT currently holding it
+    //     (stale lock file from a crashed daemon, or daemon that stopped
+    //     cleanly without removing the file). Release immediately and allow.
+    //   - failure → another process holds the lock → refuse.
+    match std::fs::File::open(&lock_path) {
+        Ok(f) => match f.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = f.unlock();
+                Ok(())
+            }
+            Err(_) => eyre::bail!(
+                "This repository has an active daemon-managed run.\n\
+                 Use `gw ps` to check status, `gw stop <id>` to cancel.\n\
+                 Or use `gw run` without --foreground to delegate to the daemon."
+            ),
+        },
+        // File exists but we couldn't open it — likely a permission issue.
+        // Warn, but don't block; the user is already in a degraded state and
+        // producing a false error here would be more surprising than helpful.
+        Err(e) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                error = %e,
+                "could not open daemon repo lock for collision check — proceeding"
+            );
             Ok(())
         }
     }

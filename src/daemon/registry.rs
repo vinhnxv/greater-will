@@ -49,6 +49,14 @@ pub struct RunEntry {
     /// Defaults to `true` for backward compatibility with existing meta.json.
     #[serde(default = "default_restartable")]
     pub restartable: bool,
+    /// PID of the `claude` child process inside the tmux session.
+    ///
+    /// Stored after a successful spawn so the monitor loop can check whether
+    /// the Claude process is alive without shell-wrangling tmux. `None` for
+    /// runs that existed before this field was added (`#[serde(default)]`)
+    /// and for runs whose spawn failed before a PID was captured.
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
 }
 
 fn default_restartable() -> bool {
@@ -203,6 +211,7 @@ impl RunRegistry {
             config_dir,
             error_message: None,
             restartable: true,
+            claude_pid: None,
         };
 
         // Persist to disk
@@ -597,6 +606,63 @@ mod tests {
                 None,
             );
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn claude_pid_backward_compat_missing_field() {
+        // Simulate a pre-shard-2 meta.json that predates the claude_pid field.
+        // Deserializing it must succeed and yield None (#[serde(default)]),
+        // preserving the on-disk format — old daemon files remain readable.
+        let legacy_json = serde_json::json!({
+            "run_id": "abcd1234",
+            "plan_path": "plans/legacy.md",
+            "repo_dir": "/tmp/repo-legacy",
+            "session_name": "gw-abcd1234",
+            "tmux_session": null,
+            "status": "Running",
+            "current_phase": null,
+            "started_at": "2026-04-11T00:00:00Z",
+            "finished_at": null,
+            "crash_restarts": 0,
+            "config_dir": null,
+            "error_message": null,
+            "restartable": true
+            // NOTE: no claude_pid field
+        });
+        let entry: RunEntry = serde_json::from_value(legacy_json)
+            .expect("legacy meta.json must deserialize with no claude_pid");
+        assert_eq!(entry.claude_pid, None);
+    }
+
+    #[test]
+    fn claude_pid_serializes_and_deserializes() {
+        // New entries with claude_pid set round-trip through JSON correctly.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let id = reg
+                .register_run(
+                    PathBuf::from("plans/pid-test.md"),
+                    PathBuf::from("/tmp/repo-pid"),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            // Mutate the PID as the executor would
+            if let Some(entry) = reg.get_mut(&id) {
+                entry.claude_pid = Some(98765);
+            }
+            // Force a disk write via update_status (it re-serializes)
+            reg.update_status(&id, RunStatus::Running, Some("testing".into()), None)
+                .unwrap();
+            // Release lock so load_from_disk doesn't collide
+            reg.update_status(&id, RunStatus::Succeeded, None, None)
+                .unwrap();
+
+            let loaded = RunRegistry::load_from_disk().unwrap();
+            let entry = loaded.get(&id).unwrap();
+            assert_eq!(entry.claude_pid, Some(98765));
         });
     }
 

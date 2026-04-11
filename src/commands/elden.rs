@@ -315,23 +315,56 @@ fn handle_permission_event() -> Result<()> {
 }
 
 // ─── Signal File Reader (for monitor loop) ──────────────────────────
+//
+// Two parallel APIs exist:
+//
+//   1. CWD-based (legacy):    read_stop_signal()           uses $CWD/.gw/signals
+//   2. base-dir-parameterized: read_stop_signal_from(&p)   uses p/.gw/signals
+//
+// The daemon's DaemonRunMonitor must read signals from each run's `repo_dir`,
+// not from its own CWD (which is usually ~/.gw or /). The `*_from` variants
+// take an explicit base directory; the CWD-based functions delegate to them
+// using `std::env::current_dir()`. Existing callers keep working unchanged.
+
+/// Signal directory for a given base directory.
+fn signal_dir_from(base_dir: &Path) -> PathBuf {
+    base_dir.join(".gw").join("signals")
+}
 
 /// Check if a stop signal file exists.
 ///
 /// Used by the monitor loop to detect clean session exit.
 /// If `expected_session_id` is Some, validates the signal belongs to this session.
 pub fn read_stop_signal() -> Option<Value> {
-    read_signal_file("session-stop.json")
+    read_stop_signal_from(&current_dir_or_default())
+}
+
+/// Check if a stop signal file exists under `base_dir/.gw/signals/`.
+pub fn read_stop_signal_from(base_dir: &Path) -> Option<Value> {
+    let path = signal_dir_from(base_dir).join("session-stop.json");
+    read_json_file(&path)
 }
 
 /// Check if a session-end signal file exists.
 pub fn read_session_end_signal() -> Option<Value> {
-    read_signal_file("session-end.json")
+    read_session_end_signal_from(&current_dir_or_default())
+}
+
+/// Check if a session-end signal file exists under `base_dir/.gw/signals/`.
+pub fn read_session_end_signal_from(base_dir: &Path) -> Option<Value> {
+    let path = signal_dir_from(base_dir).join("session-end.json");
+    read_json_file(&path)
 }
 
 /// Check if an API error signal exists (from StopFailure hook).
 pub fn read_stop_failure_signal() -> Option<Value> {
-    read_signal_file("stop-failure.json")
+    read_stop_failure_signal_from(&current_dir_or_default())
+}
+
+/// Check if an API error signal exists under `base_dir/.gw/signals/`.
+pub fn read_stop_failure_signal_from(base_dir: &Path) -> Option<Value> {
+    let path = signal_dir_from(base_dir).join("stop-failure.json");
+    read_json_file(&path)
 }
 
 /// Read a signal file and validate it belongs to the expected session.
@@ -340,10 +373,23 @@ pub fn read_stop_failure_signal() -> Option<Value> {
 /// This prevents cross-session signal contamination when multiple
 /// gw instances run in the same project directory.
 pub fn read_signal_for_session(filename: &str, expected_session_id: &str) -> Option<Value> {
-    let signal = read_signal_file(filename)?;
+    read_signal_for_session_from(&current_dir_or_default(), filename, expected_session_id)
+}
+
+/// Session-filtered signal read under `base_dir/.gw/signals/`.
+///
+/// Returns None if the signal is for a different session. Accepts signals
+/// whose session_id matches, or where either side is "unknown" (backward
+/// compatibility with pre-session-id hook output).
+pub fn read_signal_for_session_from(
+    base_dir: &Path,
+    filename: &str,
+    expected_session_id: &str,
+) -> Option<Value> {
+    let path = signal_dir_from(base_dir).join(filename);
+    let signal = read_json_file(&path)?;
     let signal_session = signal.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Accept if session matches or if either side is "unknown"
     if signal_session == expected_session_id
         || signal_session == "unknown"
         || expected_session_id == "unknown"
@@ -359,7 +405,13 @@ pub fn read_signal_for_session(filename: &str, expected_session_id: &str) -> Opt
 /// Returns true if Claude is waiting for permission (within last 60s).
 /// Monitor should NOT count this as idle time.
 pub fn is_permission_pending() -> bool {
-    let signal_path = PathBuf::from(SIGNAL_DIR).join("permission-pending.json");
+    is_permission_pending_from(&current_dir_or_default())
+}
+
+/// Check if a permission-pending signal exists under `base_dir/.gw/signals/`
+/// and was written within the last 60 seconds.
+pub fn is_permission_pending_from(base_dir: &Path) -> bool {
+    let signal_path = signal_dir_from(base_dir).join("permission-pending.json");
     match std::fs::metadata(&signal_path) {
         Ok(meta) => {
             // Check if file was written in the last 60 seconds
@@ -375,20 +427,42 @@ pub fn is_permission_pending() -> bool {
 
 /// Clean up signal files (called before starting a new session).
 pub fn clear_signals() {
-    let signal_dir = PathBuf::from(SIGNAL_DIR);
-    if signal_dir.exists() {
-        let _ = std::fs::remove_file(signal_dir.join("session-stop.json"));
-        let _ = std::fs::remove_file(signal_dir.join("stop-failure.json"));
-        let _ = std::fs::remove_file(signal_dir.join("session-end.json"));
-        let _ = std::fs::remove_file(signal_dir.join("permission-pending.json"));
+    clear_signals_from(&current_dir_or_default())
+}
+
+/// Clean up signal files under `base_dir/.gw/signals/`.
+pub fn clear_signals_from(base_dir: &Path) {
+    let dir = signal_dir_from(base_dir);
+    if !dir.exists() {
+        return;
+    }
+    for name in &[
+        "session-stop.json",
+        "stop-failure.json",
+        "session-end.json",
+        "permission-pending.json",
+    ] {
+        let _ = std::fs::remove_file(dir.join(name));
     }
 }
 
-/// Read and parse a signal file.
-fn read_signal_file(filename: &str) -> Option<Value> {
-    let signal_path = PathBuf::from(SIGNAL_DIR).join(filename);
-    let content = std::fs::read_to_string(&signal_path).ok()?;
+/// Read and parse a JSON file, returning None on any error.
+///
+/// Shared helper for all signal readers. Absence or malformed content both
+/// return None — signal files are advisory, not authoritative, so best-effort
+/// reads are appropriate.
+fn read_json_file(path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Resolve the current working directory, falling back to `.` on failure.
+///
+/// Used by the CWD-based signal readers to reach the `*_from` variants.
+/// A failed `current_dir()` is extremely rare (process has no cwd — e.g.,
+/// parent deleted it) but we must not panic in monitor-loop code.
+fn current_dir_or_default() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 // ─── Hook Installation ───────────────────────────────────────────────
@@ -917,4 +991,109 @@ mod tests {
         let _ = result;
     }
 
+    // ─── Signal reader *_from(base_dir) variants ───────────────────────
+    //
+    // The daemon's DaemonRunMonitor (Shard 3) reads signal files from a
+    // run's `repo_dir` rather than the daemon's CWD. These tests verify
+    // that the `*_from` variants correctly resolve `base_dir/.gw/signals/`
+    // and that missing directories degrade gracefully (None / false / noop).
+
+    fn write_signal(base: &std::path::Path, name: &str, session_id: &str) {
+        let dir = base.join(".gw").join("signals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = serde_json::json!({
+            "event": "test",
+            "session_id": session_id,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(dir.join(name), payload.to_string()).unwrap();
+    }
+
+    #[test]
+    fn read_stop_signal_from_reads_from_base_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_signal(tmp.path(), "session-stop.json", "abc-123");
+
+        let signal = read_stop_signal_from(tmp.path()).unwrap();
+        assert_eq!(
+            signal.get("session_id").and_then(|v| v.as_str()),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn read_stop_signal_from_returns_none_for_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No .gw/signals/ subdir created — the read must not panic.
+        assert!(read_stop_signal_from(tmp.path()).is_none());
+        assert!(read_session_end_signal_from(tmp.path()).is_none());
+        assert!(read_stop_failure_signal_from(tmp.path()).is_none());
+        assert!(!is_permission_pending_from(tmp.path()));
+    }
+
+    #[test]
+    fn read_signal_for_session_from_filters_by_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_signal(tmp.path(), "session-stop.json", "session-A");
+
+        // Matching session → Some
+        assert!(read_signal_for_session_from(
+            tmp.path(),
+            "session-stop.json",
+            "session-A"
+        )
+        .is_some());
+
+        // Mismatched session → None
+        assert!(read_signal_for_session_from(
+            tmp.path(),
+            "session-stop.json",
+            "session-B"
+        )
+        .is_none());
+
+        // "unknown" matches anything (backward compat with pre-session-id hooks)
+        assert!(read_signal_for_session_from(
+            tmp.path(),
+            "session-stop.json",
+            "unknown"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn is_permission_pending_from_fresh_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_signal(tmp.path(), "permission-pending.json", "sess-1");
+        // File is freshly written — must register as pending.
+        assert!(is_permission_pending_from(tmp.path()));
+    }
+
+    #[test]
+    fn clear_signals_from_removes_all_four_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in &[
+            "session-stop.json",
+            "stop-failure.json",
+            "session-end.json",
+            "permission-pending.json",
+        ] {
+            write_signal(tmp.path(), name, "sess");
+        }
+
+        clear_signals_from(tmp.path());
+
+        let sig_dir = tmp.path().join(".gw").join("signals");
+        assert!(!sig_dir.join("session-stop.json").exists());
+        assert!(!sig_dir.join("stop-failure.json").exists());
+        assert!(!sig_dir.join("session-end.json").exists());
+        assert!(!sig_dir.join("permission-pending.json").exists());
+    }
+
+    #[test]
+    fn clear_signals_from_missing_dir_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Must not panic when .gw/signals/ doesn't exist.
+        clear_signals_from(tmp.path());
+    }
 }

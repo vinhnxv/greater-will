@@ -622,6 +622,35 @@ async fn spawn_recovery(
         let _ = spawn::kill_session(&tmux_session);
     }
 
+    // Pre-flight disk space gate: check BOTH the repo volume and GW_HOME
+    // (they may live on different filesystems — e.g., repo on an external
+    // drive, ~/.gw on the system disk). Bailing out early avoids spawning a
+    // Claude process that will immediately crash on write errors.
+    if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
+        warn!(run_id = %run_id, error = %e, "aborting recovery: repo disk too low");
+        append_event(run_id, "recovery_failed", &format!("disk full (repo): {e}"));
+        let mut reg = registry.lock().await;
+        let _ = reg.update_status(
+            run_id,
+            RunStatus::Failed,
+            None,
+            Some(format!("crash recovery aborted: {e}")),
+        );
+        return;
+    }
+    if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
+        warn!(run_id = %run_id, error = %e, "aborting recovery: GW_HOME disk too low");
+        append_event(run_id, "recovery_failed", &format!("disk full (GW_HOME): {e}"));
+        let mut reg = registry.lock().await;
+        let _ = reg.update_status(
+            run_id,
+            RunStatus::Failed,
+            None,
+            Some(format!("crash recovery aborted: {e}")),
+        );
+        return;
+    }
+
     let has_checkpoint = crate::daemon::reconciler::check_checkpoint(repo_dir);
 
     info!(
@@ -663,7 +692,7 @@ async fn spawn_recovery(
     };
 
     match spawn::spawn_claude_session(&config) {
-        Ok(_pid) => {
+        Ok(pid) => {
             // Send the resume command
             if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &cmd) {
                 warn!(error = %e, "failed to send resume command");
@@ -688,6 +717,9 @@ async fn spawn_recovery(
                 entry.tmux_session = Some(tmux_session.clone());
                 entry.current_phase = Some("resuming".to_string());
                 entry.crash_restarts = entry.crash_restarts.saturating_add(1);
+                // Refresh claude_pid to the newly spawned process so the
+                // monitor loop's liveness checks target the right PID.
+                entry.claude_pid = Some(pid);
             }
             if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
                 warn!(run_id = %run_id, error = %e, "failed to persist recovery state to disk");

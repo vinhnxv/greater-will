@@ -297,19 +297,30 @@ pub fn quick_health_check() -> Result<SystemHealth> {
 /// Minimum disk space required before starting a pipeline (2 GB).
 const MIN_DISK_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Check that minimum disk space is available.
+/// Check that minimum disk space is available on the volume containing `target_dir`.
 ///
 /// Returns `Ok(())` if sufficient space, or `Err` if below threshold.
-/// Used by both single-session and batch modes as a pre-flight check.
-pub fn check_disk_space() -> Result<()> {
+/// The target directory determines which mounted volume to probe — this matters
+/// when the daemon and a run's repo live on different filesystems (e.g. repo
+/// on an external drive, `~/.gw` on the system disk).
+pub fn check_disk_space_at(target_dir: &std::path::Path) -> Result<()> {
     use sysinfo::Disks;
 
     let disks = Disks::new_with_refreshed_list();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+    // Canonicalize so that `..`, symlinks, and relative paths resolve to the
+    // same absolute form as the mount point strings. Fall back to the
+    // as-provided path if canonicalization fails (e.g., target doesn't exist
+    // yet) — starts_with still works for absolute paths.
+    let resolved = target_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_dir.to_path_buf());
+
+    // Longest mount-point match wins (e.g., `/Users/x/repo` under
+    // `/Users/x` nested mount prefers the deeper one).
     let available = disks
         .iter()
-        .filter(|d| cwd.starts_with(d.mount_point()))
+        .filter(|d| resolved.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| d.available_space());
 
@@ -317,21 +328,39 @@ pub fn check_disk_space() -> Result<()> {
         Some(space) if space < MIN_DISK_SPACE_BYTES => {
             let gb = space as f64 / (1024.0 * 1024.0 * 1024.0);
             Err(eyre!(
-                "Insufficient disk space: {:.2} GB available, {:.0} GB required",
+                "Insufficient disk space at {}: {:.2} GB available, {:.0} GB required",
+                target_dir.display(),
                 gb,
                 MIN_DISK_SPACE_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
             ))
         }
         Some(space) => {
             let gb = space as f64 / (1024.0 * 1024.0 * 1024.0);
-            tracing::debug!(available_gb = format!("{:.2}", gb), "Disk space check passed");
+            tracing::debug!(
+                target = %target_dir.display(),
+                available_gb = format!("{:.2}", gb),
+                "Disk space check passed"
+            );
             Ok(())
         }
         None => {
-            tracing::warn!("Could not determine disk space — proceeding anyway");
+            tracing::warn!(
+                target = %target_dir.display(),
+                "Could not determine disk space — proceeding anyway"
+            );
             Ok(())
         }
     }
+}
+
+/// Check disk space on the current working directory's volume.
+///
+/// Convenience wrapper for existing callers that always want CWD. Prefer
+/// `check_disk_space_at` when the target volume differs from CWD (e.g.
+/// daemon-spawned runs against an external repo).
+pub fn check_disk_space() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    check_disk_space_at(&cwd)
 }
 
 #[cfg(test)]
