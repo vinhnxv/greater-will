@@ -72,6 +72,29 @@ gw logs <run-id> --follow
 gw daemon stop
 ```
 
+#### Recovering from a crash-loop halt
+
+The daemon trips a circuit breaker if it crashes `GW_MAX_CRASH_RETRIES` times
+(default 5) within `GW_CRASH_WINDOW_SECS` (default 900s / 15 min). It writes
+`$GW_HOME/crashloop.flag` (default `~/.gw/crashloop.flag`) and refuses to restart
+until the flag is cleared.
+
+```bash
+# 1. Inspect — gw daemon status prints a recovery banner when the flag is set
+gw daemon status
+cat ~/.gw/crashloop.flag              # raw flag contents (use $GW_HOME if set)
+
+# 2. Investigate — check daemon stderr for the error(s) leading to the halt
+tail -n 200 ~/.gw/logs/daemon.stderr.log
+
+# 3. Clear and restart
+rm ~/.gw/crashloop.flag
+gw daemon start                       # or: launchctl kickstart -k gui/$(id -u)/com.greater-will.daemon
+```
+
+See [docs/daemon/launchd-troubleshooting.md](docs/daemon/launchd-troubleshooting.md)
+for the full launchd runbook.
+
 ## Commands
 
 ### `gw run` — Execute plans
