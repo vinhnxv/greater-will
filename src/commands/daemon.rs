@@ -12,7 +12,7 @@ use crate::output::tags::tag;
 use color_eyre::eyre::{self, Context};
 use color_eyre::Result;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Dispatch a daemon action.
@@ -178,8 +178,14 @@ fn cmd_status() -> Result<()> {
     // daemon is not running, so surface it prominently before anything
     // else.  `read_crashloop_flag` returns None for both missing and
     // malformed files, so this is a safe no-op when there is no flag.
+    //
+    // The flag path must come from `crashloop_flag_path` — hardcoding
+    // `~/.gw/crashloop.flag` would mislead operators running with a
+    // non-default `$GW_HOME`, since the writer in `daemon/mod.rs` honors
+    // that environment variable.
+    let flag_path = crate::daemon::crashloop_flag_path(&home);
     if let Some(flag) = crate::daemon::read_crashloop_flag(&home) {
-        print_crashloop_banner(&flag);
+        print_crashloop_banner(&flag, &flag_path);
     }
 
     if !DaemonClient::is_daemon_running() {
@@ -274,12 +280,21 @@ fn cmd_status() -> Result<()> {
 /// Print a prominent banner warning that the daemon is halted by the
 /// crash-loop detector.
 ///
-/// Called from `cmd_status` when `~/.gw/crashloop.flag` exists.  The
-/// banner must be visually loud because its presence means launchd
-/// respawn has stopped and the operator needs to intervene before the
-/// daemon will run again.
-fn print_crashloop_banner(flag: &crate::daemon::CrashLoopFlag) {
+/// Called from `cmd_status` when the crash-loop flag exists.  The banner
+/// must be visually loud because its presence means launchd respawn has
+/// stopped and the operator needs to intervene before the daemon will
+/// run again.
+///
+/// `flag_path` is the actual filesystem path of the sentinel flag (from
+/// [`crate::daemon::crashloop_flag_path`]) — it is NOT hardcoded to
+/// `~/.gw/crashloop.flag` because the writer honors `$GW_HOME`, and the
+/// recovery instructions must reference the same path the writer used.
+fn print_crashloop_banner(flag: &crate::daemon::CrashLoopFlag, flag_path: &Path) {
     let bar = "━".repeat(60);
+    let log_path = flag_path
+        .parent()
+        .map(|p| p.join("daemon.log"))
+        .unwrap_or_else(|| PathBuf::from("daemon.log"));
     println!("{}", bar);
     println!(
         "{} CRASHLOOP DETECTED — daemon halted by launchd backoff",
@@ -292,8 +307,14 @@ fn print_crashloop_banner(flag: &crate::daemon::CrashLoopFlag) {
         println!("  Last error        : {err}");
     }
     println!("  Details           : {}", flag.message);
-    println!("  Recovery          : inspect ~/.gw/daemon.log, fix the root cause,");
-    println!("                      then `rm ~/.gw/crashloop.flag && gw daemon start`");
+    println!(
+        "  Recovery          : inspect {}, fix the root cause,",
+        log_path.display()
+    );
+    println!(
+        "                      then `rm {} && gw daemon start`",
+        flag_path.display()
+    );
     println!("{}", bar);
     println!();
 }
