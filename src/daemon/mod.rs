@@ -4,6 +4,7 @@ pub mod heartbeat;
 pub mod protocol;
 pub mod reconciler;
 pub mod registry;
+pub mod run_monitor;
 pub mod server;
 pub mod state;
 
