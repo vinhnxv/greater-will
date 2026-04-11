@@ -434,24 +434,40 @@ impl HeartbeatMonitor {
             }
         }
 
-        // Check for pipeline completion. Cross-verify with checkpoint before
-        // marking Succeeded — `is_pipeline_complete` is a pane-text heuristic
-        // that false-positives when Claude writes documentation containing
-        // phrases like "arc completed" or "pipeline completed".
-        if is_pipeline_complete(pane_content) {
-            if !cp_confirms_completion {
-                // Pane text matches but checkpoint disagrees. Stay in Running.
-                // If the checkpoint is unreadable, `cp_confirms_completion`
-                // is also false (unwrap_or(false)) — that is intentional:
-                // we refuse to trust pane text alone.
+        // Check for pipeline completion. Checkpoint.json is the authoritative
+        // source: if it reports phase == "complete", promote the run to
+        // Succeeded regardless of pane text. If checkpoint disagrees (or is
+        // unreadable) and only pane text matches, refuse to mark Succeeded —
+        // `is_pipeline_complete` is a heuristic that false-positives when
+        // Claude writes documentation containing "arc completed",
+        // "pipeline completed", etc.
+        //
+        // Two-gate promotion:
+        //   1. checkpoint says complete  → promote (pane agreement is a bonus)
+        //   2. pane says complete alone  → suppressed as a false positive
+        //   3. neither says complete     → no-op, keep running
+        let pane_says_complete = is_pipeline_complete(pane_content);
+        if !cp_confirms_completion {
+            if pane_says_complete {
+                // FINDING-002 note: checkpoint is the authoritative source.
+                // Pane text is only trusted when checkpoint independently confirms.
                 debug!(
                     run_id = %run_id,
                     "pane text matches completion but checkpoint disagrees — ignoring"
                 );
-                return;
             }
+            return;
+        }
+
+        // cp_confirms_completion == true from here on.
+        if pane_says_complete {
             info!(run_id = %run_id, "pipeline completed (pane + checkpoint confirmed)");
             append_event(run_id, "completion_detected", "pipeline completion detected via pane text pattern match (checkpoint-confirmed)");
+        } else {
+            info!(run_id = %run_id, "pipeline completed (checkpoint authoritative; no pane match)");
+            append_event(run_id, "completion_detected", "pipeline completion detected via checkpoint.json (pane text did not match heuristic)");
+        }
+        {
             let mut registry = self.registry.lock().await;
             // Re-check status: stop_run (or another path) may have mutated the
             // entry between our earlier lock drop and this re-acquisition. If
@@ -578,11 +594,14 @@ async fn spawn_recovery(
                 tmux_session = %tmux_session,
                 "ABORT recovery: session and claude are alive — false positive crash"
             );
-            // Reset status back to Running (undo the crash_restarts increment)
-            // Persist to disk so the counter stays correct across daemon restarts
+            // Reset phase back to "running". Do NOT touch crash_restarts here:
+            // after FINDING-001, the increment lives in the success path below
+            // (after spawn_claude_session), so there is nothing to roll back
+            // when this false-positive abort fires — any saturating_sub would
+            // corrupt the counter for runs that have already survived a real
+            // prior crash restart.
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
-                entry.crash_restarts = entry.crash_restarts.saturating_sub(1);
                 entry.current_phase = Some("running".to_string());
             }
             if let Err(e) = reg.update_status(
