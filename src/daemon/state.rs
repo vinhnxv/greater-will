@@ -30,19 +30,33 @@ const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 /// environment variable, providing an audit trail for non-default paths.
 pub fn gw_home() -> PathBuf {
     if let Ok(home) = std::env::var("GW_HOME") {
+        // In production, GW_HOME should not change mid-process. The OnceLock
+        // tracks the first-seen value for drift detection. In tests, GW_HOME
+        // is deliberately changed per test via set_var, so we always return
+        // the current value but warn on drift.
         static FIRST_PATH: OnceLock<String> = OnceLock::new();
         let first = FIRST_PATH.get_or_init(|| {
             warn!(path = %home, "GW_HOME override active");
             home.clone()
         });
         if *first != home {
-            warn!(path = %home, previous = %first, "GW_HOME changed mid-process");
+            warn!(path = %home, previous = %first, "GW_HOME changed mid-process — state directory may be inconsistent");
         }
         PathBuf::from(home)
     } else {
-        dirs::home_dir()
-            .expect("could not determine home directory")
-            .join(".gw")
+        match dirs::home_dir() {
+            Some(h) => h.join(".gw"),
+            None => {
+                // Last resort: use /tmp/.gw instead of panicking the daemon.
+                // This can happen in container/CI environments without $HOME.
+                tracing::error!(
+                    "could not determine home directory — $HOME is not set. \
+                     Falling back to /tmp/.gw which will lose data across reboots. \
+                     Set $GW_HOME or $HOME to fix this."
+                );
+                PathBuf::from("/tmp/.gw")
+            }
+        }
     }
 }
 

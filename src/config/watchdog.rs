@@ -18,7 +18,7 @@
 //! | `GW_PROMPT_ACCEPT_DEBOUNCE_SECS` | 5 | seconds | Debounce between auto-accepts |
 //! | `GW_CRASH_WINDOW_SECS` | 900 | seconds | Rolling window for crash loop detection |
 //! | `GW_CRASH_STABILITY_SECS` | 1800 | seconds | Healthy running time to reset crash counters |
-//! | `GW_LOOP_STATE_WARMUP_SECS` | 180 | seconds | Max wait for arc-phase-loop.local.md to appear |
+//! | `GW_LOOP_STATE_WARMUP_SECS` | 300 | seconds | Max wait for arc-phase-loop.local.md to appear |
 
 use std::time::Duration;
 
@@ -74,21 +74,21 @@ impl WatchdogConfig {
         Self {
             idle_nudge_secs: env_or("GW_IDLE_NUDGE_SECS", 300).clamp(30, 3600),   // 5 min
             idle_kill_secs: env_or("GW_IDLE_KILL_SECS", 1800).clamp(60, 86400), // 30 min
-            error_stall_threshold_secs: env_or("GW_ERROR_STALL_THRESHOLD_SECS", 60),
-            artifact_scan_interval_secs: env_or("GW_ARTIFACT_SCAN_INTERVAL_SECS", 15),
+            error_stall_threshold_secs: env_or("GW_ERROR_STALL_THRESHOLD_SECS", 60).clamp(10, 3600),
+            artifact_scan_interval_secs: env_or("GW_ARTIFACT_SCAN_INTERVAL_SECS", 15).clamp(5, 300),
             pipeline_timeout: Duration::from_secs(
-                env_or("GW_PIPELINE_TIMEOUT_SECS", 6 * 3600),
+                env_or("GW_PIPELINE_TIMEOUT_SECS", 6 * 3600).clamp(60, 86400),
             ),
-            checkpoint_poll_interval_secs: env_or("GW_CHECKPOINT_POLL_INTERVAL_SECS", 10),
+            checkpoint_poll_interval_secs: env_or("GW_CHECKPOINT_POLL_INTERVAL_SECS", 10).clamp(1, 300),
             max_crash_retries: env_or("GW_MAX_CRASH_RETRIES", 5).clamp(1, 20) as u32,
             error_confirm_medium_secs: env_or("GW_ERROR_CONFIRM_MEDIUM_SECS", 15 * 60),
             error_confirm_high_secs: env_or("GW_ERROR_CONFIRM_HIGH_SECS", 5 * 60),
             prompt_accept_enabled: env_or("GW_PROMPT_ACCEPT", 1) != 0,
             prompt_accept_debounce_secs: env_or("GW_PROMPT_ACCEPT_DEBOUNCE_SECS", 5),
-            crash_window_secs: env_or("GW_CRASH_WINDOW_SECS", 900),
-            crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800),
-            loop_state_warmup_secs: env_or("GW_LOOP_STATE_WARMUP_SECS", 300), // 5 min minimum
-            restart_cooldown_secs: env_or("GW_RESTART_COOLDOWN_SECS", 60), // 1 min
+            crash_window_secs: env_or("GW_CRASH_WINDOW_SECS", 900).clamp(60, 7200),
+            crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800).clamp(60, 7200),
+            loop_state_warmup_secs: env_or("GW_LOOP_STATE_WARMUP_SECS", 300).clamp(30, 1800),
+            restart_cooldown_secs: env_or("GW_RESTART_COOLDOWN_SECS", 60).clamp(5, 600),
         }
     }
 }

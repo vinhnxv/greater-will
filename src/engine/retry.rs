@@ -606,13 +606,16 @@ impl RetryState {
     pub fn record_failure(&mut self) {
         let now = std::time::Instant::now();
 
+        // Capture previous failure time BEFORE overwriting
+        let previous_failure = self.last_failure;
+
         self.attempts += 1;
         self.last_failure = Some(now);
 
         // Check for rapid failure (3+ attempts within 30 seconds).
-        // Checked AFTER increment so `attempts` reflects the current failure.
-        if let Some(last) = self.last_failure {
-            if now.duration_since(last) < Duration::from_secs(30) && self.attempts >= 3 {
+        // Compare against the PREVIOUS failure timestamp, not the current one.
+        if let Some(prev) = previous_failure {
+            if now.duration_since(prev) < Duration::from_secs(30) && self.attempts >= 3 {
                 self.is_rapid_failure = true;
             }
         }

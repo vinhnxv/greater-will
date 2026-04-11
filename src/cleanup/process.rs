@@ -177,12 +177,20 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
 
     // Send SIGTERM to all processes (children first, then root)
     for pid in &descendants {
+        if *pid > i32::MAX as u32 {
+            tracing::warn!(pid = pid, "skipping SIGTERM — PID exceeds i32::MAX");
+            continue;
+        }
         unsafe {
             libc::kill(*pid as i32, libc::SIGTERM);
         }
     }
-    unsafe {
-        libc::kill(root_pid as i32, libc::SIGTERM);
+    if root_pid > i32::MAX as u32 {
+        tracing::warn!(pid = root_pid, "skipping SIGTERM for root — PID exceeds i32::MAX");
+    } else {
+        unsafe {
+            libc::kill(root_pid as i32, libc::SIGTERM);
+        }
     }
 
     // Wait for graceful termination
@@ -206,6 +214,10 @@ pub fn kill_process_tree(sys: &mut System, root_pid: u32) -> Result<usize> {
     // Force-kill remaining processes (ignore ESRCH — process may have exited between check and kill)
     tracing::warn!(pids = ?still_alive, "Force-killing remaining processes");
     for pid in &still_alive {
+        if *pid > i32::MAX as u32 {
+            tracing::warn!(pid = pid, "skipping SIGKILL — PID exceeds i32::MAX");
+            continue;
+        }
         let ret = unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();

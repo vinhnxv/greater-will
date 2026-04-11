@@ -195,8 +195,10 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
                 ) {
                     warn!(run_id = %run_id, error = %e, "failed to update for re-spawn");
                 }
-                // Clear snapshot after scheduling (it was consumed)
-                drain::clear_snapshot(run_id);
+                // Don't clear snapshot yet — it will be cleared by spawn_recovery
+                // after the session is actually recovered. If the daemon crashes
+                // before recovery completes, the snapshot is still available.
+                // drain::clear_snapshot(run_id); // deferred to spawn_recovery
                 report.respawned += 1;
             } else {
                 // Not restartable → mark Failed
@@ -267,6 +269,17 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
     entry.error_message = None;
     entry.finished_at = None;
 
+    // Acquire repo lock before adopting to prevent concurrent runs on same repo
+    let repo_dir = entry.repo_dir.clone();
+    if let Err(e) = registry.acquire_repo_lock_for_adopt(&repo_dir) {
+        warn!(
+            run_id = %run_id,
+            error = %e,
+            "cannot adopt orphan — repo already locked by another run"
+        );
+        return None;
+    }
+
     // Re-insert into registry (persists to disk)
     registry.adopt(entry);
 
@@ -320,7 +333,7 @@ fn find_run_by_tmux_session(
     None
 }
 
-/// Find Running entries whose tmux session is not in the live set.
+/// Find Running/Queued entries whose tmux session is not in the live set.
 fn find_stale_runs(
     registry: &RunRegistry,
     live_sessions: &HashSet<&str>,
@@ -328,7 +341,7 @@ fn find_stale_runs(
     registry
         .list_runs(false)
         .iter()
-        .filter(|r| r.status == RunStatus::Running)
+        .filter(|r| matches!(r.status, RunStatus::Running))
         .filter(|r| {
             // Check if tmux session is alive
             let tmux_name = format!("gw-{}", r.run_id);
@@ -359,7 +372,33 @@ pub(crate) fn check_checkpoint(repo_dir: &std::path::Path) -> bool {
         .map(|entries| {
             entries
                 .flatten()
-                .any(|e| e.path().join("checkpoint.json").exists())
+                .any(|e| {
+                    let cp = e.path().join("checkpoint.json");
+                    if !cp.exists() {
+                        return false;
+                    }
+                    // Validate that the checkpoint is actually valid JSON,
+                    // not a zero-byte or corrupt file from a partial write
+                    match std::fs::read_to_string(&cp) {
+                        Ok(content) => {
+                            if content.trim().is_empty() {
+                                warn!(path = ?cp, "checkpoint.json is empty — ignoring");
+                                return false;
+                            }
+                            match serde_json::from_str::<serde_json::Value>(&content) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    warn!(path = ?cp, error = %e, "checkpoint.json is invalid JSON — ignoring");
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(path = ?cp, error = %e, "failed to read checkpoint.json");
+                            false
+                        }
+                    }
+                })
         })
         .unwrap_or(false)
 }
