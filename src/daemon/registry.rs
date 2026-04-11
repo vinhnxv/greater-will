@@ -16,6 +16,29 @@ use std::path::{Path, PathBuf};
 use crate::daemon::protocol::{RunInfo, RunStatus};
 use crate::daemon::state::gw_home;
 
+// ── Shared repo hash ────────────────────────────────────────────────
+
+/// Compute the canonical repo hash used for daemon per-repo lock paths.
+///
+/// Shared between [`RunRegistry`] (which creates and holds the lock) and
+/// `commands::run::check_daemon_repo_lock` (which probes the lock from the
+/// foreground run path). Both call sites MUST use this function — any drift
+/// would silently break the foreground-vs-daemon collision guard by making
+/// it check a non-existent lock file path.
+///
+/// Format: SHA-256 of the canonical path as UTF-8, first 16 bytes hex-encoded
+/// (32 characters). Canonicalization falls back to the input path if the
+/// target doesn't exist, so the function is infallible and usable from any
+/// call site, including pre-creation foreground guards.
+pub(crate) fn repo_hash(repo_dir: &Path) -> String {
+    let canonical = repo_dir
+        .canonicalize()
+        .unwrap_or_else(|_| repo_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 // ── Run entry ───────────────────────────────────────────────────────
 
 /// Persistent metadata for a single arc run.
@@ -377,13 +400,12 @@ impl RunRegistry {
     // ── Internal helpers ────────────────────────────────────────────
 
     /// Compute SHA-256 hash of a repo path for the lock filename.
+    ///
+    /// Delegates to the module-level [`repo_hash`] function so that the
+    /// foreground collision guard at `commands::run::check_daemon_repo_lock`
+    /// and the daemon's lock acquisition share exactly one definition.
     fn repo_hash(repo_dir: &Path) -> String {
-        let canonical = repo_dir
-            .canonicalize()
-            .unwrap_or_else(|_| repo_dir.to_path_buf());
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        hex::encode(&hasher.finalize()[..16])
+        repo_hash(repo_dir)
     }
 
     /// Acquire a per-repo advisory lock.

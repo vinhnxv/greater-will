@@ -501,23 +501,16 @@ fn preflight_tmux() -> Result<()> {
 /// the lock, we release it immediately — the real owner is whoever holds it
 /// next.
 ///
-/// Hash format must match `RunRegistry::repo_hash` (SHA-256 of the
-/// canonical path, first 16 bytes hex-encoded — 32 chars). Any drift would
-/// make the check a silent no-op.
+/// Uses [`crate::daemon::registry::repo_hash`] for the hash computation so
+/// this guard and the daemon always agree on the lock file path. If the
+/// hash ever needs to change, updating that single function updates both
+/// the daemon's lock acquisition and this guard atomically.
 ///
 /// Missing lock file == no daemon run == pass. We do NOT create the lock.
 fn check_daemon_repo_lock(cwd: &Path) -> Result<()> {
     use fs2::FileExt;
-    use sha2::{Digest, Sha256};
 
-    // Canonicalize to match the daemon's path resolution. If canonicalization
-    // fails (e.g., the path is newly created or a symlink target is missing),
-    // fall back to the as-provided path — the hash will simply not match the
-    // daemon's, so we pass through instead of producing a false positive.
-    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let repo_hash = hex::encode(&hasher.finalize()[..16]);
+    let repo_hash = crate::daemon::registry::repo_hash(cwd);
 
     let lock_path = crate::daemon::state::gw_home()
         .join("repos")
