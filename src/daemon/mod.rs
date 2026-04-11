@@ -106,6 +106,7 @@ fn write_crashloop_flag(path: &Path, crash_count: u32) -> Result<()> {
     // suppressing the crash-loop banner.
     let tmp_path = path.with_extension("flag.tmp");
     {
+        // Atomic: tempfile + rename guarantees either the old or new file is visible, never a partial write.
         let mut f = std::fs::File::create(&tmp_path).wrap_err_with(|| {
             format!(
                 "failed to create crash loop flag tempfile at {}",
@@ -118,6 +119,7 @@ fn write_crashloop_flag(path: &Path, crash_count: u32) -> Result<()> {
                 tmp_path.display()
             )
         })?;
+        // Force fsync before rename so a crash between rename and flush can't lose the new content.
         f.sync_all().wrap_err_with(|| {
             format!(
                 "failed to fsync crash loop flag tempfile at {}",
