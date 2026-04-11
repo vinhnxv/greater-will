@@ -95,8 +95,42 @@ fn write_crashloop_flag(path: &Path, crash_count: u32) -> Result<()> {
     };
     let json =
         serde_json::to_string_pretty(&flag).wrap_err("failed to serialize crash loop flag")?;
-    std::fs::write(path, json)
-        .wrap_err_with(|| format!("failed to write crash loop flag at {}", path.display()))?;
+
+    // Atomic write: stage into a sibling tempfile, fsync, then POSIX
+    // rename into place.  `rename(2)` within a single filesystem is
+    // atomic, so `read_crashloop_flag` can never observe a torn write
+    // — it sees either the old contents or the new, never partial JSON.
+    // `std::fs::write` (the previous implementation) truncates-then-
+    // writes, so an interrupted write (power loss, disk full, OOM kill)
+    // would leave a half-written file that parses as None, silently
+    // suppressing the crash-loop banner.
+    let tmp_path = path.with_extension("flag.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp_path).wrap_err_with(|| {
+            format!(
+                "failed to create crash loop flag tempfile at {}",
+                tmp_path.display()
+            )
+        })?;
+        f.write_all(json.as_bytes()).wrap_err_with(|| {
+            format!(
+                "failed to write crash loop flag tempfile at {}",
+                tmp_path.display()
+            )
+        })?;
+        f.sync_all().wrap_err_with(|| {
+            format!(
+                "failed to fsync crash loop flag tempfile at {}",
+                tmp_path.display()
+            )
+        })?;
+    }
+    std::fs::rename(&tmp_path, path).wrap_err_with(|| {
+        format!(
+            "failed to atomically rename crash loop flag into {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -388,5 +422,47 @@ mod tests {
         let flag_path = crashloop_flag_path(dir.path());
         std::fs::write(&flag_path, b"not json {{{").unwrap();
         assert!(read_crashloop_flag(dir.path()).is_none());
+    }
+
+    /// Regression test for CDX-GAP-002.  A pre-existing torn / partial
+    /// write at the flag path (simulating a crash during a prior
+    /// `write_crashloop_flag` via `std::fs::write`) must be fully
+    /// replaced by a subsequent atomic write — not merged with or
+    /// silently shadowed by the partial content.
+    ///
+    /// Before the fix, `std::fs::write` would truncate-then-write and a
+    /// crash mid-write could leave the file unparseable (making
+    /// `read_crashloop_flag` return None).  The tempfile+rename pattern
+    /// guarantees the next read sees either the old contents or the
+    /// fully-written new contents — never a torn state.
+    #[test]
+    fn write_crashloop_flag_replaces_partial_file_atomically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let flag_path = crashloop_flag_path(dir.path());
+
+        // Simulate a torn prior write: unparseable partial JSON at the target.
+        std::fs::write(&flag_path, b"{\"timestamp\": 42, \"crash_coun").unwrap();
+        // Sanity check: the partial must not parse.
+        assert!(
+            read_crashloop_flag(dir.path()).is_none(),
+            "test precondition: partial file should not parse"
+        );
+
+        // Atomic write must fully replace the partial content.
+        write_crashloop_flag(&flag_path, 7).expect("atomic write should succeed");
+
+        let parsed = read_crashloop_flag(dir.path())
+            .expect("flag should parse after atomic write replaces partial file");
+        assert_eq!(parsed.crash_count, 7);
+        assert!(parsed.message.contains("7 crashes"));
+        assert!(parsed.timestamp > 0);
+
+        // The sibling tempfile must not linger after a successful rename.
+        let tmp_path = flag_path.with_extension("flag.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "tempfile {} should be gone after atomic rename",
+            tmp_path.display()
+        );
     }
 }
