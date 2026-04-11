@@ -14,6 +14,7 @@ use color_eyre::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::warn;
 
 /// Dispatch a daemon action.
 pub fn execute(action: DaemonAction) -> Result<()> {
@@ -290,6 +291,19 @@ fn cmd_status() -> Result<()> {
 /// `~/.gw/crashloop.flag` because the writer honors `$GW_HOME`, and the
 /// recovery instructions must reference the same path the writer used.
 fn print_crashloop_banner(flag: &crate::daemon::CrashLoopFlag, flag_path: &Path) {
+    // Emit a structured tracing event FIRST so launchd-captured stderr
+    // (daemon.stderr.log) and any other tracing sinks record the alert
+    // even when stdout is not being watched.  `println!` below is for
+    // interactive `gw daemon status` operators; this `warn!` is for log
+    // scrapers and on-call tooling.
+    warn!(
+        target: "daemon::crashloop",
+        crash_count = flag.crash_count,
+        flag_path = %flag_path.display(),
+        last_error = %flag.last_error.as_deref().unwrap_or("unknown"),
+        "crash-loop detector tripped — daemon halted, manual recovery required"
+    );
+
     let bar = "━".repeat(60);
     let log_path = flag_path
         .parent()
