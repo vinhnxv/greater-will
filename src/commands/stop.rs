@@ -18,12 +18,23 @@ use std::io::{self, Write};
 /// Sends a StopRun request for the given run ID and displays
 /// the result, including the last checkpoint phase if available.
 pub fn execute(run_id: String, force: bool, detach: bool) -> Result<()> {
+    let short = crate::commands::util::short_id(&run_id);
+
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
+        // Plan B2 fallback: when the daemon is down, still attempt a direct
+        // tmux kill so an orphaned arc session gets cleaned up. The helper
+        // downgrades any tmux error (missing session, tmux not installed)
+        // to a tracing warning and returns Ok, so a missing session is never
+        // surfaced as a command failure.
+        let _ = crate::session::kill_session(&run_id);
+        println!(
+            "{} Attempted direct tmux kill for session {}.",
+            tag("OK"),
+            short,
+        );
         return Ok(());
     }
-
-    let short = crate::commands::util::short_id(&run_id);
 
     // Confirmation prompt (unless --force)
     if !force {
