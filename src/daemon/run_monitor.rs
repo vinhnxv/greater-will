@@ -602,14 +602,26 @@ impl DaemonRunMonitor {
 impl DaemonRunMonitor {
     async fn check_session_alive(&mut self) -> Option<DaemonRunOutcome> {
         if !self.has_session().await {
-            // Session vanished. Disambiguate completion vs crash using run age.
+            // Session vanished. Disambiguate completion vs crash using 3 signals:
+            //   1. Run age too young → crash (can't have legitimately finished yet)
+            //   2. No completion signal ever seen → crash (likely external kill)
+            //   3. Old enough + completion signal observed → completed
+            //
+            // BACK-001: Without the completion-signal check, a forcibly-killed
+            // tmux session (e.g., `tmux kill-session` by user, or another
+            // process reaping the session) was incorrectly reported as
+            // Completed, polluting run telemetry with false successes.
             let age = self.run_started_at.elapsed().as_secs();
             if age < MIN_COMPLETION_AGE_SECS {
                 return Some(DaemonRunOutcome::Crashed {
                     reason: format!("tmux session vanished at age {}s (below min)", age),
                 });
             }
-            // Old enough — treat as likely-complete unless loop state says crash.
+            if self.completion_detected_at.is_none() {
+                return Some(DaemonRunOutcome::Crashed {
+                    reason: "tmux session vanished without completion signal".to_string(),
+                });
+            }
             return Some(DaemonRunOutcome::Completed);
         }
         None
