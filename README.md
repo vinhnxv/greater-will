@@ -74,10 +74,11 @@ gw daemon stop
 
 #### Recovering from a crash-loop halt
 
-The daemon trips a circuit breaker if it crashes `GW_MAX_CRASH_RETRIES` times
-(default 5) within `GW_CRASH_WINDOW_SECS` (default 900s / 15 min). It writes
+The daemon trips a circuit breaker if it crashes 5 times within 30 seconds
+(thresholds are currently hardcoded in `src/daemon/mod.rs::start_daemon` —
+tracked for env-var configurability in a follow-up plan). It writes
 `$GW_HOME/crashloop.flag` (default `~/.gw/crashloop.flag`) and refuses to restart
-until the flag is cleared.
+until the flag is cleared. The detector resets after 300 seconds of stable uptime.
 
 ```bash
 # 1. Inspect — gw daemon status prints a recovery banner when the flag is set

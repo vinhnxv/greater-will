@@ -80,10 +80,12 @@ gw daemon uninstall
 
 ## 6. Crash loop recovery
 
-When the daemon crashes `GW_MAX_CRASH_RETRIES` times (default 5) within
-`GW_CRASH_WINDOW_SECS` (default 900s / 15 min), the circuit breaker writes
-`$GW_HOME/crashloop.flag` and refuses to start. `gw daemon status` prints a
-recovery banner showing the flag path.
+When the daemon crashes 5 times within 30 seconds, the circuit breaker writes
+`$GW_HOME/crashloop.flag` and refuses to start. The detector is implemented in
+`src/daemon/mod.rs::start_daemon` via `CrashLoopDetector::new(5, 30, 300)`
+(5 crashes / 30-second window / 300-second stability reset). These thresholds
+are currently hardcoded — env-var configurability is tracked for a follow-up plan.
+`gw daemon status` prints a recovery banner showing the actual flag path.
 
 To recover:
 
