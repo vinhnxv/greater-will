@@ -56,6 +56,11 @@ impl HeartbeatMonitor {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            // Default MissedTickBehavior is Burst: if a tick is missed (e.g., check_all_runs
+            // took longer than HEARTBEAT_INTERVAL under load), the next tick fires immediately
+            // with 0 delay, producing back-to-back ticks. Skip missed ticks instead to keep
+            // the cadence steady under stress.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             info!("heartbeat monitor started (interval: {:?})", HEARTBEAT_INTERVAL);
 
             loop {
@@ -70,12 +75,15 @@ impl HeartbeatMonitor {
         let registry = self.registry.lock().await;
 
         // Collect run IDs to check (avoid holding lock during tmux calls).
-        // Only include entries with a tmux session — entries without one
-        // (e.g., queued runs) are skipped to avoid inflating the dead count.
+        // Include both Running AND Queued — a run that crashed between
+        // register_run() (Queued) and update_status(Running) would otherwise
+        // be invisible to the heartbeat and stay stuck forever. Queued entries
+        // without a tmux session are no-ops: check_run returns early at the
+        // `tmux_session.is_none()` guard.
         let running: Vec<String> = registry
             .list_runs(false)
             .iter()
-            .filter(|r| r.status == RunStatus::Running)
+            .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
             .map(|r| r.run_id.clone())
             .collect();
 
@@ -103,11 +111,16 @@ impl HeartbeatMonitor {
         let tmux_session = {
             let registry = self.registry.lock().await;
             match registry.get(run_id) {
-                Some(entry) if entry.status == RunStatus::Running => {
+                Some(entry)
+                    if matches!(
+                        entry.status,
+                        RunStatus::Running | RunStatus::Queued
+                    ) =>
+                {
                     entry.tmux_session.clone()
                 }
                 _ => {
-                    // Entry gone or no longer running — clean up tracking state
+                    // Entry gone or no longer active — clean up tracking state
                     self.clear_run_tracking(run_id);
                     return false;
                 }
@@ -221,7 +234,7 @@ impl HeartbeatMonitor {
 
         let mut registry = self.registry.lock().await;
         let entry = match registry.get_mut(run_id) {
-            Some(e) if e.status == RunStatus::Running => e,
+            Some(e) if matches!(e.status, RunStatus::Running | RunStatus::Queued) => e,
             _ => return,
         };
 
@@ -235,7 +248,10 @@ impl HeartbeatMonitor {
                 reason = %death_reason,
                 "checkpoint found — scheduling crash recovery"
             );
-            entry.crash_restarts += 1;
+            // NOTE: crash_restarts is incremented later in spawn_recovery after the
+            // spawn_claude_session call succeeds. Pre-incrementing here would burn a
+            // retry slot even when the daemon crashes between this point and the
+            // actual recovery attempt.
             entry.current_phase = Some("recovering".to_string());
 
             // Log the crash recovery event WITH the diagnosis reason
@@ -324,7 +340,14 @@ impl HeartbeatMonitor {
     }
 
     /// Append captured pane content to the pane log (raw tmux capture).
+    ///
+    /// Rotates the log file to `pane.log.1` when it exceeds `PANE_LOG_ROTATE_BYTES`
+    /// to bound disk usage — without rotation, a 12h run accumulates ~21 MB of
+    /// pane captures, and `diagnose_session_death` would try to read all of it.
     fn append_pane_log(&self, run_id: &str, content: &str) {
+        /// Rotate pane.log when it grows past this size (10 MiB).
+        const PANE_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
         let log_dir = gw_home().join("runs").join(run_id).join("logs");
         if let Err(e) = std::fs::create_dir_all(&log_dir) {
             debug!(error = %e, "failed to create log directory");
@@ -332,6 +355,19 @@ impl HeartbeatMonitor {
         }
 
         let log_path = log_dir.join("pane.log");
+
+        // Rotate if the current log has grown past the threshold. Best-effort:
+        // metadata/rename failures degrade to "no rotation this tick" rather
+        // than aborting the append.
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > PANE_LOG_ROTATE_BYTES {
+                let rotated = log_path.with_extension("log.1");
+                if let Err(e) = std::fs::rename(&log_path, &rotated) {
+                    debug!(error = %e, "failed to rotate pane.log");
+                }
+            }
+        }
+
         use std::io::Write;
         match std::fs::OpenOptions::new()
             .create(true)
@@ -353,6 +389,11 @@ impl HeartbeatMonitor {
     async fn update_phase_from_pane(&self, run_id: &str, pane_content: &str) {
         // Try checkpoint.json first — this is the authoritative source
         let checkpoint_phase = self.read_phase_from_checkpoint(run_id).await;
+        // Capture whether the checkpoint independently confirms completion,
+        // BEFORE we move `checkpoint_phase` into the phase-update path below.
+        // Used later as a cross-check gate against pane-text false positives
+        // (Claude writing documentation containing "arc completed", etc.).
+        let cp_confirms_completion = checkpoint_phase.as_deref() == Some("complete");
 
         // Fall back to pane heuristics only when checkpoint is unavailable
         let phase = if let Some(cp_phase) = checkpoint_phase {
@@ -393,10 +434,40 @@ impl HeartbeatMonitor {
             }
         }
 
-        // Check for pipeline completion
-        if is_pipeline_complete(pane_content) {
-            info!(run_id = %run_id, "pipeline completed (pane text match)");
-            append_event(run_id, "completion_detected", "pipeline completion detected via pane text pattern match");
+        // Check for pipeline completion. Checkpoint.json is the authoritative
+        // source: if it reports phase == "complete", promote the run to
+        // Succeeded regardless of pane text. If checkpoint disagrees (or is
+        // unreadable) and only pane text matches, refuse to mark Succeeded —
+        // `is_pipeline_complete` is a heuristic that false-positives when
+        // Claude writes documentation containing "arc completed",
+        // "pipeline completed", etc.
+        //
+        // Two-gate promotion:
+        //   1. checkpoint says complete  → promote (pane agreement is a bonus)
+        //   2. pane says complete alone  → suppressed as a false positive
+        //   3. neither says complete     → no-op, keep running
+        let pane_says_complete = is_pipeline_complete(pane_content);
+        if !cp_confirms_completion {
+            if pane_says_complete {
+                // FINDING-002 note: checkpoint is the authoritative source.
+                // Pane text is only trusted when checkpoint independently confirms.
+                debug!(
+                    run_id = %run_id,
+                    "pane text matches completion but checkpoint disagrees — ignoring"
+                );
+            }
+            return;
+        }
+
+        // cp_confirms_completion == true from here on.
+        if pane_says_complete {
+            info!(run_id = %run_id, "pipeline completed (pane + checkpoint confirmed)");
+            append_event(run_id, "completion_detected", "pipeline completion detected via pane text pattern match (checkpoint-confirmed)");
+        } else {
+            info!(run_id = %run_id, "pipeline completed (checkpoint authoritative; no pane match)");
+            append_event(run_id, "completion_detected", "pipeline completion detected via checkpoint.json (pane text did not match heuristic)");
+        }
+        {
             let mut registry = self.registry.lock().await;
             // Re-check status: stop_run (or another path) may have mutated the
             // entry between our earlier lock drop and this re-acquisition. If
@@ -523,11 +594,14 @@ async fn spawn_recovery(
                 tmux_session = %tmux_session,
                 "ABORT recovery: session and claude are alive — false positive crash"
             );
-            // Reset status back to Running (undo the crash_restarts increment)
-            // Persist to disk so the counter stays correct across daemon restarts
+            // Reset phase back to "running". Do NOT touch crash_restarts here:
+            // after FINDING-001, the increment lives in the success path below
+            // (after spawn_claude_session), so there is nothing to roll back
+            // when this false-positive abort fires — any saturating_sub would
+            // corrupt the counter for runs that have already survived a real
+            // prior crash restart.
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
-                entry.crash_restarts = entry.crash_restarts.saturating_sub(1);
                 entry.current_phase = Some("running".to_string());
             }
             if let Err(e) = reg.update_status(
@@ -603,11 +677,17 @@ async fn spawn_recovery(
                 return;
             }
 
-            // Update registry with new tmux session and persist to disk
+            // Update registry with new tmux session and persist to disk.
+            // crash_restarts is incremented HERE — after a successful spawn —
+            // rather than pre-incremented in handle_dead_session. This prevents
+            // phantom retries: if the daemon itself crashed between the pre-
+            // increment and this point, the counter would have been burned
+            // without an actual recovery attempt.
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
                 entry.tmux_session = Some(tmux_session.clone());
                 entry.current_phase = Some("resuming".to_string());
+                entry.crash_restarts = entry.crash_restarts.saturating_add(1);
             }
             if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
                 warn!(run_id = %run_id, error = %e, "failed to persist recovery state to disk");
@@ -726,9 +806,12 @@ fn diagnose_session_death(run_id: &str, tmux_session: &str) -> String {
         return reason;
     }
 
-    // 3. Check the last pane log for error patterns
+    // 3. Check the last pane log for error patterns.
+    //    Bound the read to the tail (50 KiB) so a rotated-but-not-yet-reset
+    //    log cannot trigger OOM when a long run accumulates many MB of capture.
     let pane_log = gw_home().join("runs").join(run_id).join("logs").join("pane.log");
-    if let Ok(content) = std::fs::read_to_string(&pane_log) {
+    let content = crate::daemon::server::read_log_tail(&pane_log, Some(50 * 1024));
+    if !content.is_empty() {
         // Check last 50 lines for error patterns
         let tail: String = content.lines().rev().take(50).collect::<Vec<_>>().join("\n");
         let tail_lower = tail.to_lowercase();

@@ -668,7 +668,12 @@ const DEFAULT_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 ///
 /// SEC-004: Bounds the read so an attacker (or a runaway process) cannot
 /// force the daemon to allocate arbitrary memory for a single IPC call.
-fn read_log_tail(path: &Path, tail: Option<usize>) -> String {
+///
+/// `pub(crate)`: also used by `heartbeat::diagnose_session_death` so that
+/// the session-death diagnosis path does not `read_to_string` a multi-MB
+/// pane log into memory. Keep the visibility tight — callers outside the
+/// `daemon` module should go through the IPC boundary.
+pub(crate) fn read_log_tail(path: &Path, tail: Option<usize>) -> String {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = match std::fs::File::open(path) {
