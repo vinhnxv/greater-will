@@ -1,9 +1,3 @@
-// SHARD 3: module is created in isolation. Nothing in the crate calls
-// `DaemonRunMonitor::{new, run}` yet — Shard 4 wires it into
-// `HeartbeatMonitor`. Suppress dead-code warnings at the module level so
-// the unwired skeleton doesn't trip `-D warnings` in CI.
-#![allow(dead_code)]
-
 //! Per-run async monitor task.
 //!
 //! Async equivalent of [`crate::engine::single_session::monitor::monitor_session`]
@@ -25,9 +19,9 @@
 //!   `file_on_disk && !active` (intentional deactivation → completion) from
 //!   `!file_on_disk` (file deleted → crash).
 //!
-//! ## Wiring (Shard 4 — NOT part of this shard)
+//! ## Wiring (Shard 4 — complete)
 //!
-//! This module is created in isolation. Shard 4 will wire it into
+//! This module is wired into
 //! [`crate::daemon::heartbeat::HeartbeatMonitor`] replacing the 4-feature
 //! implementation with full parity.
 
@@ -115,12 +109,18 @@ struct PendingKillRequest {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Per-run async monitor task. One instance per daemon run.
+// TODO: refactor — this struct has 30+ fields spanning 6+ concerns (identity, timing,
+// watchdog, phase tracking, idle detection, checkpoint tracking, etc.). Extract coherent
+// sub-structs (e.g. ActivityTracker, CheckpointTracker, LoopStateTracker, KillGate)
+// to improve testability and reduce single-responsibility violation.
 pub struct DaemonRunMonitor {
     // Identity
     run_id: String,
     tmux_session: String,
     repo_dir: PathBuf,
+    #[allow(dead_code)]
     plan_path: PathBuf,
+    #[allow(dead_code)]
     config_dir: Option<PathBuf>,
 
     // Registry reference (for status updates — Shard 4 uses this)
@@ -246,7 +246,7 @@ impl DaemonRunMonitor {
             tmux_session,
             repo_dir: entry.repo_dir.clone(),
             plan_path: entry.plan_path.clone(),
-            config_dir: None, // Shard 4: populate from CLAUDE_CONFIG_DIR if set
+            config_dir: entry.config_dir.clone(),
             registry,
             run_started_at,
             dispatch_time: now,
@@ -276,7 +276,7 @@ impl DaemonRunMonitor {
             transition_nudge_count: 0,
             in_failed_since: None,
             failed_nudge_count: 0,
-            claude_pid: None,
+            claude_pid: entry.claude_pid,
             last_process_gone_at: None,
             prompt_acceptor,
             last_status_log: now,
@@ -448,7 +448,7 @@ impl DaemonRunMonitor {
     async fn kill_session(&self) -> bool {
         let session = self.tmux_session.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::session::spawn::kill_session(&session);
+            let _ = crate::session::spawn::kill_session(&session);
             Ok::<(), color_eyre::eyre::Error>(())
         })
         .await
@@ -628,10 +628,7 @@ impl DaemonRunMonitor {
     }
 
     fn check_process_liveness(&mut self) -> Option<DaemonRunOutcome> {
-        let pid = match self.claude_pid {
-            Some(p) => p,
-            None => return None,
-        };
+        let pid = self.claude_pid?;
         if !crate::cleanup::process::is_pid_alive(pid) {
             let now = Instant::now();
             let first_gone = *self.last_process_gone_at.get_or_insert(now);
@@ -877,7 +874,7 @@ impl DaemonRunMonitor {
             checkpoint_stale_secs: Some(self.last_checkpoint_activity.elapsed().as_secs()),
             process_alive: self
                 .claude_pid
-                .map_or(true, crate::cleanup::process::is_pid_alive),
+                .is_none_or(crate::cleanup::process::is_pid_alive),
             artifacts_active: self.last_artifact_activity.elapsed().as_secs() < 60,
             // Swarm activity is updated by an external task; default false for now.
             swarm_active: false,

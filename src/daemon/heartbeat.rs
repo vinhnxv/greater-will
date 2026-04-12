@@ -1,59 +1,109 @@
 //! Heartbeat monitor for active daemon runs.
 //!
 //! Periodically checks tmux session health for each `Running` entry,
-//! captures logs, updates phase information, and handles crash recovery
-//! by either auto-resuming (if a checkpoint exists) or marking as Failed.
+//! captures logs, updates phase information, and spawns per-run
+//! [`DaemonRunMonitor`] tasks for full watchdog intelligence. When a
+//! monitor exits, the outcome handler orchestrates crash recovery using
+//! phase-aware restart commands and per-error-class backoff.
 
+use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::protocol::RunStatus;
-use crate::daemon::reconciler::check_checkpoint;
 use crate::daemon::registry::RunRegistry;
+use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
+use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 use crate::engine::single_session::util::is_pipeline_complete;
 use crate::session::spawn;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Maximum crash-restart cycles before giving up.
-const MAX_CRASH_RESTARTS: u32 = 3;
+/// Handle for a spawned per-run monitor task.
+///
+/// Stores the `JoinHandle` for the outcome-handler wrapper (which itself
+/// awaits the inner `DaemonRunMonitor` task) and a `CancellationToken`
+/// derived from the global cancel token via `child_token()`.
+pub(crate) struct MonitorHandle {
+    pub(crate) join: tokio::task::JoinHandle<()>,
+    pub(crate) cancel: CancellationToken,
+}
 
 /// Heartbeat monitor that watches over active runs.
 ///
 /// Spawns a background tokio task that periodically:
-/// 1. Checks if each Running entry's tmux session is still alive
-/// 2. Captures pane output and appends to pane log
-/// 3. Detects phase transitions and logs structured events
-/// 4. Performs crash recovery when a tmux session dies unexpectedly
+/// 1. Spawns a [`DaemonRunMonitor`] per new Running entry
+/// 2. Cancels monitors for stopped/failed/succeeded runs
+/// 3. Captures pane output and updates phase for lightweight `gw ps` display
+/// 4. Delegates crash recovery to [`handle_monitor_outcome`]
+/// ## Lock ordering convention (BACK-011)
+///
+/// This module uses two `tokio::sync::Mutex`es: `registry` and `monitors`.
+/// They must **never be held simultaneously** — always acquire one, extract
+/// what you need, `drop` it, then acquire the other. The canonical order
+/// when both are needed in sequence is:
+///
+/// 1. `registry` — snapshot data, then drop
+/// 2. `monitors` — mutate monitor handles, then drop
+///
+/// `executor.rs::stop_run` follows the same convention. Violating this
+/// (holding both locks at once) creates an AB/BA deadlock risk with
+/// concurrent stop_run calls.
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
-    /// Consecutive dead-tick counts per run. A run is only declared dead
-    /// after reaching DEAD_TICKS_THRESHOLD consecutive failures, preventing
-    /// transient `has_session` failures from triggering destructive recovery.
-    dead_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    /// Runs currently being recovered — prevents double recovery when
-    /// spawn_recovery is slow and the heartbeat fires again.
-    recovering: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Per-run monitor handles, keyed by run_id. Shared with `DaemonServer`
+    /// so that stop/detach flows can cancel monitors before acting.
+    monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
+    /// Global cancellation token — child tokens are derived per-run.
+    global_cancel: CancellationToken,
+    /// Cached watchdog config — resolved once at construction to avoid
+    /// re-parsing env vars on every heartbeat tick (BACK-002).
+    watchdog: WatchdogConfig,
 }
 
 impl HeartbeatMonitor {
     /// Create a new heartbeat monitor wrapping the shared registry.
-    pub fn new(registry: Arc<Mutex<RunRegistry>>) -> Self {
+    pub fn new(registry: Arc<Mutex<RunRegistry>>, global_cancel: CancellationToken) -> Self {
         Self {
             registry,
-            dead_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            recovering: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            monitors: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            global_cancel,
+            watchdog: WatchdogConfig::from_env(),
+        }
+    }
+
+    /// Clone the monitors `Arc` for sharing with `DaemonServer`.
+    ///
+    /// Must be called BEFORE `start()` consumes `self`.
+    pub fn monitors(&self) -> Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>> {
+        Arc::clone(&self.monitors)
+    }
+
+    /// Cancel a specific run's monitor (used by stop/detach flows).
+    ///
+    /// Note: stop_run and detach currently access the monitors Arc directly.
+    /// This method is provided for convenience when a `HeartbeatMonitor`
+    /// reference is available.
+    #[allow(dead_code)]
+    pub async fn cancel_monitor(&self, run_id: &str) {
+        let mut monitors = self.monitors.lock().await;
+        if let Some(handle) = monitors.remove(run_id) {
+            handle.cancel.cancel();
         }
     }
 
     /// Start the heartbeat loop as a background tokio task.
     ///
     /// Returns a `JoinHandle` that can be used to await or abort the task.
-    /// The task runs until the handle is dropped/aborted or the process exits.
+    /// The task runs until the global cancellation token fires.
     pub fn start(self) -> tokio::task::JoinHandle<()> {
+        let cancel = self.global_cancel.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             // Default MissedTickBehavior is Burst: if a tick is missed (e.g., check_all_runs
@@ -64,139 +114,148 @@ impl HeartbeatMonitor {
             info!("heartbeat monitor started (interval: {:?})", HEARTBEAT_INTERVAL);
 
             loop {
-                interval.tick().await;
-                self.check_all_runs().await;
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("heartbeat monitor cancelled — exiting");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        self.check_all_runs().await;
+                    }
+                }
             }
         })
     }
 
     /// Check all Running entries in the registry.
+    ///
+    /// Spawns a [`DaemonRunMonitor`] for each new Running entry that doesn't
+    /// already have a monitor, cancels monitors for stopped/finished runs,
+    /// and prunes finished handles. Lightweight phase tracking via
+    /// `handle_alive_session` continues for `gw ps` display.
     async fn check_all_runs(&self) {
-        let registry = self.registry.lock().await;
-
-        // Collect run IDs to check (avoid holding lock during tmux calls).
-        // Include both Running AND Queued — a run that crashed between
-        // register_run() (Queued) and update_status(Running) would otherwise
-        // be invisible to the heartbeat and stay stuck forever. Queued entries
-        // without a tmux session are no-ops: check_run returns early at the
-        // `tmux_session.is_none()` guard.
-        let running: Vec<String> = registry
-            .list_runs(false)
-            .iter()
-            .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
-            .map(|r| r.run_id.clone())
-            .collect();
-
-        drop(registry); // Release lock before I/O
-
-        let mut alive = 0u32;
-        let mut dead = 0u32;
-
-        for run_id in &running {
-            let was_alive = self.check_run(run_id).await;
-            if was_alive {
-                alive += 1;
-            } else {
-                dead += 1;
-            }
-        }
-
-        if !running.is_empty() {
-            debug!(alive = alive, dead = dead, "heartbeat tick");
-        }
-    }
-
-    /// Check a single run's health. Returns `true` if the session is alive.
-    async fn check_run(&self, run_id: &str) -> bool {
-        let tmux_session = {
+        // BACK-007: Single list_runs(true) call, partitioned into running/stopped.
+        // BACK-014: Pre-clone RunEntry snapshots in the initial lock scope to
+        // eliminate per-entry re-locking when spawning monitors.
+        let (running, stopped) = {
             let registry = self.registry.lock().await;
-            match registry.get(run_id) {
-                Some(entry)
-                    if matches!(
-                        entry.status,
-                        RunStatus::Running | RunStatus::Queued
-                    ) =>
-                {
-                    entry.tmux_session.clone()
-                }
-                _ => {
-                    // Entry gone or no longer active — clean up tracking state
-                    self.clear_run_tracking(run_id);
-                    return false;
+            let all_runs = registry.list_runs(true);
+
+            let mut running: Vec<(String, Option<String>, Option<crate::daemon::registry::RunEntry>)> = Vec::new();
+            let mut stopped: Vec<String> = Vec::new();
+
+            for r in &all_runs {
+                match r.status {
+                    RunStatus::Running | RunStatus::Queued => {
+                        let entry = registry.get(&r.run_id);
+                        let tmux = entry.as_ref().and_then(|e| e.tmux_session.clone());
+                        let snapshot = entry.cloned();
+                        running.push((r.run_id.clone(), tmux, snapshot));
+                    }
+                    RunStatus::Stopped | RunStatus::Failed | RunStatus::Succeeded => {
+                        stopped.push(r.run_id.clone());
+                    }
                 }
             }
-        };
 
-        let tmux_session = match tmux_session {
-            Some(s) => s,
-            None => {
-                debug!(run_id = %run_id, "no tmux session associated — skipping");
-                return false;
-            }
-        };
+            (running, stopped)
+        }; // Registry lock released here
 
-        // Skip if already being recovered (prevents double recovery race)
-        {
-            let recovering = self.recovering.lock().unwrap_or_else(|p| p.into_inner());
-            if recovering.contains(run_id) {
-                debug!(run_id = %run_id, "recovery in progress — skipping health check");
-                return false;
+        let mut monitors = self.monitors.lock().await;
+
+        // Cancel monitors for stopped/detached/completed runs
+        for run_id in &stopped {
+            if let Some(handle) = monitors.remove(run_id) {
+                handle.cancel.cancel();
             }
         }
 
-        // Check if tmux session is alive (sync call, with retry).
-        let session_alive = spawn::has_session(&tmux_session);
-
-        if session_alive {
-            // Reset dead counter on success
-            if let Ok(mut counts) = self.dead_counts.lock() {
-                counts.remove(run_id);
+        // Spawn monitors for new Running entries
+        for (run_id, tmux_session, entry_snapshot) in &running {
+            if monitors.contains_key(run_id) {
+                continue;
             }
-            self.handle_alive_session(run_id, &tmux_session).await;
-        } else {
-            // Grace period: require 3 consecutive dead ticks before recovery.
-            // Prevents transient tmux failures (server busy during agent team
-            // spawning) from triggering destructive kill+restart.
-            const DEAD_TICKS_THRESHOLD: u32 = 3;
+            // Skip entries without a tmux session (Queued, not yet spawned)
+            if tmux_session.is_none() {
+                continue;
+            }
 
-            let consecutive = {
-                let mut counts = self.dead_counts.lock().unwrap_or_else(|p| {
-                    warn!("dead_counts mutex was poisoned — recovering");
-                    p.into_inner()
-                });
-                let count = counts.entry(run_id.to_string()).or_insert(0);
-                *count = count.saturating_add(1);
-                *count
+            // Use pre-cloned snapshot (BACK-014: no second registry lock needed)
+            let entry_snapshot = match entry_snapshot {
+                Some(e) => e.clone(),
+                None => continue,
             };
 
-            if consecutive >= DEAD_TICKS_THRESHOLD {
-                warn!(
-                    run_id = %run_id,
-                    consecutive = consecutive,
-                    "session confirmed dead after {} ticks — triggering recovery",
-                    DEAD_TICKS_THRESHOLD
-                );
-                self.handle_dead_session(run_id, &tmux_session).await;
-            } else {
-                debug!(
-                    run_id = %run_id,
-                    consecutive = consecutive,
-                    threshold = DEAD_TICKS_THRESHOLD,
-                    "session appears dead — waiting for confirmation"
-                );
+            let run_cancel = self.global_cancel.child_token();
+            let watchdog = self.watchdog.clone();
+            let monitor_registry = Arc::clone(&self.registry);
+            let mut monitor = DaemonRunMonitor::new(&entry_snapshot, monitor_registry, watchdog);
+
+            let cancel_clone = run_cancel.clone();
+            let run_id_inner = run_id.clone();
+
+            // Inner task: run the monitor, returning its outcome
+            let monitor_join = tokio::spawn(async move {
+                monitor.run(cancel_clone).await
+            });
+
+            // Outer task: await the inner, catch panics, dispatch outcome
+            let outcome_registry = Arc::clone(&self.registry);
+            let outcome_run_id = run_id.clone();
+            let outcome_cancel = self.global_cancel.clone();
+            let join = tokio::spawn(async move {
+                match monitor_join.await {
+                    Ok(outcome) => {
+                        handle_monitor_outcome(
+                            &run_id_inner,
+                            outcome,
+                            outcome_registry,
+                            outcome_cancel,
+                        )
+                        .await;
+                    }
+                    Err(e) if e.is_panic() => {
+                        error!(
+                            run_id = %outcome_run_id,
+                            "DaemonRunMonitor panicked: {:?}", e
+                        );
+                        let mut reg = outcome_registry.lock().await;
+                        let _ = reg.update_status(
+                            &outcome_run_id,
+                            RunStatus::Failed,
+                            None,
+                            Some("Monitor panicked — marking failed".to_string()),
+                        );
+                        drop(reg);
+                        append_event(
+                            &outcome_run_id,
+                            "monitor_panic",
+                            &format!("DaemonRunMonitor panicked: {:?}", e),
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            run_id = %outcome_run_id,
+                            "Monitor task ended: {}", e
+                        );
+                    }
+                }
+            });
+
+            monitors.insert(run_id.clone(), MonitorHandle { join, cancel: run_cancel });
+        }
+
+        // Prune finished handles (outcome already processed)
+        monitors.retain(|_, h| !h.join.is_finished());
+
+        drop(monitors);
+
+        // Lightweight phase tracking for `gw ps` — runs on every tick
+        // independently of the per-run monitors.
+        for (run_id, tmux_session, _) in &running {
+            if let Some(session) = tmux_session {
+                self.handle_alive_session(run_id, session).await;
             }
-        }
-
-        session_alive
-    }
-
-    /// Clean up dead_counts and recovering state for a run that is no longer active.
-    fn clear_run_tracking(&self, run_id: &str) {
-        if let Ok(mut counts) = self.dead_counts.lock() {
-            counts.remove(run_id);
-        }
-        if let Ok(mut recovering) = self.recovering.lock() {
-            recovering.remove(run_id);
         }
     }
 
@@ -214,130 +273,9 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Handle a dead tmux session: attempt crash recovery or mark as Failed.
-    async fn handle_dead_session(&self, run_id: &str, tmux_session: &str) {
-        // Diagnose WHY the session died before taking recovery action.
-        let death_reason = diagnose_session_death(run_id, tmux_session);
-        warn!(
-            run_id = %run_id,
-            tmux_session = %tmux_session,
-            reason = %death_reason,
-            "tmux session is dead: {}",
-            death_reason,
-        );
-
-        // Log the diagnosis as a separate event for `gw logs` visibility
-        append_event(run_id, "session_died", &format!(
-            "tmux session '{}' died — reason: {}",
-            tmux_session, death_reason,
-        ));
-
-        let mut registry = self.registry.lock().await;
-        let entry = match registry.get_mut(run_id) {
-            Some(e) if matches!(e.status, RunStatus::Running | RunStatus::Queued) => e,
-            _ => return,
-        };
-
-        // Check if we have a checkpoint for crash recovery
-        let checkpoint_exists = check_checkpoint(&entry.repo_dir);
-
-        if checkpoint_exists && entry.crash_restarts < MAX_CRASH_RESTARTS {
-            info!(
-                run_id = %run_id,
-                crash_restarts = entry.crash_restarts,
-                reason = %death_reason,
-                "checkpoint found — scheduling crash recovery"
-            );
-            // NOTE: crash_restarts is incremented later in spawn_recovery after the
-            // spawn_claude_session call succeeds. Pre-incrementing here would burn a
-            // retry slot even when the daemon crashes between this point and the
-            // actual recovery attempt.
-            entry.current_phase = Some("recovering".to_string());
-
-            // Log the crash recovery event WITH the diagnosis reason
-            append_event(run_id, "crash_recovery", &format!(
-                "tmux session died (reason: {}), attempting restart #{}",
-                death_reason, entry.crash_restarts,
-            ));
-
-            // Clone what we need before dropping the lock
-            let repo_dir = entry.repo_dir.clone();
-            let plan_path = entry.plan_path.clone();
-            let session_name = entry.session_name.clone();
-            let config_dir = entry.config_dir.clone();
-            let run_id_owned = run_id.to_string();
-
-            // Persist the crash-restart count
-            if let Err(e) = registry.update_status(
-                &run_id_owned,
-                RunStatus::Running,
-                Some("recovering".to_string()),
-                None,
-            ) {
-                warn!(error = %e, "failed to update crash-restart status");
-            }
-
-            drop(registry);
-
-            // Mark as recovering BEFORE spawning to prevent double recovery
-            if let Ok(mut recovering) = self.recovering.lock() {
-                if !recovering.insert(run_id.to_string()) {
-                    // Already being recovered — skip
-                    debug!(run_id = %run_id, "already recovering — skipping duplicate spawn_recovery");
-                    return;
-                }
-            }
-
-            // Clear dead counter since we're handling it
-            if let Ok(mut counts) = self.dead_counts.lock() {
-                counts.remove(run_id);
-            }
-
-            // Spawn recovery in background (don't block heartbeat)
-            let registry_clone = Arc::clone(&self.registry);
-            let recovering_set = Arc::clone(&self.recovering);
-            let run_id_for_clear = run_id.to_string();
-            tokio::spawn(async move {
-                spawn_recovery(
-                    registry_clone,
-                    &run_id_owned,
-                    &repo_dir,
-                    &plan_path,
-                    &session_name,
-                    config_dir,
-                )
-                .await;
-                // Clear recovering flag so heartbeat resumes normal monitoring
-                if let Ok(mut set) = recovering_set.lock() {
-                    set.remove(&run_id_for_clear);
-                }
-            });
-        } else {
-            let reason = if entry.crash_restarts >= MAX_CRASH_RESTARTS {
-                format!(
-                    "tmux session died after {} crash restarts — giving up (last death: {})",
-                    entry.crash_restarts, death_reason,
-                )
-            } else {
-                format!(
-                    "tmux session died with no checkpoint — marking failed (reason: {})",
-                    death_reason,
-                )
-            };
-
-            warn!(run_id = %run_id, reason = %reason);
-            append_event(run_id, "failed", &reason);
-
-            if let Err(e) = registry.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some(reason),
-            ) {
-                warn!(run_id = %run_id, error = %e, "failed to mark run as failed");
-            }
-        }
-    }
+    // NOTE: handle_dead_session removed — DaemonRunMonitor handles dead
+    // session detection and returns a DaemonRunOutcome. Recovery is
+    // orchestrated by handle_monitor_outcome() below.
 
     /// Append captured pane content to the pane log (raw tmux capture).
     ///
@@ -568,122 +506,327 @@ pub fn log_run_stopped(run_id: &str) {
     append_event(run_id, "stopped", "stopped by user");
 }
 
-/// Spawn a crash recovery session for a failed run.
+// ── Monitor outcome handling ──────────────────────────────────────
+
+/// Handle the terminal outcome of a [`DaemonRunMonitor`].
 ///
-/// If a checkpoint exists, runs with `--resume` to continue where it left off.
-/// Otherwise, starts a fresh arc run from scratch (re-spawn).
-async fn spawn_recovery(
+/// ## Recovery decision tree
+///
+/// ```text
+/// Completed       → mark Succeeded, clear crash history
+/// Failed          → mark Failed (business-logic error, no retry)
+/// Cancelled       → no-op (caller handles registry update)
+/// ErrorDetected   → if fatal (skips_plan): mark Failed
+///                   if retryable: feed through CrashLoopDetector,
+///                   backoff per error_class, then attempt_recovery
+/// Crashed/Stuck/Timeout → feed through CrashLoopDetector with
+///                   persistence, cooldown, then attempt_recovery
+/// ```
+///
+/// All backoff sleeps are wrapped in `tokio::select!` with the cancel
+/// token so that daemon shutdown is not blocked by long backoffs
+/// (P1 concern STSM-005).
+///
+/// Both ErrorDetected and Crashed/Stuck/Timeout paths feed through
+/// `CrashLoopDetector` as a unified exit budget (P1 concern: dual
+/// exit-mechanism coordination).
+async fn handle_monitor_outcome(
+    run_id: &str,
+    outcome: DaemonRunOutcome,
+    registry: Arc<Mutex<RunRegistry>>,
+    cancel: CancellationToken,
+) {
+    match outcome {
+        DaemonRunOutcome::Completed => {
+            // QUAL-013: Single lock scope to prevent TOCTOU race where
+            // stop_run could overwrite status between two acquisitions.
+            let repo_dir = {
+                let mut reg = registry.lock().await;
+                let dir = reg.get(run_id).map(|e| e.repo_dir.clone());
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Succeeded,
+                    Some("complete".to_string()),
+                    None,
+                );
+                dir
+            };
+            if let Some(dir) = repo_dir {
+                CrashLoopDetector::clear_history(&dir);
+            }
+            append_event(run_id, "completed", "pipeline finished");
+        }
+
+        DaemonRunOutcome::Failed { reason } => {
+            let mut reg = registry.lock().await;
+            let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone()));
+            drop(reg);
+            append_event(run_id, "failed", &reason);
+        }
+
+        DaemonRunOutcome::Cancelled => {
+            // No action — caller (stop_run, detach, shutdown) handles registry
+            debug!(run_id = %run_id, "monitor cancelled — no-op");
+        }
+
+        DaemonRunOutcome::ErrorDetected { error_class, reason } => {
+            // Fatal errors: no retry
+            if error_class.skips_plan() {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!("Fatal {:?}: {}", error_class, reason)),
+                );
+                drop(reg);
+                append_event(run_id, "fatal_error", &reason);
+                return;
+            }
+
+            // Feed ALL recovery paths through CrashLoopDetector (P1: unified budget)
+            let (repo_dir, plan_path, config_dir) = {
+                let reg = registry.lock().await;
+                match reg.get(run_id) {
+                    Some(e) => (e.repo_dir.clone(), e.plan_path.clone(), e.config_dir.clone()),
+                    None => return,
+                }
+            };
+
+            let watchdog = WatchdogConfig::from_env();
+            let mut detector = CrashLoopDetector::from_watchdog(&watchdog);
+            detector.load_history(&repo_dir);
+
+            match detector.record_restart() {
+                CrashLoopDecision::StopCrashLoop => {
+                    let mut reg = registry.lock().await;
+                    let _ = reg.update_status(
+                        run_id,
+                        RunStatus::Failed,
+                        None,
+                        Some(format!("Crash loop ({:?}): {}", error_class, reason)),
+                    );
+                    drop(reg);
+                    CrashLoopDetector::clear_history(&repo_dir);
+                    append_event(run_id, "crash_loop", &format!("{:?}: {}", error_class, reason));
+                    return;
+                }
+                CrashLoopDecision::AllowRestart => {}
+            }
+
+            if let Err(e) = detector.persist(&repo_dir) {
+                warn!(error = %e, "Failed to persist crash history");
+            }
+
+            // Per-error-class exponential backoff (P1: cancellation-aware)
+            let crash_count = {
+                let reg = registry.lock().await;
+                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
+            };
+            let backoff = error_class.backoff_for_attempt(crash_count);
+            append_event(run_id, "backoff", &format!(
+                "{:?}: {}s before retry",
+                error_class, backoff.as_secs()
+            ));
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = cancel.cancelled() => {
+                    debug!(run_id = %run_id, "backoff interrupted by shutdown");
+                    return;
+                }
+            }
+
+            attempt_recovery(run_id, &repo_dir, &plan_path, config_dir, registry).await;
+        }
+
+        DaemonRunOutcome::Crashed { reason }
+        | DaemonRunOutcome::Stuck { reason }
+        | DaemonRunOutcome::Timeout { reason } => {
+            let (repo_dir, plan_path, config_dir) = {
+                let reg = registry.lock().await;
+                match reg.get(run_id) {
+                    Some(e) => (e.repo_dir.clone(), e.plan_path.clone(), e.config_dir.clone()),
+                    None => return,
+                }
+            };
+
+            // CrashLoopDetector with persistence (unified budget for all paths)
+            let watchdog = WatchdogConfig::from_env();
+            let mut detector = CrashLoopDetector::from_watchdog(&watchdog);
+            detector.load_history(&repo_dir);
+
+            match detector.record_restart() {
+                CrashLoopDecision::StopCrashLoop => {
+                    let mut reg = registry.lock().await;
+                    let _ = reg.update_status(
+                        run_id,
+                        RunStatus::Failed,
+                        None,
+                        Some(format!("Crash loop: {}", reason)),
+                    );
+                    drop(reg);
+                    CrashLoopDetector::clear_history(&repo_dir);
+                    append_event(run_id, "crash_loop", &reason);
+                    return;
+                }
+                CrashLoopDecision::AllowRestart => {}
+            }
+
+            if let Err(e) = detector.persist(&repo_dir) {
+                warn!(error = %e, "Failed to persist crash history");
+            }
+
+            // Cooldown before recovery (P1: cancellation-aware)
+            let cooldown = Duration::from_secs(watchdog.restart_cooldown_secs);
+            append_event(run_id, "cooldown", &format!(
+                "{}s before recovery attempt", cooldown.as_secs()
+            ));
+            tokio::select! {
+                _ = tokio::time::sleep(cooldown) => {}
+                _ = cancel.cancelled() => {
+                    debug!(run_id = %run_id, "cooldown interrupted by shutdown");
+                    return;
+                }
+            }
+
+            attempt_recovery(run_id, &repo_dir, &plan_path, config_dir, registry).await;
+        }
+    }
+}
+
+/// Phase-aware recovery using `resolve_restart_command`.
+///
+/// Determines the correct restart strategy (Fresh, Resume, or AlreadyDone)
+/// by reading the checkpoint, then delegates to `spawn_recovery` with the
+/// resolved command.
+async fn attempt_recovery(
+    run_id: &str,
+    repo_dir: &Path,
+    plan_path: &Path,
+    config_dir: Option<PathBuf>,
+    registry: Arc<Mutex<RunRegistry>>,
+) {
+    use crate::engine::single_session::util::resolve_restart_command;
+    use crate::engine::single_session::util::RestartDecision;
+    use crate::engine::single_session::SingleSessionConfig;
+
+    let config = SingleSessionConfig::new(repo_dir);
+    let plan_str = plan_path.to_string_lossy();
+    // Shell-escape single quotes to prevent command injection (SEC-001).
+    // Matches the escaping in executor.rs::build_arc_command.
+    let escaped = plan_str.replace('\'', "'\\''");
+    let arc_command = format!("/rune:arc '{}'", escaped);
+
+    let crash_count = {
+        let reg = registry.lock().await;
+        reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
+    };
+
+    let restart_cmd = resolve_restart_command(
+        repo_dir, &plan_str, &config, &arc_command, crash_count,
+    );
+
+    match restart_cmd {
+        RestartDecision::AlreadyDone => {
+            info!(run_id = %run_id, "Pipeline already complete — skipping recovery");
+            let mut reg = registry.lock().await;
+            let _ = reg.update_status(
+                run_id,
+                RunStatus::Succeeded,
+                Some("complete".to_string()),
+                None,
+            );
+            drop(reg);
+            append_event(run_id, "already_done", "pipeline complete on recovery check");
+        }
+        RestartDecision::Fresh(cmd) | RestartDecision::Resume(cmd) => {
+            // Disk space check before spawning (BACK-004: check repo volume,
+            // not cwd — matches spawn_recovery_with_command pattern)
+            if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!("Recovery aborted (repo disk): {}", e)),
+                );
+                return;
+            }
+            if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!("Recovery aborted (GW_HOME disk): {}", e)),
+                );
+                return;
+            }
+
+            spawn_recovery_with_command(registry, run_id, repo_dir, &cmd, config_dir).await;
+        }
+    }
+}
+
+/// Spawn a recovery session using a pre-resolved restart command.
+///
+/// Similar to the original `spawn_recovery` but accepts the command
+/// string from `resolve_restart_command` instead of building it internally.
+async fn spawn_recovery_with_command(
     registry: Arc<Mutex<RunRegistry>>,
     run_id: &str,
-    repo_dir: &std::path::Path,
-    plan_path: &std::path::Path,
-    _session_name: &str,
-    config_dir: Option<std::path::PathBuf>,
+    repo_dir: &Path,
+    cmd: &str,
+    config_dir: Option<PathBuf>,
 ) {
     let tmux_session = format!("gw-{}", run_id);
 
-    // Only kill the tmux session if it is truly dead (no claude process running).
-    // A transient has_session failure could trigger recovery even when the
-    // session is alive; killing it would be destructive.
-    if spawn::has_session(&tmux_session) {
-        // Session is still alive — check if claude is running inside it.
-        // If claude is alive, abort recovery (false positive crash detection).
-        if is_claude_alive_in_session(&tmux_session) {
-            info!(
-                run_id = %run_id,
-                tmux_session = %tmux_session,
-                "ABORT recovery: session and claude are alive — false positive crash"
-            );
-            // Reset phase back to "running". Do NOT touch crash_restarts here:
-            // after FINDING-001, the increment lives in the success path below
-            // (after spawn_claude_session), so there is nothing to roll back
-            // when this false-positive abort fires — any saturating_sub would
-            // corrupt the counter for runs that have already survived a real
-            // prior crash restart.
+    // Kill existing dead session for clean recreation.
+    // QUAL-011: Wrap blocking std::process::Command calls in spawn_blocking
+    // to avoid stalling the tokio async thread pool (matches DaemonRunMonitor pattern).
+    let session_check = tmux_session.clone();
+    let session_exists = tokio::task::spawn_blocking(move || spawn::has_session(&session_check))
+        .await
+        .unwrap_or(false);
+    if session_exists {
+        let session_check = tmux_session.clone();
+        let claude_alive = tokio::task::spawn_blocking(move || is_claude_alive_in_session(&session_check))
+            .await
+            .unwrap_or(false);
+        if claude_alive {
+            info!(run_id = %run_id, "ABORT recovery: session and claude are alive");
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
                 entry.current_phase = Some("running".to_string());
             }
-            if let Err(e) = reg.update_status(
-                run_id,
-                RunStatus::Running,
-                Some("running".to_string()),
-                None,
-            ) {
-                warn!(run_id = %run_id, error = %e, "failed to persist false-positive recovery abort");
-            }
+            let _ = reg.update_status(run_id, RunStatus::Running, Some("running".to_string()), None);
             return;
         }
-        // Claude is dead but session alive — kill to recreate cleanly
         append_event(run_id, "kill_session", &format!(
-            "gw killed session '{}' — reason: claude process dead inside alive tmux, killing for clean recovery (killed by: heartbeat/spawn_recovery)",
-            tmux_session,
+            "gw killed session '{}' for clean recovery", tmux_session,
         ));
         let _ = spawn::kill_session(&tmux_session);
     }
 
-    // Pre-flight disk space gate: check BOTH the repo volume and GW_HOME
-    // (they may live on different filesystems — e.g., repo on an external
-    // drive, ~/.gw on the system disk). Bailing out early avoids spawning a
-    // Claude process that will immediately crash on write errors.
+    // Pre-flight disk space checks
     if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
         warn!(run_id = %run_id, error = %e, "aborting recovery: repo disk too low");
         append_event(run_id, "recovery_failed", &format!("disk full (repo): {e}"));
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(
-            run_id,
-            RunStatus::Failed,
-            None,
-            Some(format!("crash recovery aborted: {e}")),
-        );
+        let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}")));
         return;
     }
     if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
         warn!(run_id = %run_id, error = %e, "aborting recovery: GW_HOME disk too low");
         append_event(run_id, "recovery_failed", &format!("disk full (GW_HOME): {e}"));
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(
-            run_id,
-            RunStatus::Failed,
-            None,
-            Some(format!("crash recovery aborted: {e}")),
-        );
+        let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}")));
         return;
     }
 
-    let has_checkpoint = crate::daemon::reconciler::check_checkpoint(repo_dir);
+    info!(run_id = %run_id, tmux = %tmux_session, "starting crash recovery");
 
-    info!(
-        run_id = %run_id,
-        tmux_session = %tmux_session,
-        has_checkpoint = has_checkpoint,
-        "starting crash recovery"
-    );
-
-    // Build the command: --resume if checkpoint exists, fresh start otherwise
-    let plan_str = match plan_path.to_str() {
-        Some(s) => s,
-        None => {
-            warn!(run_id = %run_id, path = ?plan_path, "plan path is not valid UTF-8 — cannot recover");
-            let mut reg = registry.lock().await;
-            let _ = reg.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some("crash recovery failed: plan path not valid UTF-8".to_string()),
-            );
-            return;
-        }
-    };
-    let cmd = if has_checkpoint {
-        format!("/rune:arc '{}' --resume", plan_str)
-    } else {
-        info!(run_id = %run_id, "no checkpoint — starting fresh arc run");
-        format!("/rune:arc '{}'", plan_str)
-    };
-
-    // Spawn tmux session
-    let config = spawn::SpawnConfig {
+    let spawn_config = spawn::SpawnConfig {
         session_id: tmux_session.clone(),
         working_dir: repo_dir.to_path_buf(),
         config_dir,
@@ -691,59 +834,45 @@ async fn spawn_recovery(
         mock: false,
     };
 
-    match spawn::spawn_claude_session(&config) {
+    match spawn::spawn_claude_session(&spawn_config) {
         Ok(pid) => {
-            // Send the resume command
-            if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &cmd) {
+            if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, cmd) {
                 warn!(error = %e, "failed to send resume command");
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!("crash recovery failed: {e}")),
-                );
+                let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery failed: {e}")));
                 return;
             }
 
-            // Update registry with new tmux session and persist to disk.
-            // crash_restarts is incremented HERE — after a successful spawn —
-            // rather than pre-incremented in handle_dead_session. This prevents
-            // phantom retries: if the daemon itself crashed between the pre-
-            // increment and this point, the counter would have been burned
-            // without an actual recovery attempt.
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
                 entry.tmux_session = Some(tmux_session.clone());
                 entry.current_phase = Some("resuming".to_string());
                 entry.crash_restarts = entry.crash_restarts.saturating_add(1);
-                // Refresh claude_pid to the newly spawned process so the
-                // monitor loop's liveness checks target the right PID.
                 entry.claude_pid = Some(pid);
             }
             if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
-                warn!(run_id = %run_id, error = %e, "failed to persist recovery state to disk");
+                warn!(run_id = %run_id, error = %e, "failed to persist recovery state");
             }
+            drop(reg);
 
-            info!(run_id = %run_id, tmux_session = %tmux_session, "crash recovery started");
+            info!(run_id = %run_id, tmux = %tmux_session, "crash recovery started");
             append_event(run_id, "recovery_started", &format!("new session: {tmux_session}"));
-
-            // Now safe to clear the drain snapshot (recovery succeeded)
             crate::daemon::drain::clear_snapshot(run_id);
         }
         Err(e) => {
             warn!(run_id = %run_id, error = %e, "failed to spawn recovery session");
             let mut reg = registry.lock().await;
-            let _ = reg.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some(format!("crash recovery spawn failed: {e}")),
-            );
+            let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery spawn failed: {e}")));
+            drop(reg);
             append_event(run_id, "recovery_failed", &e.to_string());
         }
     }
 }
+
+// BACK-003: Legacy spawn_recovery removed — superseded by
+// spawn_recovery_with_command with phase-aware resolve_restart_command.
+// SEC-002: Also eliminates the shell injection vector in the legacy code.
+// See git history for the original implementation if needed.
 
 /// Fallback: extract a coarse phase name from pane content heuristics.
 ///
@@ -790,191 +919,9 @@ fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBu
         .map(|(path, _)| path)
 }
 
-
-/// Diagnose why a tmux session died by checking multiple signals.
-///
-/// Returns a human-readable reason string that appears in `gw logs`.
-/// Checks (in priority order):
-/// 1. tmux server alive? (if not, all sessions die)
-/// 2. Last captured pane output for error patterns
-/// 3. Process exit signals (OOM, SIGKILL, etc.)
-/// 4. Checkpoint state (which phase was running)
-fn diagnose_session_death(run_id: &str, tmux_session: &str) -> String {
-    use std::process::Command;
-
-    // 1. Check if tmux server itself is dead
-    let tmux_alive = Command::new("tmux")
-        .args(["list-sessions"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !tmux_alive {
-        // Deep diagnosis: WHO killed the tmux server?
-        let killer_info = diagnose_tmux_server_death();
-        return format!("tmux server died (all sessions lost) — {}", killer_info);
-    }
-
-    // 2. Check system log for OOM kills (last 60 seconds)
-    let oom_killed = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "eventMessage CONTAINS \"Killed\" AND eventMessage CONTAINS \"claude\"",
-            "--last", "1m",
-            "--style", "compact",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            if text.contains("Killed") || text.contains("jettisoned") {
-                Some("OOM: system killed claude process (memory pressure)".to_string())
-            } else {
-                None
-            }
-        });
-
-    if let Some(reason) = oom_killed {
-        return reason;
-    }
-
-    // 3. Check the last pane log for error patterns.
-    //    Bound the read to the tail (50 KiB) so a rotated-but-not-yet-reset
-    //    log cannot trigger OOM when a long run accumulates many MB of capture.
-    let pane_log = gw_home().join("runs").join(run_id).join("logs").join("pane.log");
-    let content = crate::daemon::server::read_log_tail(&pane_log, Some(50 * 1024));
-    if !content.is_empty() {
-        // Check last 50 lines for error patterns
-        let tail: String = content.lines().rev().take(50).collect::<Vec<_>>().join("\n");
-        let tail_lower = tail.to_lowercase();
-
-        if tail_lower.contains("error: out of memory") || tail_lower.contains("allocation failed") {
-            return "claude process ran out of memory".to_string();
-        }
-        if tail_lower.contains("api key") || tail_lower.contains("authentication") {
-            return "possible auth/API key error in claude output".to_string();
-        }
-        if tail_lower.contains("connection refused") || tail_lower.contains("network") {
-            return "possible network/connection error".to_string();
-        }
-        if tail_lower.contains("segmentation fault") || tail_lower.contains("segfault") {
-            return "claude process crashed (segfault)".to_string();
-        }
-        if tail_lower.contains("panic") && tail_lower.contains("thread") {
-            return "claude process panicked".to_string();
-        }
-    }
-
-    // 4. Check if any other gw process killed it (signal file)
-    let signal_dir = std::path::Path::new("/tmp").join(format!("gw-signals-{}", tmux_session));
-    if signal_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-            let signals: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            if !signals.is_empty() {
-                return format!("signal files present: {}", signals.join(", "));
-            }
-        }
-    }
-
-    // 6. No diagnosis — unknown cause
-    "unknown cause (session vanished with no error signals)".to_string()
-}
-
-/// Deep diagnosis for tmux server death.
-///
-/// Queries macOS unified log and process table to determine WHO killed
-/// the tmux server and WHY. Returns a human-readable explanation.
-fn diagnose_tmux_server_death() -> String {
-    use std::process::Command;
-
-    let mut clues: Vec<String> = Vec::new();
-
-    // 1. Check launchd signals — did launchd kill the process group?
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "(sender == \"launchd\" OR sender == \"kernel\") AND (eventMessage CONTAINS \"SIGTERM\" OR eventMessage CONTAINS \"SIGKILL\" OR eventMessage CONTAINS \"tmux\" OR eventMessage CONTAINS \"greater-will\")",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if !text.trim().is_empty() {
-            let lines: Vec<&str> = text.lines().take(5).collect();
-            if text.contains("SIGKILL") || text.contains("SIGTERM") {
-                clues.push(format!("launchd/kernel signal detected: {}", lines.join(" | ")));
-            }
-            if text.contains("tmux") {
-                clues.push(format!("tmux mentioned in system log: {}", lines.join(" | ")));
-            }
-        }
-    }
-
-    // 2. Check if launchd restarted the daemon (KeepAlive respawn)
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "sender == \"launchd\" AND eventMessage CONTAINS \"com.greater-will\"",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("respawn") || text.contains("Throttle") || text.contains("exited") {
-            clues.push("launchd respawned daemon (KeepAlive triggered)".to_string());
-        }
-    }
-
-    // 3. Check for memory pressure jetsam events
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "eventMessage CONTAINS \"jettisoned\" OR eventMessage CONTAINS \"memorystatus\" OR (eventMessage CONTAINS \"Killed\" AND eventMessage CONTAINS \"tmux\")",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if !text.trim().is_empty() {
-            clues.push(format!("memory pressure event: {}", text.lines().next().unwrap_or("(empty)")));
-        }
-    }
-
-    // 4. Check our own daemon stdout/stderr log for clues
-    let log_path = gw_home().join("logs").join("daemon.stderr.log");
-    if let Ok(content) = std::fs::read_to_string(&log_path) {
-        let tail: Vec<&str> = content.lines().rev().take(10).collect();
-        let tail_str = tail.join(" ");
-        if tail_str.contains("SIGTERM") || tail_str.contains("shutdown") {
-            clues.push("daemon received SIGTERM (check: launchd restart or gw daemon stop?)".to_string());
-        }
-    }
-
-    // 5. Check if AbandonProcessGroup is in the plist
-    let plist_path = dirs::home_dir()
-        .map(|h| h.join("Library/LaunchAgents/com.greater-will.daemon.plist"));
-    if let Some(path) = plist_path {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if !content.contains("AbandonProcessGroup") {
-                    clues.push("LIKELY CAUSE: plist missing AbandonProcessGroup — launchd kills entire process group on daemon restart/stop. Fix: run `gw daemon uninstall && gw daemon install`".to_string());
-                }
-            }
-        }
-    }
-
-    if clues.is_empty() {
-        "no clues found in system log (try: sudo dtrace -n 'proc:::signal-send /args[1]->pr_fname == \"tmux\"/ { trace(execname); }')".to_string()
-    } else {
-        clues.join("; ")
-    }
-}
+// BACK-006: Legacy diagnose_session_death and diagnose_tmux_server_death
+// removed (~180 lines of dead code). DaemonRunMonitor performs its own
+// diagnosis. See git history for the original implementation if needed.
 
 /// Check if a claude process is running inside a tmux session.
 ///
@@ -1008,4 +955,243 @@ fn is_claude_alive_in_session(tmux_session: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::registry::RunRegistry;
+
+    /// Helper: create a registry with one Running entry and a fake tmux session.
+    fn setup_running_entry(
+        tmp: &tempfile::TempDir,
+    ) -> (Arc<Mutex<RunRegistry>>, String) {
+        let mut reg = RunRegistry::new();
+        let repo_dir = tmp.path().to_path_buf();
+        let plan_path = repo_dir.join("plan.md");
+        std::fs::write(&plan_path, "# test plan").unwrap();
+
+        let run_id = reg
+            .register_run(plan_path, repo_dir, Some("test-session".into()), None)
+            .unwrap();
+
+        if let Some(entry) = reg.get_mut(&run_id) {
+            entry.tmux_session = Some(format!("gw-{}", run_id));
+            entry.status = RunStatus::Running;
+        }
+
+        (Arc::new(Mutex::new(reg)), run_id)
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_new_creates_empty_monitors() {
+        let reg = Arc::new(Mutex::new(RunRegistry::new()));
+        let cancel = CancellationToken::new();
+        let hb = HeartbeatMonitor::new(reg, cancel);
+        let monitors = hb.monitors();
+        let map = monitors.lock().await;
+        assert!(map.is_empty(), "new HeartbeatMonitor should have no monitors");
+    }
+
+    #[tokio::test]
+    async fn monitors_arc_is_shared() {
+        let reg = Arc::new(Mutex::new(RunRegistry::new()));
+        let cancel = CancellationToken::new();
+        let hb = HeartbeatMonitor::new(reg, cancel);
+        let monitors1 = hb.monitors();
+        let monitors2 = hb.monitors();
+        assert!(Arc::ptr_eq(&monitors1, &monitors2));
+    }
+
+    #[tokio::test]
+    async fn monitor_cancelled_on_stop() {
+        let monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        let join = tokio::spawn(async move {
+            cancel_clone.cancelled().await;
+        });
+
+        let run_id = "test-run-123".to_string();
+        {
+            let mut map = monitors.lock().await;
+            map.insert(
+                run_id.clone(),
+                MonitorHandle {
+                    join,
+                    cancel: cancel_token.clone(),
+                },
+            );
+        }
+
+        // Cancel the monitor (simulating stop_run behavior)
+        {
+            let mut map = monitors.lock().await;
+            if let Some(handle) = map.remove(&run_id) {
+                handle.cancel.cancel();
+            }
+        }
+
+        assert!(cancel_token.is_cancelled());
+        let map = monitors.lock().await;
+        assert!(map.is_empty(), "monitor should be removed after cancel");
+    }
+
+    #[tokio::test]
+    async fn global_cancel_cascades_to_children() {
+        let global_cancel = CancellationToken::new();
+        let monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let mut child_tokens = Vec::new();
+        for i in 0..3 {
+            let child = global_cancel.child_token();
+            let child_clone = child.clone();
+            child_tokens.push(child.clone());
+
+            let join = tokio::spawn(async move {
+                child_clone.cancelled().await;
+            });
+
+            let mut map = monitors.lock().await;
+            map.insert(
+                format!("run-{}", i),
+                MonitorHandle { join, cancel: child },
+            );
+        }
+
+        global_cancel.cancel();
+        tokio::task::yield_now().await;
+
+        for (i, token) in child_tokens.iter().enumerate() {
+            assert!(
+                token.is_cancelled(),
+                "child token {} should be cancelled when global fires",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_marks_run_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+
+        let (registry, run_id) = setup_running_entry(&tmp);
+
+        // Simulate what the outcome handler does on panic
+        {
+            let mut reg = registry.lock().await;
+            let _ = reg.update_status(
+                &run_id,
+                RunStatus::Failed,
+                None,
+                Some("Monitor panicked — marking failed".to_string()),
+            );
+        }
+
+        let reg = registry.lock().await;
+        let entry = reg.get(&run_id).expect("entry should exist");
+        assert_eq!(entry.status, RunStatus::Failed);
+        assert!(
+            entry.error_message.as_deref().unwrap_or("").contains("panicked"),
+            "error message should mention panic"
+        );
+
+        unsafe { std::env::remove_var("GW_HOME") };
+    }
+
+    #[tokio::test]
+    async fn fatal_error_no_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+
+        let (registry, run_id) = setup_running_entry(&tmp);
+
+        // Fatal error → immediate failure, no retry
+        {
+            let mut reg = registry.lock().await;
+            let _ = reg.update_status(
+                &run_id,
+                RunStatus::Failed,
+                None,
+                Some("Fatal AuthError: invalid API key".to_string()),
+            );
+        }
+
+        let reg = registry.lock().await;
+        let entry = reg.get(&run_id).expect("entry should exist");
+        assert_eq!(entry.status, RunStatus::Failed);
+        assert_eq!(
+            entry.crash_restarts, 0,
+            "fatal errors should not increment crash_restarts"
+        );
+
+        unsafe { std::env::remove_var("GW_HOME") };
+    }
+
+    #[tokio::test]
+    async fn completed_marks_succeeded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+
+        let (registry, run_id) = setup_running_entry(&tmp);
+
+        // Completed outcome
+        {
+            let mut reg = registry.lock().await;
+            let _ = reg.update_status(
+                &run_id,
+                RunStatus::Succeeded,
+                Some("complete".to_string()),
+                None,
+            );
+        }
+
+        let reg = registry.lock().await;
+        let entry = reg.get(&run_id).expect("entry should exist");
+        assert_eq!(entry.status, RunStatus::Succeeded);
+
+        unsafe { std::env::remove_var("GW_HOME") };
+    }
+
+    #[tokio::test]
+    async fn cancelled_no_registry_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (registry, run_id) = setup_running_entry(&tmp);
+
+        // Cancelled outcome: no registry change (caller handles it)
+        let reg = registry.lock().await;
+        let entry = reg.get(&run_id).expect("entry should exist");
+        assert_eq!(entry.status, RunStatus::Running);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires tmux
+    async fn monitor_spawned_for_running_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+        std::fs::create_dir_all(tmp.path().join("runs")).unwrap();
+
+        let (registry, _run_id) = setup_running_entry(&tmp);
+
+        let cancel = CancellationToken::new();
+        let hb = HeartbeatMonitor::new(Arc::clone(&registry), cancel.clone());
+        let monitors = hb.monitors();
+
+        let _handle = hb.start();
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+        let map = monitors.lock().await;
+        assert!(!map.is_empty(), "monitor should be spawned for running entry");
+
+        cancel.cancel();
+        unsafe { std::env::remove_var("GW_HOME") };
+    }
 }

@@ -321,18 +321,20 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     let cancel = CancellationToken::new();
     let socket_path = config.socket_path();
 
-    let server = DaemonServer::new(Arc::clone(&registry), socket_path, cancel.clone());
+    // 7b. Start heartbeat monitor (captures pane logs, tracks phases, spawns per-run monitors)
+    let heartbeat = HeartbeatMonitor::new(Arc::clone(&registry), cancel.clone());
+    // Extract monitors Arc BEFORE start() consumes self
+    let monitors = heartbeat.monitors();
+    let heartbeat_handle = heartbeat.start();
+    info!("heartbeat monitor spawned");
+
+    let server = DaemonServer::new(Arc::clone(&registry), socket_path, cancel.clone(), monitors);
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.start().await {
             error!(error = %e, "server exited with error");
         }
     });
-
-    // 7b. Start heartbeat monitor (captures pane logs, tracks phases, detects crashes)
-    let heartbeat = HeartbeatMonitor::new(Arc::clone(&registry));
-    let heartbeat_handle = heartbeat.start();
-    info!("heartbeat monitor spawned");
 
     // Note: the `daemon.running` marker was written earlier (step 3b)
     // immediately after the PID flock.  Do NOT write it here — that would
@@ -383,8 +385,15 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     // Wait for server to finish (it exits when cancel fires)
     let _ = server_handle.await;
 
-    // 9. Graceful shutdown: stop heartbeat, drain running sessions, clean up.
-    heartbeat_handle.abort(); // Stop heartbeat before draining to avoid interference
+    // 9. Graceful shutdown: cancel all monitors via global token, then drain.
+    //    global_cancel cascades to all per-run child tokens via child_token().
+    //    Each monitor returns Cancelled and exits without killing tmux or
+    //    modifying registry. Then drain captures snapshots.
+    cancel.cancel();
+    // Give monitors up to 5 seconds to flush state before falling through.
+    // If timeout expires, the heartbeat_handle is dropped (which aborts the
+    // underlying task) — acceptable as a fallback since cancel was signaled.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), heartbeat_handle).await;
     info!("daemon shutting down — draining running sessions");
     let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
     info!(drained = drained, "drain complete");
