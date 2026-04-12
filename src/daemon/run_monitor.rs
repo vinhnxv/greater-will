@@ -1,9 +1,3 @@
-// SHARD 3: module is created in isolation. Nothing in the crate calls
-// `DaemonRunMonitor::{new, run}` yet — Shard 4 wires it into
-// `HeartbeatMonitor`. Suppress dead-code warnings at the module level so
-// the unwired skeleton doesn't trip `-D warnings` in CI.
-#![allow(dead_code)]
-
 //! Per-run async monitor task.
 //!
 //! Async equivalent of [`crate::engine::single_session::monitor::monitor_session`]
@@ -120,7 +114,9 @@ pub struct DaemonRunMonitor {
     run_id: String,
     tmux_session: String,
     repo_dir: PathBuf,
+    #[allow(dead_code)]
     plan_path: PathBuf,
+    #[allow(dead_code)]
     config_dir: Option<PathBuf>,
 
     // Registry reference (for status updates — Shard 4 uses this)
@@ -448,7 +444,7 @@ impl DaemonRunMonitor {
     async fn kill_session(&self) -> bool {
         let session = self.tmux_session.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::session::spawn::kill_session(&session);
+            let _ = crate::session::spawn::kill_session(&session);
             Ok::<(), color_eyre::eyre::Error>(())
         })
         .await

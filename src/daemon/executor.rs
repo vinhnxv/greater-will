@@ -5,10 +5,12 @@
 //! `engine/single_session/util.rs` for tmux interaction and
 //! arc command construction.
 
+use crate::daemon::heartbeat::MonitorHandle;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::RunRegistry;
 use crate::session::spawn::{self, SpawnConfig};
 use color_eyre::{eyre::eyre, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -184,8 +186,21 @@ pub async fn spawn_run(
 /// 4. Update registry and release per-repo lock
 pub async fn stop_run(
     registry: Arc<Mutex<RunRegistry>>,
+    monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
     run_id: &str,
 ) -> Result<()> {
+    // Step 0: Cancel the monitor BEFORE sending /exit to prevent race
+    // where the monitor fires its kill gate between cancel and stop.
+    {
+        let mut mons = monitors.lock().await;
+        if let Some(handle) = mons.remove(run_id) {
+            handle.cancel.cancel();
+            // Brief grace for monitor to exit its poll loop
+            drop(mons);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     let tmux_session = {
         let reg = registry.lock().await;
         let entry = reg

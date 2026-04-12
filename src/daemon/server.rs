@@ -4,6 +4,7 @@
 //! Each connection uses length-prefixed JSON framing (see `protocol.rs`).
 
 use color_eyre::{eyre::WrapErr, Result};
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
+use crate::daemon::heartbeat::MonitorHandle;
 use crate::daemon::protocol::{
     read_message, write_message, ErrorCode, Request, Response, RunStatus,
 };
@@ -30,6 +32,7 @@ pub struct DaemonServer {
     registry: Arc<Mutex<RunRegistry>>,
     socket_path: PathBuf,
     cancel: CancellationToken,
+    monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
 }
 
 impl DaemonServer {
@@ -38,11 +41,13 @@ impl DaemonServer {
         registry: Arc<Mutex<RunRegistry>>,
         socket_path: PathBuf,
         cancel: CancellationToken,
+        monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
     ) -> Self {
         Self {
             registry,
             socket_path,
             cancel,
+            monitors,
         }
     }
 
@@ -81,8 +86,9 @@ impl DaemonServer {
                         Ok((stream, _addr)) => {
                             let registry = Arc::clone(&self.registry);
                             let cancel = self.cancel.clone();
+                            let monitors = Arc::clone(&self.monitors);
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, registry, cancel).await {
+                                if let Err(e) = handle_connection(stream, registry, cancel, monitors).await {
                                     tracing::warn!(error = %e, "connection handler error");
                                 }
                             });
@@ -160,6 +166,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     registry: Arc<Mutex<RunRegistry>>,
     cancel: CancellationToken,
+    monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -224,7 +231,7 @@ async fn handle_connection(
 
         let request_type = request_type_name(&request);
         let start = std::time::Instant::now();
-        let response = dispatch_request(request, &registry, &cancel).await;
+        let response = dispatch_request(request, &registry, &cancel, &monitors).await;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::info!(
@@ -416,6 +423,7 @@ async fn dispatch_request(
     request: Request,
     registry: &Arc<Mutex<RunRegistry>>,
     cancel: &CancellationToken,
+    monitors: &Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
 ) -> Response {
     match request {
         Request::SubmitRun {
@@ -547,7 +555,7 @@ async fn dispatch_request(
             // only mutated the registry — it left the tmux session (and
             // its arc worker) running, leaking resources and making the
             // "stopped" state a lie.
-            match crate::daemon::executor::stop_run(Arc::clone(registry), &actual_id).await {
+            match crate::daemon::executor::stop_run(Arc::clone(registry), Arc::clone(monitors), &actual_id).await {
                 Ok(()) => Response::Ok {
                     message: format!("run {actual_id} stopped"),
                 },
@@ -580,10 +588,18 @@ async fn dispatch_request(
                 }
             };
 
-            // Step 2: Snapshot only the detached run (not all running sessions)
+            // Step 2: Cancel monitor FIRST — prevent it from killing the detached session
+            {
+                let mut mons = monitors.lock().await;
+                if let Some(handle) = mons.remove(&actual_id) {
+                    handle.cancel.cancel();
+                }
+            }
+
+            // Step 3: Snapshot only the detached run (not all running sessions)
             crate::daemon::drain::drain_single_session(Arc::clone(registry), &actual_id).await;
 
-            // Step 3: Mark as Stopped but do NOT kill tmux
+            // Step 4: Mark as Stopped but do NOT kill tmux
             crate::daemon::heartbeat::append_event(&actual_id, "detached", &format!(
                 "detached by user — tmux session '{}' kept alive (gw no longer tracking)",
                 tmux.as_deref().unwrap_or("unknown"),
@@ -804,10 +820,12 @@ mod tests {
         let registry = Arc::new(Mutex::new(RunRegistry::new()));
         let cancel = CancellationToken::new();
 
+        let monitors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let server = DaemonServer::new(
             Arc::clone(&registry),
             socket_path.clone(),
             cancel.clone(),
+            monitors,
         );
 
         // Spawn server in background
