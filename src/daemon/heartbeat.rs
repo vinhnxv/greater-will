@@ -42,6 +42,19 @@ pub(crate) struct MonitorHandle {
 /// 2. Cancels monitors for stopped/failed/succeeded runs
 /// 3. Captures pane output and updates phase for lightweight `gw ps` display
 /// 4. Delegates crash recovery to [`handle_monitor_outcome`]
+/// ## Lock ordering convention (BACK-011)
+///
+/// This module uses two `tokio::sync::Mutex`es: `registry` and `monitors`.
+/// They must **never be held simultaneously** — always acquire one, extract
+/// what you need, `drop` it, then acquire the other. The canonical order
+/// when both are needed in sequence is:
+///
+/// 1. `registry` — snapshot data, then drop
+/// 2. `monitors` — mutate monitor handles, then drop
+///
+/// `executor.rs::stop_run` follows the same convention. Violating this
+/// (holding both locks at once) creates an AB/BA deadlock risk with
+/// concurrent stop_run calls.
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
     /// Per-run monitor handles, keyed by run_id. Shared with `DaemonServer`
@@ -49,6 +62,9 @@ pub struct HeartbeatMonitor {
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
     /// Global cancellation token — child tokens are derived per-run.
     global_cancel: CancellationToken,
+    /// Cached watchdog config — resolved once at construction to avoid
+    /// re-parsing env vars on every heartbeat tick (BACK-002).
+    watchdog: WatchdogConfig,
 }
 
 impl HeartbeatMonitor {
@@ -58,6 +74,7 @@ impl HeartbeatMonitor {
             registry,
             monitors: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             global_cancel,
+            watchdog: WatchdogConfig::from_env(),
         }
     }
 
@@ -117,33 +134,32 @@ impl HeartbeatMonitor {
     /// and prunes finished handles. Lightweight phase tracking via
     /// `handle_alive_session` continues for `gw ps` display.
     async fn check_all_runs(&self) {
-        let registry = self.registry.lock().await;
+        // BACK-007: Single list_runs(true) call, partitioned into running/stopped.
+        // BACK-014: Pre-clone RunEntry snapshots in the initial lock scope to
+        // eliminate per-entry re-locking when spawning monitors.
+        let (running, stopped) = {
+            let registry = self.registry.lock().await;
+            let all_runs = registry.list_runs(true);
 
-        // Snapshot running entries — use list_runs for IDs, get() for tmux_session
-        let active_infos = registry.list_runs(false);
-        let running: Vec<(String, Option<String>)> = active_infos
-            .iter()
-            .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
-            .map(|r| {
-                let tmux = registry.get(&r.run_id).and_then(|e| e.tmux_session.clone());
-                (r.run_id.clone(), tmux)
-            })
-            .collect();
+            let mut running: Vec<(String, Option<String>, Option<crate::daemon::registry::RunEntry>)> = Vec::new();
+            let mut stopped: Vec<String> = Vec::new();
 
-        // Snapshot stopped/finished run IDs
-        let stopped: Vec<String> = registry
-            .list_runs(true)
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.status,
-                    RunStatus::Stopped | RunStatus::Failed | RunStatus::Succeeded
-                )
-            })
-            .map(|r| r.run_id.clone())
-            .collect();
+            for r in &all_runs {
+                match r.status {
+                    RunStatus::Running | RunStatus::Queued => {
+                        let entry = registry.get(&r.run_id);
+                        let tmux = entry.as_ref().and_then(|e| e.tmux_session.clone());
+                        let snapshot = entry.cloned();
+                        running.push((r.run_id.clone(), tmux, snapshot));
+                    }
+                    RunStatus::Stopped | RunStatus::Failed | RunStatus::Succeeded => {
+                        stopped.push(r.run_id.clone());
+                    }
+                }
+            }
 
-        drop(registry); // Release lock before monitor operations
+            (running, stopped)
+        }; // Registry lock released here
 
         let mut monitors = self.monitors.lock().await;
 
@@ -155,7 +171,7 @@ impl HeartbeatMonitor {
         }
 
         // Spawn monitors for new Running entries
-        for (run_id, tmux_session) in &running {
+        for (run_id, tmux_session, entry_snapshot) in &running {
             if monitors.contains_key(run_id) {
                 continue;
             }
@@ -164,17 +180,14 @@ impl HeartbeatMonitor {
                 continue;
             }
 
-            // Snapshot the full entry for DaemonRunMonitor::new
-            let entry_snapshot = {
-                let registry = self.registry.lock().await;
-                match registry.get(run_id) {
-                    Some(e) => e.clone(),
-                    None => continue,
-                }
+            // Use pre-cloned snapshot (BACK-014: no second registry lock needed)
+            let entry_snapshot = match entry_snapshot {
+                Some(e) => e.clone(),
+                None => continue,
             };
 
             let run_cancel = self.global_cancel.child_token();
-            let watchdog = WatchdogConfig::from_env();
+            let watchdog = self.watchdog.clone();
             let monitor_registry = Arc::clone(&self.registry);
             let mut monitor = DaemonRunMonitor::new(&entry_snapshot, monitor_registry, watchdog);
 
@@ -239,7 +252,7 @@ impl HeartbeatMonitor {
 
         // Lightweight phase tracking for `gw ps` — runs on every tick
         // independently of the per-run monitors.
-        for (run_id, tmux_session) in &running {
+        for (run_id, tmux_session, _) in &running {
             if let Some(session) = tmux_session {
                 self.handle_alive_session(run_id, session).await;
             }
@@ -525,19 +538,19 @@ async fn handle_monitor_outcome(
 ) {
     match outcome {
         DaemonRunOutcome::Completed => {
+            // QUAL-013: Single lock scope to prevent TOCTOU race where
+            // stop_run could overwrite status between two acquisitions.
             let repo_dir = {
-                let reg = registry.lock().await;
-                reg.get(run_id).map(|e| e.repo_dir.clone())
-            };
-            {
                 let mut reg = registry.lock().await;
+                let dir = reg.get(run_id).map(|e| e.repo_dir.clone());
                 let _ = reg.update_status(
                     run_id,
                     RunStatus::Succeeded,
                     Some("complete".to_string()),
                     None,
                 );
-            }
+                dir
+            };
             if let Some(dir) = repo_dir {
                 CrashLoopDetector::clear_history(&dir);
             }
@@ -699,7 +712,10 @@ async fn attempt_recovery(
 
     let config = SingleSessionConfig::new(repo_dir);
     let plan_str = plan_path.to_string_lossy();
-    let arc_command = format!("/rune:arc '{}'", plan_str);
+    // Shell-escape single quotes to prevent command injection (SEC-001).
+    // Matches the escaping in executor.rs::build_arc_command.
+    let escaped = plan_str.replace('\'', "'\\''");
+    let arc_command = format!("/rune:arc '{}'", escaped);
 
     let crash_count = {
         let reg = registry.lock().await;
@@ -724,14 +740,25 @@ async fn attempt_recovery(
             append_event(run_id, "already_done", "pipeline complete on recovery check");
         }
         RestartDecision::Fresh(cmd) | RestartDecision::Resume(cmd) => {
-            // Disk space check before spawning
-            if let Err(e) = crate::cleanup::health::check_disk_space() {
+            // Disk space check before spawning (BACK-004: check repo volume,
+            // not cwd — matches spawn_recovery_with_command pattern)
+            if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
                 let mut reg = registry.lock().await;
                 let _ = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
-                    Some(format!("Recovery aborted: {}", e)),
+                    Some(format!("Recovery aborted (repo disk): {}", e)),
+                );
+                return;
+            }
+            if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!("Recovery aborted (GW_HOME disk): {}", e)),
                 );
                 return;
             }
@@ -754,9 +781,19 @@ async fn spawn_recovery_with_command(
 ) {
     let tmux_session = format!("gw-{}", run_id);
 
-    // Kill existing dead session for clean recreation
-    if spawn::has_session(&tmux_session) {
-        if is_claude_alive_in_session(&tmux_session) {
+    // Kill existing dead session for clean recreation.
+    // QUAL-011: Wrap blocking std::process::Command calls in spawn_blocking
+    // to avoid stalling the tokio async thread pool (matches DaemonRunMonitor pattern).
+    let session_check = tmux_session.clone();
+    let session_exists = tokio::task::spawn_blocking(move || spawn::has_session(&session_check))
+        .await
+        .unwrap_or(false);
+    if session_exists {
+        let session_check = tmux_session.clone();
+        let claude_alive = tokio::task::spawn_blocking(move || is_claude_alive_in_session(&session_check))
+            .await
+            .unwrap_or(false);
+        if claude_alive {
             info!(run_id = %run_id, "ABORT recovery: session and claude are alive");
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(run_id) {
@@ -832,181 +869,10 @@ async fn spawn_recovery_with_command(
     }
 }
 
-/// Legacy spawn_recovery — superseded by `spawn_recovery_with_command` above
-/// which uses phase-aware `resolve_restart_command` instead of blind --resume.
-#[allow(dead_code)]
-async fn spawn_recovery(
-    registry: Arc<Mutex<RunRegistry>>,
-    run_id: &str,
-    repo_dir: &std::path::Path,
-    plan_path: &std::path::Path,
-    _session_name: &str,
-    config_dir: Option<std::path::PathBuf>,
-) {
-    let tmux_session = format!("gw-{}", run_id);
-
-    // Only kill the tmux session if it is truly dead (no claude process running).
-    // A transient has_session failure could trigger recovery even when the
-    // session is alive; killing it would be destructive.
-    if spawn::has_session(&tmux_session) {
-        // Session is still alive — check if claude is running inside it.
-        // If claude is alive, abort recovery (false positive crash detection).
-        if is_claude_alive_in_session(&tmux_session) {
-            info!(
-                run_id = %run_id,
-                tmux_session = %tmux_session,
-                "ABORT recovery: session and claude are alive — false positive crash"
-            );
-            // Reset phase back to "running". Do NOT touch crash_restarts here:
-            // after FINDING-001, the increment lives in the success path below
-            // (after spawn_claude_session), so there is nothing to roll back
-            // when this false-positive abort fires — any saturating_sub would
-            // corrupt the counter for runs that have already survived a real
-            // prior crash restart.
-            let mut reg = registry.lock().await;
-            if let Some(entry) = reg.get_mut(run_id) {
-                entry.current_phase = Some("running".to_string());
-            }
-            if let Err(e) = reg.update_status(
-                run_id,
-                RunStatus::Running,
-                Some("running".to_string()),
-                None,
-            ) {
-                warn!(run_id = %run_id, error = %e, "failed to persist false-positive recovery abort");
-            }
-            return;
-        }
-        // Claude is dead but session alive — kill to recreate cleanly
-        append_event(run_id, "kill_session", &format!(
-            "gw killed session '{}' — reason: claude process dead inside alive tmux, killing for clean recovery (killed by: heartbeat/spawn_recovery)",
-            tmux_session,
-        ));
-        let _ = spawn::kill_session(&tmux_session);
-    }
-
-    // Pre-flight disk space gate: check BOTH the repo volume and GW_HOME
-    // (they may live on different filesystems — e.g., repo on an external
-    // drive, ~/.gw on the system disk). Bailing out early avoids spawning a
-    // Claude process that will immediately crash on write errors.
-    if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
-        warn!(run_id = %run_id, error = %e, "aborting recovery: repo disk too low");
-        append_event(run_id, "recovery_failed", &format!("disk full (repo): {e}"));
-        let mut reg = registry.lock().await;
-        let _ = reg.update_status(
-            run_id,
-            RunStatus::Failed,
-            None,
-            Some(format!("crash recovery aborted: {e}")),
-        );
-        return;
-    }
-    if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
-        warn!(run_id = %run_id, error = %e, "aborting recovery: GW_HOME disk too low");
-        append_event(run_id, "recovery_failed", &format!("disk full (GW_HOME): {e}"));
-        let mut reg = registry.lock().await;
-        let _ = reg.update_status(
-            run_id,
-            RunStatus::Failed,
-            None,
-            Some(format!("crash recovery aborted: {e}")),
-        );
-        return;
-    }
-
-    let has_checkpoint = crate::daemon::reconciler::check_checkpoint(repo_dir);
-
-    info!(
-        run_id = %run_id,
-        tmux_session = %tmux_session,
-        has_checkpoint = has_checkpoint,
-        "starting crash recovery"
-    );
-
-    // Build the command: --resume if checkpoint exists, fresh start otherwise
-    let plan_str = match plan_path.to_str() {
-        Some(s) => s,
-        None => {
-            warn!(run_id = %run_id, path = ?plan_path, "plan path is not valid UTF-8 — cannot recover");
-            let mut reg = registry.lock().await;
-            let _ = reg.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some("crash recovery failed: plan path not valid UTF-8".to_string()),
-            );
-            return;
-        }
-    };
-    let cmd = if has_checkpoint {
-        format!("/rune:arc '{}' --resume", plan_str)
-    } else {
-        info!(run_id = %run_id, "no checkpoint — starting fresh arc run");
-        format!("/rune:arc '{}'", plan_str)
-    };
-
-    // Spawn tmux session
-    let config = spawn::SpawnConfig {
-        session_id: tmux_session.clone(),
-        working_dir: repo_dir.to_path_buf(),
-        config_dir,
-        claude_path: "claude".to_string(),
-        mock: false,
-    };
-
-    match spawn::spawn_claude_session(&config) {
-        Ok(pid) => {
-            // Send the resume command
-            if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &cmd) {
-                warn!(error = %e, "failed to send resume command");
-                let mut reg = registry.lock().await;
-                let _ = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!("crash recovery failed: {e}")),
-                );
-                return;
-            }
-
-            // Update registry with new tmux session and persist to disk.
-            // crash_restarts is incremented HERE — after a successful spawn —
-            // rather than pre-incremented in handle_dead_session. This prevents
-            // phantom retries: if the daemon itself crashed between the pre-
-            // increment and this point, the counter would have been burned
-            // without an actual recovery attempt.
-            let mut reg = registry.lock().await;
-            if let Some(entry) = reg.get_mut(run_id) {
-                entry.tmux_session = Some(tmux_session.clone());
-                entry.current_phase = Some("resuming".to_string());
-                entry.crash_restarts = entry.crash_restarts.saturating_add(1);
-                // Refresh claude_pid to the newly spawned process so the
-                // monitor loop's liveness checks target the right PID.
-                entry.claude_pid = Some(pid);
-            }
-            if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
-                warn!(run_id = %run_id, error = %e, "failed to persist recovery state to disk");
-            }
-
-            info!(run_id = %run_id, tmux_session = %tmux_session, "crash recovery started");
-            append_event(run_id, "recovery_started", &format!("new session: {tmux_session}"));
-
-            // Now safe to clear the drain snapshot (recovery succeeded)
-            crate::daemon::drain::clear_snapshot(run_id);
-        }
-        Err(e) => {
-            warn!(run_id = %run_id, error = %e, "failed to spawn recovery session");
-            let mut reg = registry.lock().await;
-            let _ = reg.update_status(
-                run_id,
-                RunStatus::Failed,
-                None,
-                Some(format!("crash recovery spawn failed: {e}")),
-            );
-            append_event(run_id, "recovery_failed", &e.to_string());
-        }
-    }
-}
+// BACK-003: Legacy spawn_recovery removed — superseded by
+// spawn_recovery_with_command with phase-aware resolve_restart_command.
+// SEC-002: Also eliminates the shell injection vector in the legacy code.
+// See git history for the original implementation if needed.
 
 /// Fallback: extract a coarse phase name from pane content heuristics.
 ///
@@ -1053,196 +919,9 @@ fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBu
         .map(|(path, _)| path)
 }
 
-
-/// Diagnose why a tmux session died by checking multiple signals.
-///
-/// Returns a human-readable reason string that appears in `gw logs`.
-/// Checks (in priority order):
-/// 1. tmux server alive? (if not, all sessions die)
-/// 2. Last captured pane output for error patterns
-/// 3. Process exit signals (OOM, SIGKILL, etc.)
-/// 4. Checkpoint state (which phase was running)
-///
-/// Note: Currently unused — DaemonRunMonitor performs its own diagnosis.
-/// Retained for potential future use (e.g., post-mortem analysis).
-#[allow(dead_code)]
-fn diagnose_session_death(run_id: &str, tmux_session: &str) -> String {
-    use std::process::Command;
-
-    // 1. Check if tmux server itself is dead
-    let tmux_alive = Command::new("tmux")
-        .args(["list-sessions"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !tmux_alive {
-        // Deep diagnosis: WHO killed the tmux server?
-        let killer_info = diagnose_tmux_server_death();
-        return format!("tmux server died (all sessions lost) — {}", killer_info);
-    }
-
-    // 2. Check system log for OOM kills (last 60 seconds)
-    let oom_killed = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "eventMessage CONTAINS \"Killed\" AND eventMessage CONTAINS \"claude\"",
-            "--last", "1m",
-            "--style", "compact",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            if text.contains("Killed") || text.contains("jettisoned") {
-                Some("OOM: system killed claude process (memory pressure)".to_string())
-            } else {
-                None
-            }
-        });
-
-    if let Some(reason) = oom_killed {
-        return reason;
-    }
-
-    // 3. Check the last pane log for error patterns.
-    //    Bound the read to the tail (50 KiB) so a rotated-but-not-yet-reset
-    //    log cannot trigger OOM when a long run accumulates many MB of capture.
-    let pane_log = gw_home().join("runs").join(run_id).join("logs").join("pane.log");
-    let content = crate::daemon::server::read_log_tail(&pane_log, Some(50 * 1024));
-    if !content.is_empty() {
-        // Check last 50 lines for error patterns
-        let tail: String = content.lines().rev().take(50).collect::<Vec<_>>().join("\n");
-        let tail_lower = tail.to_lowercase();
-
-        if tail_lower.contains("error: out of memory") || tail_lower.contains("allocation failed") {
-            return "claude process ran out of memory".to_string();
-        }
-        if tail_lower.contains("api key") || tail_lower.contains("authentication") {
-            return "possible auth/API key error in claude output".to_string();
-        }
-        if tail_lower.contains("connection refused") || tail_lower.contains("network") {
-            return "possible network/connection error".to_string();
-        }
-        if tail_lower.contains("segmentation fault") || tail_lower.contains("segfault") {
-            return "claude process crashed (segfault)".to_string();
-        }
-        if tail_lower.contains("panic") && tail_lower.contains("thread") {
-            return "claude process panicked".to_string();
-        }
-    }
-
-    // 4. Check if any other gw process killed it (signal file)
-    let signal_dir = std::path::Path::new("/tmp").join(format!("gw-signals-{}", tmux_session));
-    if signal_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-            let signals: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            if !signals.is_empty() {
-                return format!("signal files present: {}", signals.join(", "));
-            }
-        }
-    }
-
-    // 6. No diagnosis — unknown cause
-    "unknown cause (session vanished with no error signals)".to_string()
-}
-
-/// Deep diagnosis for tmux server death.
-///
-/// Queries macOS unified log and process table to determine WHO killed
-/// the tmux server and WHY. Returns a human-readable explanation.
-#[allow(dead_code)]
-fn diagnose_tmux_server_death() -> String {
-    use std::process::Command;
-
-    let mut clues: Vec<String> = Vec::new();
-
-    // 1. Check launchd signals — did launchd kill the process group?
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "(sender == \"launchd\" OR sender == \"kernel\") AND (eventMessage CONTAINS \"SIGTERM\" OR eventMessage CONTAINS \"SIGKILL\" OR eventMessage CONTAINS \"tmux\" OR eventMessage CONTAINS \"greater-will\")",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if !text.trim().is_empty() {
-            let lines: Vec<&str> = text.lines().take(5).collect();
-            if text.contains("SIGKILL") || text.contains("SIGTERM") {
-                clues.push(format!("launchd/kernel signal detected: {}", lines.join(" | ")));
-            }
-            if text.contains("tmux") {
-                clues.push(format!("tmux mentioned in system log: {}", lines.join(" | ")));
-            }
-        }
-    }
-
-    // 2. Check if launchd restarted the daemon (KeepAlive respawn)
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "sender == \"launchd\" AND eventMessage CONTAINS \"com.greater-will\"",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("respawn") || text.contains("Throttle") || text.contains("exited") {
-            clues.push("launchd respawned daemon (KeepAlive triggered)".to_string());
-        }
-    }
-
-    // 3. Check for memory pressure jetsam events
-    if let Ok(output) = Command::new("log")
-        .args([
-            "show", "--predicate",
-            "eventMessage CONTAINS \"jettisoned\" OR eventMessage CONTAINS \"memorystatus\" OR (eventMessage CONTAINS \"Killed\" AND eventMessage CONTAINS \"tmux\")",
-            "--last", "2m",
-            "--style", "compact",
-        ])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if !text.trim().is_empty() {
-            clues.push(format!("memory pressure event: {}", text.lines().next().unwrap_or("(empty)")));
-        }
-    }
-
-    // 4. Check our own daemon stdout/stderr log for clues
-    let log_path = gw_home().join("logs").join("daemon.stderr.log");
-    if let Ok(content) = std::fs::read_to_string(&log_path) {
-        let tail: Vec<&str> = content.lines().rev().take(10).collect();
-        let tail_str = tail.join(" ");
-        if tail_str.contains("SIGTERM") || tail_str.contains("shutdown") {
-            clues.push("daemon received SIGTERM (check: launchd restart or gw daemon stop?)".to_string());
-        }
-    }
-
-    // 5. Check if AbandonProcessGroup is in the plist
-    let plist_path = dirs::home_dir()
-        .map(|h| h.join("Library/LaunchAgents/com.greater-will.daemon.plist"));
-    if let Some(path) = plist_path {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if !content.contains("AbandonProcessGroup") {
-                    clues.push("LIKELY CAUSE: plist missing AbandonProcessGroup — launchd kills entire process group on daemon restart/stop. Fix: run `gw daemon uninstall && gw daemon install`".to_string());
-                }
-            }
-        }
-    }
-
-    if clues.is_empty() {
-        "no clues found in system log (try: sudo dtrace -n 'proc:::signal-send /args[1]->pr_fname == \"tmux\"/ { trace(execname); }')".to_string()
-    } else {
-        clues.join("; ")
-    }
-}
+// BACK-006: Legacy diagnose_session_death and diagnose_tmux_server_death
+// removed (~180 lines of dead code). DaemonRunMonitor performs its own
+// diagnosis. See git history for the original implementation if needed.
 
 /// Check if a claude process is running inside a tmux session.
 ///

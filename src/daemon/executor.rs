@@ -352,9 +352,9 @@ mod tests {
 
     #[test]
     fn check_git_clean_nonexistent_dir() {
-        // Non-existent directory should return a warning
+        // Non-existent directory: Command::output() fails because the OS
+        // cannot set the working directory, so .ok()? returns None.
         let result = check_git_clean(Path::new("/nonexistent/repo"));
-        // git command will fail, returning Some
-        assert!(result.is_some() || result.is_none()); // either is fine
+        assert!(result.is_none());
     }
 }
