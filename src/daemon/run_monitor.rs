@@ -790,7 +790,7 @@ impl DaemonRunMonitor {
 
         // CRITICAL DISTINCTION:
         // - file_on_disk && !exists → active=false → COMPLETION (intentional)
-        // - !file_on_disk          → file deleted → CRASH
+        // - !file_on_disk          → file deleted → CRASH (unless checkpoint says done)
         let gone_since = *self.loop_state_gone_since.get_or_insert(Instant::now());
         if file_on_disk {
             // Intentional deactivation — wait for completion grace.
@@ -798,8 +798,24 @@ impl DaemonRunMonitor {
                 return Some(DaemonRunOutcome::Completed);
             }
         } else {
-            // File deleted → crash path after grace period.
+            // File deleted — but check checkpoint before assuming crash.
+            // Parity with single-session monitor: if the terminal phase (merge)
+            // is completed, the pipeline is done even if the file was deleted.
             if gone_since.elapsed().as_secs() >= LOOP_STATE_GONE_GRACE_SECS {
+                // Read checkpoint to distinguish "completed but file cleaned up"
+                // from genuine crash.
+                if let Some(checkpoint) = read_cached_checkpoint(
+                    &self.repo_dir,
+                    &mut self.cached_checkpoint_path,
+                ) {
+                    if checkpoint.is_complete() || checkpoint.is_terminal_phase_completed() {
+                        info!(
+                            run_id = %self.run_id,
+                            "Loop state file deleted but checkpoint shows completion — treating as completed"
+                        );
+                        return Some(DaemonRunOutcome::Completed);
+                    }
+                }
                 return Some(DaemonRunOutcome::Crashed {
                     reason: "arc-phase-loop state file deleted".to_string(),
                 });

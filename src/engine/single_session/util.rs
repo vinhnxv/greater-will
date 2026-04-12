@@ -161,8 +161,12 @@ pub(crate) fn resolve_restart_command(
         }
     };
 
-    // Check if already complete
-    if checkpoint.is_complete() {
+    // Check if already complete.
+    // Defense-in-depth: also check terminal phase directly in case
+    // is_complete() has edge cases with partial phase maps.
+    if checkpoint.is_complete() || checkpoint.is_terminal_phase_completed() {
+        info!(restart = restart_count, "Pipeline already complete (merge done) — skipping restart");
+        println!("[gw] Pipeline already complete (merge phase done) — not restarting");
         return RestartDecision::AlreadyDone;
     }
 
