@@ -239,6 +239,46 @@ pub enum Commands {
     /// - Temporary checkpoint files
     /// - Log files from previous runs
     Clean,
+
+    /// Browse history of past arc runs.
+    ///
+    /// Reads run metadata and logs directly from disk (~/.gw/runs/).
+    /// Works without the daemon running.
+    History {
+        /// Maximum number of runs to display.
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+
+        /// Filter by status: succeeded, failed, stopped.
+        #[arg(short, long)]
+        status: Option<String>,
+
+        /// Filter by repository path (substring match).
+        #[arg(short, long)]
+        repo: Option<String>,
+
+        /// Show detailed info for a specific run ID (prefix match).
+        #[arg(long)]
+        detail: Option<String>,
+
+        /// Show event logs for a specific run ID (prefix match).
+        ///
+        /// Reads from ~/.gw/runs/<id>/logs/events.jsonl directly.
+        #[arg(long)]
+        logs: Option<String>,
+
+        /// When used with --logs, show raw pane capture instead of events.
+        #[arg(long)]
+        pane: bool,
+
+        /// When used with --logs, show only the last N lines.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for `gw daemon`.
