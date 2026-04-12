@@ -429,11 +429,19 @@ impl Checkpoint {
                 next_pending: next,
             },
             (Some((last, _)), None) => {
-                // Last completed but no more pending — check if truly all done
-                if self.is_complete() {
+                // Last completed but no more pending phases ahead.
+                // This includes the case where `merge` (terminal) completed
+                // but is_complete() might still return false due to stale
+                // pending phases earlier in the pipeline. Treat as AllDone
+                // when the last completed phase is at or past the terminal
+                // index, or when is_complete() agrees.
+                let last_idx = crate::checkpoint::phase_order::phase_index(last).unwrap_or(0);
+                let terminal_idx = crate::checkpoint::phase_order::PHASE_COUNT.saturating_sub(1);
+                if self.is_complete() || last_idx >= terminal_idx {
                     PhasePosition::AllDone
                 } else {
-                    // Some phases may be failed
+                    // Genuinely mid-pipeline with no actionable next phase
+                    // (e.g., remaining phases are all failed).
                     PhasePosition::Transitioning {
                         last_completed: last,
                         last_completed_at: self.phases.get(last).and_then(|p| p.completed_at.clone()),
@@ -476,9 +484,20 @@ impl Checkpoint {
     ///
     /// An arc is complete if:
     /// - `completed_at` is set, OR
+    /// - The terminal phase (`merge`) is "completed" — regardless of other
+    ///   phases' statuses, because `merge` is the last phase in `PHASE_ORDER`
+    ///   and a completed merge means the pipeline ran to its end, OR
     /// - All phases are "completed" or "skipped"
     pub fn is_complete(&self) -> bool {
         if self.completed_at.is_some() {
+            return true;
+        }
+
+        // Terminal phase check: if `merge` (last in PHASE_ORDER) is completed,
+        // the pipeline is done even if earlier phases are still "pending"
+        // (e.g., due to skip_map not being populated, schema version drift,
+        // or Rune not marking all skipped phases before exiting).
+        if self.is_terminal_phase_completed() {
             return true;
         }
 
@@ -486,6 +505,20 @@ impl Checkpoint {
             && self.phases.values().all(|p| {
                 p.status == "completed" || p.status == "skipped"
             })
+    }
+
+    /// Check if the terminal phase (last in PHASE_ORDER) is completed.
+    ///
+    /// This is a stronger signal than `completed_at` because Rune doesn't
+    /// always set that field. If the last phase ran to completion, the
+    /// pipeline is definitively done.
+    pub fn is_terminal_phase_completed(&self) -> bool {
+        let terminal = crate::checkpoint::phase_order::phase_at(
+            crate::checkpoint::phase_order::PHASE_COUNT - 1,
+        );
+        terminal
+            .and_then(|name| self.phases.get(name))
+            .is_some_and(|p| p.status == "completed")
     }
 
     /// Check if a phase is in the skip_map (will be auto-skipped by Rune).
@@ -1256,5 +1289,82 @@ mod tests {
             }
             other => panic!("Expected Running, got {:?}", other),
         }
+    }
+
+    // ── Terminal phase completion tests ─────────────────────────────
+
+    /// Helper: build a checkpoint with merge completed but some earlier
+    /// phases still "pending" — the exact scenario that caused the
+    /// post-merge restart loop.
+    fn checkpoint_merge_done_but_pending_earlier() -> Checkpoint {
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+        let mut cp = Checkpoint::default();
+        for &phase in PHASE_ORDER {
+            let status = match phase {
+                // Simulate: some early phases pending (never populated by Rune)
+                "design_extraction" | "design_prototype" | "storybook_verification"
+                | "design_verification" | "design_verification_qa" | "ux_verification"
+                | "design_iteration" => "pending",
+                // Everything else completed
+                _ => "completed",
+            };
+            cp.phases.insert(phase.to_string(), PhaseStatus {
+                status: status.to_string(),
+                ..Default::default()
+            });
+        }
+        cp
+    }
+
+    #[test]
+    fn test_is_terminal_phase_completed_true() {
+        let cp = checkpoint_merge_done_but_pending_earlier();
+        assert!(cp.is_terminal_phase_completed());
+    }
+
+    #[test]
+    fn test_is_terminal_phase_completed_false_when_merge_pending() {
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "pending".to_string(),
+            ..Default::default()
+        });
+        assert!(!cp.is_terminal_phase_completed());
+    }
+
+    #[test]
+    fn test_is_complete_with_terminal_phase_done_despite_pending() {
+        // This is THE bug scenario: merge done, some phases pending.
+        // Before the fix, is_complete() returned false → crash loop.
+        let cp = checkpoint_merge_done_but_pending_earlier();
+        assert!(
+            cp.is_complete(),
+            "is_complete() should return true when merge (terminal) is completed, \
+             even if earlier phases are still pending"
+        );
+    }
+
+    #[test]
+    fn test_infer_phase_position_alldone_when_merge_completed() {
+        // With merge completed, infer_phase_position should return AllDone
+        // (not Transitioning with empty next_pending).
+        let cp = checkpoint_merge_done_but_pending_earlier();
+        assert!(
+            matches!(cp.infer_phase_position(), PhasePosition::AllDone),
+            "Expected AllDone when merge is completed, got {:?}",
+            cp.infer_phase_position()
+        );
+    }
+
+    #[test]
+    fn test_inferred_phase_name_none_when_merge_completed() {
+        // inferred_phase_name should return None (AllDone) — not "work"
+        // or any other phase that would trigger a restart.
+        let cp = checkpoint_merge_done_but_pending_earlier();
+        assert_eq!(
+            cp.inferred_phase_name(),
+            None,
+            "inferred_phase_name should be None when pipeline is AllDone"
+        );
     }
 }
