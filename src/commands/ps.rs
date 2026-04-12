@@ -99,12 +99,17 @@ fn print_table(runs: &[RunInfo]) {
     let narrow = term_width < 60;
 
     // Pre-compute row data
-    let rows: Vec<RowData> = runs
+    let mut rows: Vec<(u8, RowData)> = runs
         .iter()
         .map(|run| {
+            let sort_key = match run.status {
+                RunStatus::Running => 0,
+                RunStatus::Queued => 1,
+                _ => 2,
+            };
             let status_plain = format_status_plain(run.status);
             let status_styled = format_status(run.status);
-            RowData {
+            (sort_key, RowData {
                 id: short_id(&run.run_id).to_string(),
                 tmux: run.session_name.clone(),
                 status_plain,
@@ -113,9 +118,11 @@ fn print_table(runs: &[RunInfo]) {
                 repo: abbreviate_home(&run.repo_dir.to_string_lossy()),
                 phase: run.current_phase.as_deref().unwrap_or("-").to_string(),
                 uptime: format_uptime(run.uptime_secs),
-            }
+            })
         })
         .collect();
+    rows.sort_by_key(|(k, _)| *k);
+    let rows: Vec<RowData> = rows.into_iter().map(|(_, r)| r).collect();
 
     // Fixed-width columns: ID, TMUX, STATUS, PHASE, UPTIME (plus border chars).
     // Each column has 3 chars overhead: space + content + space, plus 1 for the │.

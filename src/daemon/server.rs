@@ -456,18 +456,42 @@ async fn dispatch_request(
                 }
             };
 
-            // BACK-003: Delegate to `executor::spawn_run`, which registers
-            // the run AND spawns the tmux session. Previously the handler
-            // only called `reg.register_run()` and never started tmux, so
-            // every submitted run sat in the Queued state forever.
-            //
-            // Note: `executor::spawn_run` internally calls `register_run`,
-            // so we MUST NOT call it ourselves beforehand — the per-repo
-            // flock would reject the nested registration. The call is
-            // awaited inline (not wrapped in `tokio::spawn`) because the
-            // registry lock is only held briefly inside the executor, the
-            // tmux work is sub-second, and we need the returned run_id for
-            // the synchronous response.
+            // Check if repo already has an active run — enqueue if so
+            {
+                let mut reg = registry.lock().await;
+                if reg.has_repo_lock(&canonical_repo) {
+                    // Repo is busy — enqueue for later
+                    let run_id = crate::daemon::registry::RunRegistry::generate_id();
+                    let pending = crate::daemon::registry::PendingRun {
+                        run_id: run_id.clone(),
+                        plan_path: canonical_plan.clone(),
+                        repo_dir: canonical_repo.clone(),
+                        session_name: session_name.clone(),
+                        config_dir: config_dir.clone(),
+                        verbose,
+                        queued_at: chrono::Utc::now(),
+                    };
+                    match reg.enqueue_run(pending) {
+                        Ok(position) => {
+                            return Response::RunQueued { run_id, position };
+                        }
+                        Err(e) => {
+                            let code = if e.to_string().contains("queue full") {
+                                ErrorCode::QueueFull
+                            } else if e.to_string().contains("already queued") {
+                                ErrorCode::InvalidRequest
+                            } else {
+                                ErrorCode::InternalError
+                            };
+                            return Response::Error {
+                                code,
+                                message: e.to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+            // No active run — spawn directly (existing path)
             match crate::daemon::executor::spawn_run(
                 Arc::clone(registry),
                 &canonical_plan,
@@ -480,8 +504,6 @@ async fn dispatch_request(
             {
                 Ok(run_id) => Response::RunSubmitted { run_id },
                 Err(e) => {
-                    // QUAL-005: classify errors into typed ErrorCode
-                    // variants instead of a naive `contains("locked")`.
                     let code = classify_spawn_error(&e);
                     Response::Error {
                         code,
@@ -549,12 +571,23 @@ async fn dispatch_request(
                 }
             };
 
+            // Check if run is queued (no tmux session to kill)
+            {
+                let mut reg = registry.lock().await;
+                if let Some(entry) = reg.get(&actual_id) {
+                    if entry.status == RunStatus::Queued {
+                        reg.dequeue_run(&actual_id);
+                        drop(reg);
+                        return Response::Ok {
+                            message: format!("removed from queue: {actual_id}"),
+                        };
+                    }
+                }
+            }
+
             // SEC-002: Delegate to `executor::stop_run`, which sends /exit
             // to the tmux session, waits for graceful shutdown, force-kills
-            // on timeout, and then updates the registry. The previous code
-            // only mutated the registry — it left the tmux session (and
-            // its arc worker) running, leaking resources and making the
-            // "stopped" state a lie.
+            // on timeout, and then updates the registry.
             match crate::daemon::executor::stop_run(Arc::clone(registry), Arc::clone(monitors), &actual_id).await {
                 Ok(()) => Response::Ok {
                     message: format!("run {actual_id} stopped"),
@@ -645,11 +678,18 @@ async fn dispatch_request(
         }
 
         Request::Shutdown => {
+            let pending_count = {
+                let reg = registry.lock().await;
+                reg.total_pending_count()
+            };
             tracing::info!("shutdown requested via socket");
             cancel.cancel();
-            Response::Ok {
-                message: "shutting down".into(),
-            }
+            let msg = if pending_count > 0 {
+                format!("shutting down — {} queued plan(s) will be lost", pending_count)
+            } else {
+                "shutting down".into()
+            };
+            Response::Ok { message: msg }
         }
     }
 }
@@ -790,6 +830,50 @@ fn classify_spawn_error(e: &color_eyre::Report) -> ErrorCode {
         ErrorCode::InvalidRequest
     } else {
         ErrorCode::InternalError
+    }
+}
+
+/// Drain the next queued run for a repo after a run completes.
+///
+/// CRITICAL: Must be called AFTER releasing the registry lock.
+/// Uses `tokio::spawn` to avoid deadlock — `spawn_run` re-acquires the lock.
+pub(crate) async fn drain_if_available(
+    registry: Arc<Mutex<RunRegistry>>,
+    repo_dir: &Path,
+    failed: bool,
+) {
+    let next = {
+        let mut reg = registry.lock().await;
+        if failed {
+            reg.record_queue_failure(repo_dir);
+        } else {
+            reg.record_queue_success(repo_dir);
+        }
+        reg.drain_next(repo_dir)
+    };
+
+    if let Some(pending) = next {
+        let registry = Arc::clone(&registry);
+        let plan_path = pending.plan_path.clone();
+        let repo_dir = pending.repo_dir.clone();
+        let session_name = pending.session_name.or_else(|| Some(format!("gw-{}", &pending.run_id)));
+        let config_dir = pending.config_dir.clone();
+        let verbose = pending.verbose;
+
+        tokio::spawn(async move {
+            match crate::daemon::executor::spawn_run(
+                registry, &plan_path, &repo_dir, session_name, config_dir, verbose,
+            )
+            .await
+            {
+                Ok(run_id) => {
+                    tracing::info!(run_id = %run_id, "drained queued run — now running");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to spawn drained run");
+                }
+            }
+        });
     }
 }
 

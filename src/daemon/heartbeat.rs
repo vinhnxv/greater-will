@@ -9,6 +9,7 @@
 use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::RunRegistry;
+use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
@@ -551,10 +552,14 @@ async fn handle_monitor_outcome(
                 );
                 dir
             };
-            if let Some(dir) = repo_dir {
-                CrashLoopDetector::clear_history(&dir);
+            if let Some(ref dir) = repo_dir {
+                CrashLoopDetector::clear_history(dir);
             }
             append_event(run_id, "completed", "pipeline finished");
+            // Drain next queued run for this repo
+            if let Some(ref dir) = repo_dir {
+                drain_if_available(Arc::clone(&registry), dir, false).await;
+            }
         }
 
         DaemonRunOutcome::Failed { reason } => {
@@ -562,6 +567,16 @@ async fn handle_monitor_outcome(
             let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone()));
             drop(reg);
             append_event(run_id, "failed", &reason);
+            // Drain next queued run for this repo (failure increments circuit breaker)
+            {
+                let repo_dir = {
+                    let reg = registry.lock().await;
+                    reg.get(run_id).map(|e| e.repo_dir.clone())
+                };
+                if let Some(dir) = repo_dir {
+                    drain_if_available(Arc::clone(&registry), &dir, true).await;
+                }
+            }
         }
 
         DaemonRunOutcome::Cancelled => {
@@ -581,6 +596,14 @@ async fn handle_monitor_outcome(
                 );
                 drop(reg);
                 append_event(run_id, "fatal_error", &reason);
+                // Drain next queued run (fatal error counts as failure)
+                let repo_dir_for_drain = {
+                    let reg = registry.lock().await;
+                    reg.get(run_id).map(|e| e.repo_dir.clone())
+                };
+                if let Some(dir) = repo_dir_for_drain {
+                    drain_if_available(Arc::clone(&registry), &dir, true).await;
+                }
                 return;
             }
 

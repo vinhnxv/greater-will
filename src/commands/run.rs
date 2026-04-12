@@ -813,6 +813,14 @@ fn delegate_to_daemon(plans: &[String], cwd: &Path, config_dir: Option<&Path>, v
                 println!("  Stop:    gw stop {}", short);
                 println!();
             }
+            Response::RunQueued { run_id, position } => {
+                let short = crate::commands::util::short_id(&run_id);
+                println!("{} Queued:  {} [{}] (position {} in queue)",
+                    tag("RUN"), plan, short, position);
+                println!("  Monitor: gw ps");
+                println!("  Cancel:  gw stop {}", short);
+                println!();
+            }
             Response::Error { message, .. } => {
                 println!("{} Failed to submit {}: {}", tag("FAIL"), plan, message);
             }
