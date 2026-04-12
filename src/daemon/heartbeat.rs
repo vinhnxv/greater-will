@@ -879,18 +879,33 @@ async fn spawn_recovery_with_command(
 /// Used only when checkpoint.json is not available (e.g., session just started
 /// and Rune hasn't written a checkpoint yet).
 fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
+    // Primary: match the arc stop-hook's system message format:
+    //   "Arc phase loop — executing phase: {PHASE_NAME} (iteration N)"
+    // Scan bottom-up so the most recent phase wins.
+    for line in pane_content.lines().rev().take(30) {
+        if let Some(rest) = line.to_lowercase().strip_prefix("arc phase loop") {
+            // Extract phase name after "executing phase: "
+            if let Some(phase_start) = rest.find("executing phase:") {
+                let after = &rest[phase_start + "executing phase:".len()..];
+                let phase = after.trim().split_whitespace().next()?;
+                return Some(phase.to_string());
+            }
+        }
+    }
+
+    // Fallback: match "phase_N" markers (these are unambiguous)
     let last_lines: Vec<&str> = pane_content.lines().rev().take(20).collect();
     let tail = last_lines.join("\n").to_lowercase();
 
-    if tail.contains("phase_1") || tail.contains("plan") {
+    if tail.contains("phase_1") {
         Some("plan".to_string())
-    } else if tail.contains("phase_2") || tail.contains("work") {
+    } else if tail.contains("phase_2") {
         Some("work".to_string())
-    } else if tail.contains("phase_3") || tail.contains("review") {
+    } else if tail.contains("phase_3") {
         Some("review".to_string())
-    } else if tail.contains("phase_4") || tail.contains("test") {
+    } else if tail.contains("phase_4") {
         Some("test".to_string())
-    } else if tail.contains("phase_5") || tail.contains("ship") || tail.contains("merge") {
+    } else if tail.contains("phase_5") {
         Some("ship".to_string())
     } else {
         None
@@ -1193,5 +1208,44 @@ mod tests {
 
         cancel.cancel();
         unsafe { std::env::remove_var("GW_HOME") };
+    }
+
+    // ── phase_from_pane_heuristic tests ──
+
+    #[test]
+    fn heuristic_matches_arc_system_message() {
+        let pane = "some startup output\n\
+                     Arc phase loop — executing phase: forge (iteration 1)\n\
+                     Loading plan...";
+        assert_eq!(phase_from_pane_heuristic(pane), Some("forge".to_string()));
+    }
+
+    #[test]
+    fn heuristic_picks_most_recent_phase() {
+        let pane = "Arc phase loop — executing phase: forge (iteration 1)\n\
+                     ...forge output...\n\
+                     Arc phase loop — executing phase: plan_review (iteration 2)\n\
+                     reviewing...";
+        assert_eq!(phase_from_pane_heuristic(pane), Some("plan_review".to_string()));
+    }
+
+    #[test]
+    fn heuristic_no_false_positive_on_work_keyword() {
+        // "work" appears in casual text but there's no arc system message
+        let pane = "Starting work on plan...\n\
+                     Working directory: /tmp/foo\n\
+                     Network request completed";
+        assert_eq!(phase_from_pane_heuristic(pane), None);
+    }
+
+    #[test]
+    fn heuristic_falls_back_to_phase_n_markers() {
+        let pane = "some output\nphase_3 starting\nmore output";
+        assert_eq!(phase_from_pane_heuristic(pane), Some("review".to_string()));
+    }
+
+    #[test]
+    fn heuristic_returns_none_on_empty() {
+        assert_eq!(phase_from_pane_heuristic(""), None);
     }
 }
