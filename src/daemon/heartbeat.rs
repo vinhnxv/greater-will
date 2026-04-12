@@ -9,6 +9,7 @@
 use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::RunRegistry;
+use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
@@ -551,17 +552,27 @@ async fn handle_monitor_outcome(
                 );
                 dir
             };
-            if let Some(dir) = repo_dir {
-                CrashLoopDetector::clear_history(&dir);
+            if let Some(ref dir) = repo_dir {
+                CrashLoopDetector::clear_history(dir);
             }
             append_event(run_id, "completed", "pipeline finished");
+            // Drain next queued run for this repo
+            if let Some(ref dir) = repo_dir {
+                drain_if_available(Arc::clone(&registry), dir, false).await;
+            }
         }
 
         DaemonRunOutcome::Failed { reason } => {
             let mut reg = registry.lock().await;
             let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone()));
+            // Extract repo_dir before dropping lock to avoid re-acquisition race
+            let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
             drop(reg);
             append_event(run_id, "failed", &reason);
+            // Drain next queued run for this repo (failure increments circuit breaker)
+            if let Some(dir) = repo_dir {
+                drain_if_available(Arc::clone(&registry), &dir, true).await;
+            }
         }
 
         DaemonRunOutcome::Cancelled => {
@@ -581,6 +592,14 @@ async fn handle_monitor_outcome(
                 );
                 drop(reg);
                 append_event(run_id, "fatal_error", &reason);
+                // Drain next queued run (fatal error counts as failure)
+                let repo_dir_for_drain = {
+                    let reg = registry.lock().await;
+                    reg.get(run_id).map(|e| e.repo_dir.clone())
+                };
+                if let Some(dir) = repo_dir_for_drain {
+                    drain_if_available(Arc::clone(&registry), &dir, true).await;
+                }
                 return;
             }
 
@@ -709,6 +728,39 @@ async fn attempt_recovery(
     use crate::engine::single_session::util::resolve_restart_command;
     use crate::engine::single_session::util::RestartDecision;
     use crate::engine::single_session::SingleSessionConfig;
+
+    // Terminal-status gate: if the run has been moved to Stopped/Failed/Succeeded
+    // by stop_run/detach/completion between the monitor outcome firing and this
+    // recovery call, DO NOT respawn. This closes the auto-resume race where
+    // `stop_run` cancels the per-run monitor token but the outer outcome task
+    // holds the global token (heartbeat.rs:206) and sails past the cooldown into
+    // recovery. Without this gate, `gw stop` would be overridden and the run
+    // would respawn repeatedly — exactly the "can't stop" symptom reported.
+    {
+        let reg = registry.lock().await;
+        if let Some(entry) = reg.get(run_id) {
+            if matches!(
+                entry.status,
+                RunStatus::Stopped | RunStatus::Failed | RunStatus::Succeeded
+            ) {
+                info!(
+                    run_id = %run_id,
+                    status = ?entry.status,
+                    "Recovery skipped: run has terminal status (stopped/failed/succeeded)"
+                );
+                append_event(
+                    run_id,
+                    "recovery_skipped",
+                    &format!("terminal status {:?} — not respawning", entry.status),
+                );
+                return;
+            }
+        } else {
+            // Run gone from registry entirely (e.g., pruned) — nothing to recover.
+            debug!(run_id = %run_id, "Recovery skipped: run not in registry");
+            return;
+        }
+    }
 
     let config = SingleSessionConfig::new(repo_dir);
     let plan_str = plan_path.to_string_lossy();
