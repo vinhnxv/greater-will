@@ -862,7 +862,7 @@ pub(crate) async fn drain_if_available(
 
         tokio::spawn(async move {
             match crate::daemon::executor::spawn_run(
-                registry, &plan_path, &repo_dir, session_name, config_dir, verbose,
+                Arc::clone(&registry), &plan_path, &repo_dir, session_name, config_dir, verbose,
             )
             .await
             {
@@ -870,7 +870,20 @@ pub(crate) async fn drain_if_available(
                     tracing::info!(run_id = %run_id, "drained queued run — now running");
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to spawn drained run");
+                    tracing::error!(error = %e, "failed to spawn drained run — recording failure");
+                    // Record failure so circuit breaker tracks it, then try next entry
+                    let mut reg = registry.lock().await;
+                    reg.record_queue_failure(&repo_dir);
+                    let next = reg.drain_next(&repo_dir);
+                    drop(reg);
+                    if let Some(retry) = next {
+                        tracing::info!("retrying with next queued run after spawn failure");
+                        let _ = crate::daemon::executor::spawn_run(
+                            registry, &retry.plan_path, &retry.repo_dir,
+                            retry.session_name.or_else(|| Some(format!("gw-{}", &retry.run_id))),
+                            retry.config_dir, retry.verbose,
+                        ).await;
+                    }
                 }
             }
         });

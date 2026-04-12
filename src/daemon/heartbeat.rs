@@ -565,17 +565,13 @@ async fn handle_monitor_outcome(
         DaemonRunOutcome::Failed { reason } => {
             let mut reg = registry.lock().await;
             let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone()));
+            // Extract repo_dir before dropping lock to avoid re-acquisition race
+            let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
             drop(reg);
             append_event(run_id, "failed", &reason);
             // Drain next queued run for this repo (failure increments circuit breaker)
-            {
-                let repo_dir = {
-                    let reg = registry.lock().await;
-                    reg.get(run_id).map(|e| e.repo_dir.clone())
-                };
-                if let Some(dir) = repo_dir {
-                    drain_if_available(Arc::clone(&registry), &dir, true).await;
-                }
+            if let Some(dir) = repo_dir {
+                drain_if_available(Arc::clone(&registry), &dir, true).await;
             }
         }
 
