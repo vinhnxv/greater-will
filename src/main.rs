@@ -80,5 +80,15 @@ fn main() -> Result<()> {
             Ok(())
         }
         commands::Commands::Clean => commands::clean::execute(),
+        commands::Commands::History {
+            limit,
+            status,
+            repo,
+            detail,
+            logs,
+            pane,
+            tail,
+            json,
+        } => commands::history::execute(limit, status, repo, detail, logs, pane, tail, json),
     }
 }

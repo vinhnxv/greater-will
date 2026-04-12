@@ -6,6 +6,7 @@
 pub mod clean;
 pub mod daemon;
 pub mod elden;
+pub mod history;
 pub mod logs;
 pub mod ps;
 pub mod replay;
