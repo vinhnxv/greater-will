@@ -55,12 +55,26 @@ pub fn execute(
 
     // Daemon delegation: if the daemon is running and --foreground is not set,
     // submit the plan for background execution instead of running inline.
+    // If the daemon is NOT running, fall back to foreground mode transparently
+    // so the user never hits a hard error just because the daemon is down.
+    // We print a visible notice so they know why there's no background
+    // tracking, log follow, queue support, or crash recovery on this run.
+    //
     // NOTE: This block is placed AFTER config_dir resolution so the daemon
     // receives the resolved config_dir (CLI flag or env var).
     if !foreground && !dry_run && mock.is_none() {
         if crate::client::socket::DaemonClient::is_daemon_running() {
             return delegate_to_daemon(&plans, &cwd, config_dir.as_deref(), verbose);
         }
+        // Daemon is down — inform the user before silently falling through to
+        // the foreground path. Stderr so it's visible even when stdout is
+        // piped, and prefixed with [gw] to match the rest of the CLI output.
+        eprintln!(
+            "[gw] NOTICE: daemon is not running — falling back to foreground mode.\n\
+             [gw]   This run will block your terminal and has no log follow / queue / auto-recovery.\n\
+             [gw]   Start the daemon with `gw daemon start` for background execution,\n\
+             [gw]   or pass `--foreground` explicitly to silence this notice."
+        );
     }
 
     // Pre-flight: check for uncommitted git changes
@@ -118,6 +132,22 @@ fn run_single(
     // directory, refuse to run in foreground mode — two concurrent runs on
     // the same repo would corrupt branches, checkpoints, and tmux state.
     check_daemon_repo_lock(cwd)?;
+
+    // Guard: serialize concurrent foreground `gw run` invocations on the same
+    // repo to prevent tmux session, session-owner, and checkpoint corruption.
+    //
+    // Policy (matches user expectation):
+    //   - Same plan file already running on this repo → reject fast.
+    //     Running the exact same plan twice is always a mistake.
+    //   - Different plan on this repo → queue behind via blocking flock.
+    //     The kernel gives us FIFO semantics for free; Ctrl+C stays responsive
+    //     because flock is signal-interruptible on POSIX.
+    //
+    // The session-owner check is best-effort (there's a small race between
+    // the read and the lock acquire), but since we fall through to the
+    // blocking lock anyway, a race just turns a fast-reject into a queued
+    // run — not a correctness issue.
+    let _instance_lock = acquire_run_lock(cwd, plans.first().map(|s| s.as_str()))?;
 
     preflight_tmux()?;
 
@@ -551,6 +581,67 @@ fn check_daemon_repo_lock(cwd: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Acquire the per-repo instance lock with same-plan fast-reject.
+///
+/// Behavior:
+///   - If an active gw run on this repo is executing the **same** plan file:
+///     returns an error immediately. Running the same plan twice is a bug.
+///   - If a different plan is active: prints a queued message and blocks
+///     until the current holder releases the flock. The kernel provides
+///     FIFO ordering; Ctrl+C stays responsive.
+///   - If nothing is active: blocking-lock acquires instantly.
+///
+/// The session-owner read is best-effort and racy; the authoritative
+/// serialization is the flock itself. The check exists purely so that the
+/// same-plan case fails fast with a useful error instead of silently queuing
+/// a wasteful duplicate run.
+fn acquire_run_lock(cwd: &Path, plan_hint: Option<&str>) -> Result<crate::batch::lock::InstanceLock> {
+    use crate::monitor::session_owner::read_session_owner;
+
+    // Best-effort check: is another gw already active on this repo?
+    if let Some(owner) = read_session_owner(cwd) {
+        let owner_alive = crate::cleanup::process::is_pid_alive(owner.gw_pid);
+        if owner_alive {
+            let same_plan = plan_hint
+                .map(|p| plans_equivalent(p, &owner.plan_file, cwd))
+                .unwrap_or(false);
+
+            if same_plan {
+                eyre::bail!(
+                    "Plan '{}' is already running on this repo (gw PID {}). \
+                     Wait for it to finish or run `gw stop {}` to cancel.",
+                    owner.plan_file,
+                    owner.gw_pid,
+                    owner.session_name,
+                );
+            }
+
+            println!(
+                "[gw] Another gw run is active (PID {}, plan: {}). Queueing — will start when it releases the lock. Ctrl+C to cancel.",
+                owner.gw_pid,
+                owner.plan_file,
+            );
+        }
+    }
+
+    // Blocking acquire: queues behind any active holder, then proceeds.
+    crate::batch::lock::InstanceLock::acquire_blocking()
+        .wrap_err("Failed to acquire gw instance lock")
+}
+
+/// Best-effort comparison of two plan path strings.
+///
+/// Canonicalizes both relative to `cwd`. Falls back to string equality if
+/// canonicalization fails (e.g., one of the paths no longer exists).
+fn plans_equivalent(a: &str, b: &str, cwd: &Path) -> bool {
+    let canon = |p: &str| -> PathBuf {
+        let path = Path::new(p);
+        let abs = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+        std::fs::canonicalize(&abs).unwrap_or(abs)
+    };
+    canon(a) == canon(b)
 }
 
 /// Expand glob patterns in plan file paths.

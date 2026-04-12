@@ -733,6 +733,39 @@ async fn attempt_recovery(
     use crate::engine::single_session::util::RestartDecision;
     use crate::engine::single_session::SingleSessionConfig;
 
+    // Terminal-status gate: if the run has been moved to Stopped/Failed/Succeeded
+    // by stop_run/detach/completion between the monitor outcome firing and this
+    // recovery call, DO NOT respawn. This closes the auto-resume race where
+    // `stop_run` cancels the per-run monitor token but the outer outcome task
+    // holds the global token (heartbeat.rs:206) and sails past the cooldown into
+    // recovery. Without this gate, `gw stop` would be overridden and the run
+    // would respawn repeatedly — exactly the "can't stop" symptom reported.
+    {
+        let reg = registry.lock().await;
+        if let Some(entry) = reg.get(run_id) {
+            if matches!(
+                entry.status,
+                RunStatus::Stopped | RunStatus::Failed | RunStatus::Succeeded
+            ) {
+                info!(
+                    run_id = %run_id,
+                    status = ?entry.status,
+                    "Recovery skipped: run has terminal status (stopped/failed/succeeded)"
+                );
+                append_event(
+                    run_id,
+                    "recovery_skipped",
+                    &format!("terminal status {:?} — not respawning", entry.status),
+                );
+                return;
+            }
+        } else {
+            // Run gone from registry entirely (e.g., pruned) — nothing to recover.
+            debug!(run_id = %run_id, "Recovery skipped: run not in registry");
+            return;
+        }
+    }
+
     let config = SingleSessionConfig::new(repo_dir);
     let plan_str = plan_path.to_string_lossy();
     // Shell-escape single quotes to prevent command injection (SEC-001).
