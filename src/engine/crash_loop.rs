@@ -154,6 +154,33 @@ impl CrashLoopDetector {
         }
     }
 
+    /// Record healthy runtime duration from a completed session (GAP 2 parity).
+    ///
+    /// Unlike `record_healthy_tick()` which requires a live `Instant` and is
+    /// called periodically, this method accepts a duration in seconds and is
+    /// designed for the daemon path where the detector is recreated per-event.
+    ///
+    /// If `duration_secs >= stability_period`, crash history is cleared entirely.
+    /// Otherwise, if no healthy tracking is active, it begins now.
+    pub fn record_healthy_runtime(&mut self, duration_secs: u64) {
+        // Guard: a session that ran for 0 seconds was not healthy (FLAW-002 fix).
+        if duration_secs == 0 {
+            return;
+        }
+        if duration_secs >= self.stability_period.as_secs() {
+            tracing::info!(
+                stability_secs = self.stability_period.as_secs(),
+                runtime_secs = duration_secs,
+                cleared_crashes = self.crash_times.len(),
+                "Session ran long enough to reset crash counters"
+            );
+            self.crash_times.clear();
+            self.healthy_since = Some(Instant::now());
+        } else if self.healthy_since.is_none() {
+            self.healthy_since = Some(Instant::now());
+        }
+    }
+
     /// Total restarts across the lifetime (for PipelineResult).
     pub fn total_restarts(&self) -> u32 { self.total_restarts }
 
@@ -192,10 +219,17 @@ impl CrashLoopDetector {
             now_epoch.saturating_sub(age_secs)
         }).collect();
 
+        // Convert healthy_since Instant to epoch for persistence (GAP 2/3)
+        let last_healthy_epoch = self.healthy_since.map(|since| {
+            let age = now_instant.duration_since(since).as_secs();
+            now_epoch.saturating_sub(age)
+        });
+
         let record = CrashHistoryRecord {
             crash_epochs,
             total_restarts: self.total_restarts,
             window_secs: self.window.as_secs(),
+            last_healthy_epoch,
         };
 
         let path = Self::history_path(working_dir);
@@ -268,6 +302,14 @@ impl CrashLoopDetector {
 
         self.total_restarts = record.total_restarts;
 
+        // Restore healthy_since if it's still within the stability period (GAP 2/3)
+        if let Some(epoch) = record.last_healthy_epoch {
+            let age = now_epoch.saturating_sub(epoch);
+            if age < self.stability_period.as_secs() {
+                self.healthy_since = Some(now_instant - Duration::from_secs(age));
+            }
+        }
+
         if restored > 0 {
             tracing::info!(
                 restored = restored,
@@ -307,6 +349,11 @@ struct CrashHistoryRecord {
     total_restarts: u32,
     /// Window size used when this history was written.
     window_secs: u64,
+    /// When healthy running started (Unix epoch). `None` if no healthy period
+    /// was active when the history was persisted. Added for GAP 2/3 parity —
+    /// old files without this field deserialize correctly (`Option` defaults to `None`).
+    #[serde(default)]
+    last_healthy_epoch: Option<u64>,
 }
 
 #[cfg(test)]
@@ -452,6 +499,7 @@ mod tests {
             ],
             total_restarts: 5,
             window_secs: 900,
+            last_healthy_epoch: None,
         };
 
         let gw_dir = dir.path().join(".gw");
@@ -465,5 +513,96 @@ mod tests {
         d.load_history(dir.path());
         assert_eq!(d.total_restarts(), 5); // total preserved
         assert_eq!(d.crashes_in_window(), 1); // only recent one survives window
+    }
+
+    #[test]
+    fn test_record_healthy_runtime_zero_is_noop() {
+        // FLAW-002: duration=0 should NOT clear crashes, even with stability_period=0
+        let mut d = CrashLoopDetector::new(5, 900, 0); // stability_period=0
+        d.record_restart();
+        d.record_restart();
+        assert_eq!(d.crashes_in_window(), 2);
+
+        d.record_healthy_runtime(0); // instant crash — not healthy
+        assert_eq!(d.crashes_in_window(), 2); // crashes preserved
+    }
+
+    #[test]
+    fn test_record_healthy_runtime_resets_crashes() {
+        // GAP 2: Long healthy runtime should clear crash counters
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.record_restart();
+        d.record_restart();
+        d.record_restart();
+        d.record_restart();
+        assert_eq!(d.crashes_in_window(), 4);
+
+        // Runtime exceeds stability_period (1800s) → crashes cleared
+        d.record_healthy_runtime(1800);
+        assert_eq!(d.crashes_in_window(), 0);
+        assert!(d.healthy_since.is_some());
+    }
+
+    #[test]
+    fn test_record_healthy_runtime_short_starts_tracking() {
+        // Short runtime below stability_period starts tracking but doesn't clear
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.record_restart();
+        d.record_restart();
+        assert_eq!(d.crashes_in_window(), 2);
+        assert!(d.healthy_since.is_none()); // reset by record_restart
+
+        d.record_healthy_runtime(600); // below 1800s threshold
+        assert_eq!(d.crashes_in_window(), 2); // crashes preserved
+        assert!(d.healthy_since.is_some()); // tracking started
+    }
+
+    #[test]
+    fn test_persist_and_load_with_healthy_epoch() {
+        // GAP 2/3: Roundtrip test for last_healthy_epoch persistence
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let mut d1 = CrashLoopDetector::new(5, 900, 1800);
+        d1.record_restart();
+        // Set healthy_since to now (simulating a healthy period started)
+        d1.healthy_since = Some(Instant::now());
+        d1.persist(dir.path()).unwrap();
+
+        // Load into a fresh detector
+        let mut d2 = CrashLoopDetector::new(5, 900, 1800);
+        d2.load_history(dir.path());
+        assert_eq!(d2.total_restarts(), 1);
+        // healthy_since should be restored (within stability period)
+        assert!(d2.healthy_since.is_some());
+    }
+
+    #[test]
+    fn test_load_old_history_without_healthy_epoch() {
+        // Backward compat: old files without last_healthy_epoch load correctly
+        let dir = tempfile::TempDir::new().unwrap();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Simulate an old-format history file (no last_healthy_epoch field)
+        let json = serde_json::json!({
+            "crash_epochs": [now_epoch - 10],
+            "total_restarts": 1,
+            "window_secs": 900
+        });
+
+        let gw_dir = dir.path().join(".gw");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        std::fs::write(
+            gw_dir.join("crash-history.json"),
+            json.to_string(),
+        ).unwrap();
+
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.load_history(dir.path());
+        assert_eq!(d.total_restarts(), 1);
+        assert_eq!(d.crashes_in_window(), 1);
+        assert!(d.healthy_since.is_none()); // not set (old format)
     }
 }
