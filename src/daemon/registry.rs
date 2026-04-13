@@ -510,23 +510,39 @@ impl RunRegistry {
 
     /// Remove a queued run by ID. Returns the PendingRun if found.
     pub fn dequeue_run(&mut self, run_id: &str) -> Option<PendingRun> {
-        for queue in self.pending_queues.values_mut() {
-            if let Some(pos) = queue.iter().position(|p| p.run_id == run_id) {
-                let pending = queue.remove(pos);
-                // Update the RunEntry to Stopped
-                let _ = self.update_status(
-                    run_id,
-                    RunStatus::Stopped,
-                    None,
-                    Some("removed from queue".into()),
-                );
-                if let Err(e) = self.save_queue() {
-                    tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
+        // Collect pending entry first without holding a mutable borrow of
+        // self.pending_queues while we call &mut self methods below.
+        let pending = {
+            let mut found: Option<PendingRun> = None;
+            for queue in self.pending_queues.values_mut() {
+                if let Some(pos) = queue.iter().position(|p| p.run_id == run_id) {
+                    // VecDeque::remove returns Option<T>; position was just
+                    // verified above so this is Some in practice.
+                    found = queue.remove(pos);
+                    break;
                 }
-                return pending;
             }
+            found?
+        };
+        // Update the RunEntry to Stopped. Warn loudly on failure so the
+        // disk meta.json doesn't drift from queue.json (which would leave a
+        // ghost Queued entry that causes repo_lock leaks after daemon restart).
+        if let Err(e) = self.update_status(
+            run_id,
+            RunStatus::Stopped,
+            None,
+            Some("removed from queue".into()),
+        ) {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %e,
+                "failed to flip meta.json status to Stopped after dequeue — meta may drift from queue.json"
+            );
         }
-        None
+        if let Err(e) = self.save_queue() {
+            tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
+        }
+        Some(pending)
     }
 
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
