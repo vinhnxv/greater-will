@@ -5,6 +5,7 @@ pub mod protocol;
 pub mod reconciler;
 pub mod registry;
 pub mod run_monitor;
+pub mod schedule;
 pub mod server;
 pub mod state;
 
