@@ -38,10 +38,26 @@ pub struct CrashLoopDetector {
     healthy_since: Option<Instant>,
     /// Total lifetime restarts (for PipelineResult compatibility).
     total_restarts: u32,
+    /// Absolute ceiling on total restarts regardless of window.
+    ///
+    /// The sliding window alone is defeated when each recovery session survives
+    /// long enough (3-10 min) to push earlier crashes out of the window — you
+    /// can have infinite crashes as long as each run spaces them ~3+ min apart.
+    /// This ceiling provides a hard stop after N total restarts per run.
+    max_total_restarts: u32,
 }
 
 impl CrashLoopDetector {
     pub fn new(max_crashes: u32, window_secs: u64, stability_secs: u64) -> Self {
+        Self::with_total_limit(max_crashes, window_secs, stability_secs, max_crashes * 2)
+    }
+
+    pub fn with_total_limit(
+        max_crashes: u32,
+        window_secs: u64,
+        stability_secs: u64,
+        max_total: u32,
+    ) -> Self {
         Self {
             crash_times: VecDeque::new(),
             max_crashes,
@@ -49,11 +65,17 @@ impl CrashLoopDetector {
             stability_period: Duration::from_secs(stability_secs),
             healthy_since: None,
             total_restarts: 0,
+            max_total_restarts: max_total.max(max_crashes),
         }
     }
 
     pub fn from_watchdog(cfg: &crate::config::watchdog::WatchdogConfig) -> Self {
-        Self::new(cfg.max_crash_retries, cfg.crash_window_secs, cfg.crash_stability_secs)
+        Self::with_total_limit(
+            cfg.max_crash_retries,
+            cfg.crash_window_secs,
+            cfg.crash_stability_secs,
+            cfg.max_total_crash_retries,
+        )
     }
 
     /// Record a crash/restart. Returns whether to continue or stop.
@@ -66,6 +88,19 @@ impl CrashLoopDetector {
         self.total_restarts += 1;
         self.crash_times.push_back(now);
         self.healthy_since = None; // Reset healthy tracking
+
+        // Hard ceiling: stop regardless of window timing.
+        // The sliding window is defeated when each recovery session survives 3-10 min
+        // (pushing earlier crashes out of the window). This ensures a finite upper bound.
+        if self.total_restarts >= self.max_total_restarts {
+            tracing::error!(
+                total_restarts = self.total_restarts,
+                max_total = self.max_total_restarts,
+                "Crash loop detected — {} total restarts reached ceiling of {}",
+                self.total_restarts, self.max_total_restarts
+            );
+            return CrashLoopDecision::StopCrashLoop;
+        }
 
         // Prune entries outside the window (use checked_sub to handle early-boot / short uptime)
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
@@ -325,10 +360,35 @@ mod tests {
     }
 
     #[test]
+    fn test_total_ceiling_stops_spaced_crashes() {
+        // Simulates the real bug: crashes spaced far enough apart that the
+        // sliding window never fills, but total restarts hit the ceiling.
+        // With max_total=6, window=5, window never triggers but total does.
+        let mut d = CrashLoopDetector::with_total_limit(5, 900, 1800, 6);
+
+        // Simulate 5 crashes that individually fall out of the window
+        // (by clearing window state between each, mimicking time passage)
+        for i in 0..5 {
+            let decision = d.record_restart();
+            assert!(
+                matches!(decision, CrashLoopDecision::AllowRestart),
+                "Crash {} should be allowed", i + 1
+            );
+            // Simulate time passage: clear window entries (as if they expired)
+            d.crash_times.clear();
+        }
+
+        // 6th crash hits the total ceiling
+        assert!(matches!(d.record_restart(), CrashLoopDecision::StopCrashLoop));
+        assert_eq!(d.total_restarts(), 6);
+    }
+
+    #[test]
     fn test_from_watchdog_config() {
         let cfg = crate::config::watchdog::WatchdogConfig::from_env();
         let d = CrashLoopDetector::from_watchdog(&cfg);
         assert_eq!(d.max_crashes, cfg.max_crash_retries);
+        assert_eq!(d.max_total_restarts, cfg.max_total_crash_retries);
     }
 
     #[test]

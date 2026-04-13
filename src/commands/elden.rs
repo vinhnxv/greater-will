@@ -269,7 +269,14 @@ fn handle_session_end_event() -> Result<()> {
     let checkpoint_info = detect_arc_checkpoint();
     let is_complete = checkpoint_info
         .as_ref()
-        .map(|ci| ci.completed >= ci.total && ci.total > 0)
+        .map(|ci| {
+            // Terminal phase (merge) completed is the strongest signal — the pipeline
+            // is done even if earlier phases are still "pending" (e.g., skipped design
+            // phases that Rune didn't mark). Without this, the monitor misclassifies
+            // a completed run as crashed and enters a recovery loop.
+            ci.terminal_phase_completed
+                || (ci.completed >= ci.total && ci.total > 0)
+        })
         .unwrap_or(false);
 
     let signal = json!({
@@ -884,6 +891,10 @@ struct ArcCheckpointInfo {
     current_phase: String,
     completed: usize,
     total: usize,
+    /// Whether the terminal phase (merge) is completed — strongest completion signal.
+    /// When true, the pipeline is definitively done even if earlier phases are "pending"
+    /// (e.g., design phases that were skipped but never marked in the checkpoint).
+    terminal_phase_completed: bool,
 }
 
 /// Detect the active arc checkpoint via arc-phase-loop.local.md — no directory scanning.
@@ -927,11 +938,24 @@ fn detect_arc_checkpoint() -> Option<ArcCheckpointInfo> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "all_complete".to_string());
 
+    // Check if the terminal phase (merge, last in PHASE_ORDER) is completed.
+    // This is the strongest completion signal — it means the pipeline ran to
+    // its end regardless of what earlier phase statuses say.
+    let terminal_phase = crate::checkpoint::phase_order::phase_at(
+        crate::checkpoint::phase_order::PHASE_COUNT - 1,
+    );
+    let terminal_phase_completed = terminal_phase
+        .and_then(|name| phases.get(name))
+        .and_then(|v| v.get("status"))
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s == "completed");
+
     Some(ArcCheckpointInfo {
         plan_file,
         current_phase,
         completed,
         total,
+        terminal_phase_completed,
     })
 }
 
