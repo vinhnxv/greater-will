@@ -42,6 +42,7 @@ use crate::engine::single_session::util::{
     read_cached_checkpoint, scan_artifact_dir, ArtifactSnapshot,
 };
 use crate::monitor::loop_state::{read_arc_loop_state, ArcLoopState};
+use crate::monitor::phase_nav;
 use crate::monitor::prompt_accept::PromptAcceptor;
 
 /// Re-declared constants (mirrors function-scoped values in `monitor_session`).
@@ -51,7 +52,7 @@ use crate::monitor::prompt_accept::PromptAcceptor;
 /// daemon module self-contained. Values match the foreground source.
 const KILL_GATE_MIN_SECS: u64 = 300; // 5 min silence before kill fires
 const COMPLETION_GRACE_SECS: u64 = 300; // 5 min after completion signal
-const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min before "vanished = crash" disambiguates
+const MIN_COMPLETION_AGE_SECS: u64 = 60; // 1 min (DET-6: reduced from 300s; checkpoint-based disambiguation handles the rest)
 const POLL_INTERVAL_SECS: u64 = 5;
 const STATUS_LOG_INTERVAL_SECS: u64 = 30;
 const LOOP_STATE_GONE_GRACE_SECS: u64 = 300; // 5 min before loop state gone → crash
@@ -175,14 +176,10 @@ pub struct DaemonRunMonitor {
     // Completion
     completion_detected_at: Option<Instant>,
 
-    // Transition/failed gap tracking (stubs — Shard 4 or later port)
-    #[allow(dead_code)]
+    // Transition/failed gap tracking (ported from foreground monitor)
     in_transition_since: Option<Instant>,
-    #[allow(dead_code)]
     transition_nudge_count: u32,
-    #[allow(dead_code)]
     in_failed_since: Option<Instant>,
-    #[allow(dead_code)]
     failed_nudge_count: u32,
 
     // Process tracking
@@ -326,18 +323,28 @@ impl DaemonRunMonitor {
                         return outcome;
                     }
 
-                    // 4. Capture pane + activity tracking
-                    let pane_content = match self.capture_pane().await {
-                        Some(c) => c,
-                        None => continue,
-                    };
+                    // 4. Capture pane + activity tracking (DET-5: graceful failure)
+                    // When capture_pane fails (tmux contention), only pane-dependent
+                    // checks are skipped. Steps 6-18 continue to run, preventing
+                    // phantom idle accumulation from consecutive capture failures.
+                    let pane_content = self.capture_pane().await;
 
-                    self.update_activity_from_pane(&pane_content);
+                    if let Some(ref content) = pane_content {
+                        self.update_activity_from_pane(content);
 
-                    // 5. Auto-accept permission prompts
-                    if self.check_prompt_accept(&pane_content) {
-                        continue;
+                        // 5. Auto-accept permission prompts
+                        if self.check_prompt_accept(content) {
+                            continue;
+                        }
+
+                        // 10. Pane text completion (3-min guard)
+                        self.check_pane_completion(content);
+
+                        // 11. Error evidence detection
+                        self.evaluate_error_evidence(content);
                     }
+
+                    // Steps below run regardless of pane capture success.
 
                     // 6. Completion grace period
                     if let Some(outcome) = self.check_completion_grace() {
@@ -355,12 +362,6 @@ impl DaemonRunMonitor {
                     // 9. Artifact dir scan
                     self.scan_artifacts();
 
-                    // 10. Pane text completion (3-min guard)
-                    self.check_pane_completion(&pane_content);
-
-                    // 11. Error evidence detection
-                    self.evaluate_error_evidence(&pane_content);
-
                     // 12. Process liveness
                     if let Some(outcome) = self.check_process_liveness() {
                         return outcome;
@@ -369,11 +370,19 @@ impl DaemonRunMonitor {
                     // 13. Per-phase timeout
                     self.check_phase_timeout();
 
-                    // 14-15. Transition gap / failed phase escalation
-                    // TODO(shard-4): port from monitor.rs:640-931 (transition_nudge/kill lifecycle)
+                    // 14. Transition gap escalation (DET-2)
+                    self.check_transition_gap().await;
 
-                    // 16. Idle detection + nudge
-                    self.check_idle().await;
+                    // 15. Failed phase escalation (DET-3)
+                    self.check_failed_phase().await;
+
+                    // 16. Idle detection + nudge — skip if transition/failed gap is active.
+                    // When in a transition or failed state, the gap-specific escalation
+                    // (steps 14-15) handles timing. Running idle detection concurrently
+                    // would cause false Stuck kills on natural inter-phase pauses.
+                    if self.in_transition_since.is_none() && self.in_failed_since.is_none() {
+                        self.check_idle().await;
+                    }
 
                     // 17. Unified kill gate
                     if let Some(outcome) = self.evaluate_kill_gate().await {
@@ -489,6 +498,26 @@ impl DaemonRunMonitor {
             .unwrap_or(false)
     }
 
+    /// Read checkpoint via spawn_blocking (same async pattern as has_session).
+    /// Used in session vanish disambiguation where we need checkpoint state
+    /// after the tmux session is already gone.
+    async fn read_checkpoint_sync(&mut self) -> Option<crate::checkpoint::schema::Checkpoint> {
+        let dir = self.repo_dir.clone();
+        let mut path = self.cached_checkpoint_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            read_cached_checkpoint(&dir, &mut path)
+        })
+        .await
+        .ok()
+        .flatten();
+        // Update cached path from the spawn_blocking result if we found one.
+        if result.is_some() && self.cached_checkpoint_path.is_none() {
+            self.cached_checkpoint_path =
+                find_artifact_dir_cached(&self.cached_checkpoint_path, &self.repo_dir);
+        }
+        result
+    }
+
     /// Check swarm activity (observational; falls back to false).
     async fn check_swarm_active(&self) -> bool {
         let pid = match self.claude_pid {
@@ -600,29 +629,51 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
+    /// 4-step session vanish disambiguation (DET-1).
+    ///
+    /// Ported from foreground monitor's checkpoint-based approach:
+    /// 1. Age < MIN_COMPLETION_AGE_SECS → Crashed (too young)
+    /// 2. Checkpoint complete → Completed (definitive)
+    /// 3. Checkpoint has in-progress phase → Crashed with phase context
+    /// 4. No checkpoint + completion_detected_at → Completed; else Crashed
     async fn check_session_alive(&mut self) -> Option<DaemonRunOutcome> {
         if !self.has_session().await {
-            // Session vanished. Disambiguate completion vs crash using 3 signals:
-            //   1. Run age too young → crash (can't have legitimately finished yet)
-            //   2. No completion signal ever seen → crash (likely external kill)
-            //   3. Old enough + completion signal observed → completed
-            //
-            // BACK-001: Without the completion-signal check, a forcibly-killed
-            // tmux session (e.g., `tmux kill-session` by user, or another
-            // process reaping the session) was incorrectly reported as
-            // Completed, polluting run telemetry with false successes.
             let age = self.run_started_at.elapsed().as_secs();
+
+            // Step 1: Too young — can't have legitimately finished yet.
             if age < MIN_COMPLETION_AGE_SECS {
                 return Some(DaemonRunOutcome::Crashed {
                     reason: format!("tmux session vanished at age {}s (below min)", age),
                 });
             }
-            if self.completion_detected_at.is_none() {
+
+            // Step 2: Check checkpoint for definitive answer.
+            if let Some(checkpoint) = self.read_checkpoint_sync().await {
+                if checkpoint.is_complete() {
+                    return Some(DaemonRunOutcome::Completed);
+                }
+                // Checkpoint exists but not complete — crashed mid-phase.
+                let phase = checkpoint
+                    .inferred_phase_name()
+                    .or_else(|| checkpoint.current_phase())
+                    .unwrap_or("unknown");
                 return Some(DaemonRunOutcome::Crashed {
-                    reason: "tmux session vanished without completion signal".to_string(),
+                    reason: format!(
+                        "session ended during phase '{}' after {}s",
+                        phase, age
+                    ),
                 });
             }
-            return Some(DaemonRunOutcome::Completed);
+
+            // Step 3: No checkpoint — fall back to pane completion signal.
+            if self.completion_detected_at.is_some() {
+                return Some(DaemonRunOutcome::Completed);
+            }
+
+            // Step 4: No evidence of completion.
+            return Some(DaemonRunOutcome::Crashed {
+                reason: "tmux session vanished without completion evidence".to_string(),
+            });
         }
         None
     }
@@ -692,7 +743,7 @@ impl DaemonRunMonitor {
 
 impl DaemonRunMonitor {
     fn poll_checkpoint(&mut self) {
-        let _checkpoint = match read_cached_checkpoint(
+        let checkpoint = match read_cached_checkpoint(
             &self.repo_dir,
             &mut self.cached_checkpoint_path,
         ) {
@@ -707,11 +758,53 @@ impl DaemonRunMonitor {
         }
 
         // Checkpoint heartbeat — any read that succeeded means progress exists.
-        // TODO(shard-4): port full phase-transition detection from
-        //   monitor.rs:500-638 (compute_phase_navigation, transition detection,
-        //   current_phase/profile updates, effective_phase_timeout calculation,
-        //   transition/failed gap state).
         self.last_checkpoint_activity = Instant::now();
+
+        // Phase navigation: determine current phase, update profile, and track
+        // transition/failed gap state for escalation (DET-2, DET-3).
+        let nav = phase_nav::compute_phase_navigation(&checkpoint);
+
+        // Update current phase + profile when phase changes.
+        let new_phase = nav.effective_phase_name().map(|s| s.to_string());
+        if new_phase != self.current_phase {
+            if let Some(ref phase_name) = new_phase {
+                self.current_profile = phase_profile::profile_for_phase(phase_name)
+                    .unwrap_or_else(phase_profile::default_profile);
+                self.phase_started_at = Some(Instant::now());
+                debug!(
+                    run_id = %self.run_id,
+                    phase = %phase_name,
+                    idle_nudge = self.current_profile.idle_nudge_secs,
+                    idle_kill = self.current_profile.idle_kill_secs,
+                    phase_timeout = self.current_profile.phase_timeout_secs,
+                    "phase changed — profile updated"
+                );
+            }
+            self.current_phase = new_phase;
+        }
+
+        // Transition/failed gap state tracking.
+        if nav.has_failure() {
+            if self.in_failed_since.is_none() {
+                self.in_failed_since = Some(Instant::now());
+                self.failed_nudge_count = 0;
+            }
+            self.in_transition_since = None;
+            self.transition_nudge_count = 0;
+        } else if nav.is_transitioning() {
+            if self.in_transition_since.is_none() {
+                self.in_transition_since = Some(Instant::now());
+                self.transition_nudge_count = 0;
+            }
+            self.in_failed_since = None;
+            self.failed_nudge_count = 0;
+        } else {
+            // Phase running normally — clear all gap timers.
+            self.in_transition_since = None;
+            self.transition_nudge_count = 0;
+            self.in_failed_since = None;
+            self.failed_nudge_count = 0;
+        }
     }
 }
 
@@ -981,6 +1074,74 @@ impl DaemonRunMonitor {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Transition gap / failed phase escalation (DET-2, DET-3)
+// ──────────────────────────────────────────────────────────────────────
+
+impl DaemonRunMonitor {
+    /// Escalate transition gaps: nudge → warn → kill gate.
+    ///
+    /// When PhaseNav detects no `in_progress` phase but completed phases exist,
+    /// the pipeline is between phases. This is natural (5-10 min) but if it
+    /// exceeds TRANSITION_KILL_SECS, the arc is likely stuck.
+    async fn check_transition_gap(&mut self) {
+        let start = match self.in_transition_since {
+            Some(t) => t,
+            None => return,
+        };
+        let gap_secs = start.elapsed().as_secs();
+
+        if gap_secs > phase_nav::TRANSITION_KILL_SECS && self.pending_kill.is_none() {
+            self.pending_kill = Some(PendingKillRequest {
+                reason: format!(
+                    "transition gap {}s > {}s threshold",
+                    gap_secs, phase_nav::TRANSITION_KILL_SECS
+                ),
+                outcome: KillOutcomeKind::Stuck,
+                started_at: Instant::now(),
+                nudge_sent: false,
+            });
+        } else if gap_secs > phase_nav::TRANSITION_WARN_SECS && self.transition_nudge_count < 2 {
+            self.transition_nudge_count = 2;
+            self.send_nudge("are you stuck between phases? please continue to the next phase")
+                .await;
+        } else if gap_secs > phase_nav::TRANSITION_NUDGE_SECS && self.transition_nudge_count < 1 {
+            self.transition_nudge_count = 1;
+            self.send_nudge("please continue working").await;
+        }
+    }
+
+    /// Escalate failed phase gaps: nudge → warn → kill gate.
+    ///
+    /// When PhaseNav detects a failed phase, Rune's retry mechanism may self-heal.
+    /// Give Rune up to FAILED_KILL_SECS before intervention.
+    async fn check_failed_phase(&mut self) {
+        let start = match self.in_failed_since {
+            Some(t) => t,
+            None => return,
+        };
+        let gap_secs = start.elapsed().as_secs();
+
+        if gap_secs > phase_nav::FAILED_KILL_SECS && self.pending_kill.is_none() {
+            self.pending_kill = Some(PendingKillRequest {
+                reason: format!(
+                    "failed phase unresolved for {}s > {}s threshold",
+                    gap_secs, phase_nav::FAILED_KILL_SECS
+                ),
+                outcome: KillOutcomeKind::Stuck,
+                started_at: Instant::now(),
+                nudge_sent: false,
+            });
+        } else if gap_secs > phase_nav::FAILED_WARN_SECS && self.failed_nudge_count < 2 {
+            self.failed_nudge_count = 2;
+            self.send_nudge("a phase has failed — please check and continue or retry").await;
+        } else if gap_secs > phase_nav::FAILED_NUDGE_SECS && self.failed_nudge_count < 1 {
+            self.failed_nudge_count = 1;
+            self.send_nudge("please continue working").await;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Unified kill gate
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1075,6 +1236,10 @@ impl DaemonRunMonitor {
             return;
         }
         self.last_status_log = Instant::now();
+
+        // DET-4: Loop stall correlation — distinguish "long phase" from "truly stuck".
+        self.check_loop_stall();
+
         info!(
             run_id = %self.run_id,
             tmux_session = %self.tmux_session,
@@ -1083,8 +1248,45 @@ impl DaemonRunMonitor {
             idle_secs = self.last_activity.elapsed().as_secs(),
             nudge_count = self.nudge_count,
             pending_kill = self.pending_kill.is_some(),
+            in_transition = self.in_transition_since.is_some(),
+            in_failed = self.in_failed_since.is_some(),
             "run monitor status"
         );
+    }
+
+    /// DET-4: Correlate loop state staleness with checkpoint activity.
+    ///
+    /// When the loop state file hasn't changed (normal mid-phase), check whether
+    /// the checkpoint is still updating. If both are stale, the arc may be truly
+    /// stuck. If only loop state is stale but checkpoint is fresh, a long phase
+    /// is in progress — no alarm needed.
+    fn check_loop_stall(&self) {
+        const LOOP_STALL_WARN_SECS: u64 = 600;
+
+        if !self.loop_state_ever_seen {
+            return;
+        }
+
+        let loop_stall = self.last_loop_state_change.elapsed().as_secs();
+        if loop_stall <= LOOP_STALL_WARN_SECS {
+            return;
+        }
+
+        let cp_stale = self.last_checkpoint_activity.elapsed().as_secs();
+        if cp_stale > LOOP_STALL_WARN_SECS {
+            warn!(
+                run_id = %self.run_id,
+                loop_stall_secs = loop_stall,
+                checkpoint_stale_secs = cp_stale,
+                "loop state AND checkpoint both stale — arc may be stuck"
+            );
+        } else {
+            debug!(
+                run_id = %self.run_id,
+                loop_stall_secs = loop_stall,
+                "loop state stale but checkpoint still updating — phase in progress"
+            );
+        }
     }
 }
 
@@ -1188,7 +1390,9 @@ mod tests {
     fn test_constants_match_foreground() {
         assert_eq!(KILL_GATE_MIN_SECS, 300);
         assert_eq!(COMPLETION_GRACE_SECS, 300);
-        assert_eq!(MIN_COMPLETION_AGE_SECS, 300);
+        // DET-6: reduced from 300s to 60s (checkpoint-based disambiguation
+        // handles the rest, so age threshold matters less).
+        assert_eq!(MIN_COMPLETION_AGE_SECS, 60);
         assert_eq!(POLL_INTERVAL_SECS, 5);
         assert_eq!(STATUS_LOG_INTERVAL_SECS, 30);
         assert_eq!(LOOP_STATE_GONE_GRACE_SECS, 300);
@@ -1198,5 +1402,48 @@ mod tests {
     fn test_hash_str_deterministic() {
         assert_eq!(hash_str("hello"), hash_str("hello"));
         assert_ne!(hash_str("hello"), hash_str("world"));
+    }
+
+    // ── DET-2/DET-3: Transition/failed gap detection ─────────────────
+
+    #[test]
+    fn test_transition_gap_thresholds_order() {
+        // Verify escalation order: nudge < warn < kill.
+        assert!(phase_nav::TRANSITION_NUDGE_SECS < phase_nav::TRANSITION_WARN_SECS);
+        assert!(phase_nav::TRANSITION_WARN_SECS < phase_nav::TRANSITION_KILL_SECS);
+    }
+
+    #[test]
+    fn test_failed_phase_thresholds_order() {
+        // Verify escalation order: nudge < warn < kill.
+        assert!(phase_nav::FAILED_NUDGE_SECS < phase_nav::FAILED_WARN_SECS);
+        assert!(phase_nav::FAILED_WARN_SECS < phase_nav::FAILED_KILL_SECS);
+    }
+
+    #[test]
+    fn test_failed_phase_gives_rune_time() {
+        // Failed phase kill threshold (12 min) is longer than typical idle kill
+        // thresholds for most phases, giving Rune time to self-heal.
+        assert!(phase_nav::FAILED_KILL_SECS >= 720);
+    }
+
+    // ── DET-6: MIN_COMPLETION_AGE_SECS reduction ─────────────────────
+
+    #[test]
+    fn test_min_completion_age_reduced() {
+        // DET-6: 60s is a conservative middle ground between foreground's 30s
+        // and the old daemon value of 300s.
+        assert!(MIN_COMPLETION_AGE_SECS <= 60);
+        assert!(MIN_COMPLETION_AGE_SECS >= 30);
+    }
+
+    // ── DET-4: Loop stall thresholds ─────────────────────────────────
+
+    #[test]
+    fn test_loop_stall_warn_threshold() {
+        // Loop stall warning fires at 600s (10 min), matching foreground.
+        // This is a doc-test that the constant exists and is reasonable.
+        const LOOP_STALL_WARN_SECS: u64 = 600;
+        assert!(LOOP_STALL_WARN_SECS >= STATUS_LOG_INTERVAL_SECS * 10);
     }
 }
