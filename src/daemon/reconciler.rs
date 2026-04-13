@@ -64,7 +64,7 @@ impl std::fmt::Display for ReconciliationReport {
 pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
     let mut report = ReconciliationReport::default();
 
-    // Step 0: Re-acquire repo locks for all Running/Queued entries loaded from disk.
+    // Step 0: Re-acquire repo locks for Running entries loaded from disk.
     //
     // After `load_from_disk`, the in-memory `repo_locks` HashMap is empty even
     // though the on-disk meta.json still records entries as Running. Without
@@ -73,12 +73,22 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
     // `acquire_repo_lock_for_adopt`, which returns Ok if the lock is already
     // held by this process.
     //
+    // NOTE: Queued entries are intentionally excluded. `enqueue_run` creates a
+    // RunEntry with status=Queued purely for `gw ps` visibility WITHOUT
+    // acquiring a repo lock (see registry.rs `enqueue_run`). If a pending
+    // queue entry's queue.json record was lost (or dequeued) but its meta.json
+    // remained at Queued, treating it as lock-holding would keep the repo
+    // locked forever, preventing any new runs. Genuinely mid-init register_run
+    // entries (rare crash-window case) are still handled later by
+    // `find_stale_runs`, which will RESUME/RESPAWN/mark-Failed and release or
+    // acquire the lock as appropriate.
+    //
     // Gathered as (run_id, repo_dir) pairs first so we don't hold an immutable
     // borrow of `registry` across the `&mut self` acquire call.
     let running_repos: Vec<(String, std::path::PathBuf)> = registry
         .list_runs(false)
         .iter()
-        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
+        .filter(|r| matches!(r.status, RunStatus::Running))
         .map(|r| (r.run_id.clone(), r.repo_dir.clone()))
         .collect();
 
