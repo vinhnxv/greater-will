@@ -246,6 +246,12 @@ pub enum Commands {
         action: ScheduleAction,
     },
 
+    /// Manage the pending run queue.
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
+
     /// Browse history of past arc runs.
     ///
     /// Reads run metadata and logs directly from disk (~/.gw/runs/).
@@ -365,5 +371,31 @@ pub enum ScheduleAction {
     Resume {
         /// Schedule ID (prefix match).
         id: String,
+    },
+}
+
+/// Subcommands for `gw queue`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum QueueAction {
+    /// List queued plans.
+    List {
+        /// Filter by repository path.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a queued plan by ID.
+    Remove {
+        /// Run ID (prefix match).
+        id: String,
+    },
+    /// Clear all queued plans.
+    Clear {
+        /// Clear queues for all repos (default: current repo only).
+        #[arg(long)]
+        all: bool,
     },
 }
