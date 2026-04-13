@@ -846,7 +846,7 @@ impl RunRegistry {
         let meta_path = run_dir.join("meta.json");
         let tmp_path = run_dir.join("meta.json.tmp");
 
-        let json = serde_json::to_string_pretty(entry).wrap_err("failed to serialize run entry")?;
+        let json = serde_json::to_string(entry).wrap_err("failed to serialize run entry")?;
 
         // Open → write → fsync → rename for crash safety.
         // Using a single fd avoids the TOCTOU of write-then-reopen.

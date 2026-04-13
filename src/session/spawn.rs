@@ -411,13 +411,23 @@ pub fn send_keys_with_workaround(session_id: &str, text: &str) -> Result<()> {
 /// Send a simple command (without workaround) to the session.
 pub fn send_simple_command(session_id: &str, cmd: &str) -> Result<()> {
     let target = format!("{}:0.0", session_id);
+    // Send command text literally (SEC-004: -l prevents tmux key-name interpretation)
     let output = Command::new("tmux")
-        .args(["send-keys", "-t", &target, cmd, "Enter"])
+        .args(["send-keys", "-t", &target, "-l", cmd])
         .output()
-        .wrap_err("Failed to send command")?;
+        .wrap_err("Failed to send command text")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(eyre!("tmux send-keys failed: {}", stderr.trim()));
+        return Err(eyre!("tmux send-keys failed (text): {}", stderr.trim()));
+    }
+    // Send Enter as a key name (not literal)
+    let output = Command::new("tmux")
+        .args(["send-keys", "-t", &target, "Enter"])
+        .output()
+        .wrap_err("Failed to send Enter")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("tmux send-keys failed (Enter): {}", stderr.trim()));
     }
 
     Ok(())

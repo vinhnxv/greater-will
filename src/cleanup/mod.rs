@@ -112,6 +112,10 @@ pub fn post_phase_cleanup(session_id: &str, pane_pid: u32) -> Result<bool> {
 
     // Force-kill remaining processes
     for pid in &remaining {
+        if *pid > i32::MAX as u32 {
+            tracing::warn!(pid = pid, "skipping SIGKILL — PID exceeds i32::MAX");
+            continue;
+        }
         unsafe {
             libc::kill(*pid as i32, libc::SIGKILL);
         }

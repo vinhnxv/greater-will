@@ -58,11 +58,24 @@ impl CrashLoopDetector {
         stability_secs: u64,
         max_total: u32,
     ) -> Self {
+        // Enforce minimum stability period to prevent trivial crash-history resets (FLAW-007).
+        // A 1-second healthy runtime should not clear crash counters.
+        const MIN_STABILITY_SECS: u64 = 60;
+        let effective_stability = if stability_secs > 0 && stability_secs < MIN_STABILITY_SECS {
+            tracing::warn!(
+                requested = stability_secs,
+                enforced = MIN_STABILITY_SECS,
+                "stability_period below minimum — enforcing floor"
+            );
+            MIN_STABILITY_SECS
+        } else {
+            stability_secs
+        };
         Self {
             crash_times: VecDeque::new(),
             max_crashes,
             window: Duration::from_secs(window_secs),
-            stability_period: Duration::from_secs(stability_secs),
+            stability_period: Duration::from_secs(effective_stability),
             healthy_since: None,
             total_restarts: 0,
             max_total_restarts: max_total.max(max_crashes),
@@ -140,9 +153,11 @@ impl CrashLoopDetector {
                 tracing::info!(
                     stability_secs = self.stability_period.as_secs(),
                     cleared_crashes = self.crash_times.len(),
-                    "Session stable — resetting crash counters"
+                    total_restarts_before = self.total_restarts,
+                    "Session stable — resetting crash counters (including total_restarts)"
                 );
                 self.crash_times.clear();
+                self.total_restarts = 0;
                 self.healthy_since = Some(now);
             }
             // First healthy tick after a crash — begin tracking stability.
@@ -172,9 +187,11 @@ impl CrashLoopDetector {
                 stability_secs = self.stability_period.as_secs(),
                 runtime_secs = duration_secs,
                 cleared_crashes = self.crash_times.len(),
-                "Session ran long enough to reset crash counters"
+                total_restarts_before = self.total_restarts,
+                "Session ran long enough to reset crash counters (including total_restarts)"
             );
             self.crash_times.clear();
+            self.total_restarts = 0;
             self.healthy_since = Some(Instant::now());
         } else if self.healthy_since.is_none() {
             self.healthy_since = Some(Instant::now());

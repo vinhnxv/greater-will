@@ -91,8 +91,12 @@ impl Tmux {
                 // Timeout — kill the child process by PID to avoid leaking
                 // both the OS thread and the zombie tmux process.
                 #[cfg(unix)]
-                unsafe {
-                    libc::kill(child_id as i32, libc::SIGKILL);
+                if child_id > i32::MAX as u32 {
+                    tracing::warn!(pid = child_id, "skipping SIGKILL — PID exceeds i32::MAX");
+                } else {
+                    unsafe {
+                        libc::kill(child_id as i32, libc::SIGKILL);
+                    }
                 }
                 // Join the thread (it will return now that the child is killed)
                 let _ = thread.join();

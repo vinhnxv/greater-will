@@ -295,12 +295,20 @@ pub fn kill_gw_owned_claude_processes() -> Result<Vec<u32>> {
 
             // SIGTERM descendants first (children before parent)
             for &pid in &descendants {
+                if pid > i32::MAX as u32 {
+                    tracing::warn!(pid = pid, "skipping SIGTERM — PID exceeds i32::MAX");
+                    continue;
+                }
                 unsafe { libc::kill(pid as i32, libc::SIGTERM); }
                 killed_pids.push(pid);
             }
             // SIGTERM the root pane process
-            unsafe { libc::kill(pane_pid as i32, libc::SIGTERM); }
-            killed_pids.push(pane_pid);
+            if pane_pid > i32::MAX as u32 {
+                tracing::warn!(pid = pane_pid, "skipping SIGTERM for root — PID exceeds i32::MAX");
+            } else {
+                unsafe { libc::kill(pane_pid as i32, libc::SIGTERM); }
+                killed_pids.push(pane_pid);
+            }
         }
 
         // Kill the tmux session itself
@@ -313,6 +321,9 @@ pub fn kill_gw_owned_claude_processes() -> Result<Vec<u32>> {
         refresh_process_system(&mut sys);
 
         for &pid in &killed_pids {
+            if pid > i32::MAX as u32 {
+                continue;
+            }
             if is_pid_alive(pid) {
                 tracing::warn!(pid = pid, "Force-killing straggler process");
                 unsafe { libc::kill(pid as i32, libc::SIGKILL); }

@@ -279,7 +279,8 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     //    0 = info (daemon default), 1 = info, 2 = debug, 3+ = trace.
     //    RUST_LOG env var overrides when set.
     let level = match verbosity {
-        0 | 1 => "info",
+        0 => "warn",
+        1 => "info",
         2 => "debug",
         _ => "trace",
     };
