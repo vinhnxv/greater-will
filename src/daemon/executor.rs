@@ -275,7 +275,7 @@ pub async fn stop_run(
         }
     }
 
-    let tmux_session = {
+    let (tmux_session, repo_dir) = {
         let reg = registry.lock().await;
         let entry = reg
             .get(run_id)
@@ -289,7 +289,7 @@ pub async fn stop_run(
             ));
         }
 
-        entry.tmux_session.clone()
+        (entry.tmux_session.clone(), entry.repo_dir.clone())
     };
 
     let tmux_session = match tmux_session {
@@ -297,13 +297,24 @@ pub async fn stop_run(
         None => {
             // No tmux session — just mark as stopped
             crate::daemon::heartbeat::append_event(run_id, "stopped", "stopped by user (no tmux session to kill)");
-            let mut reg = registry.lock().await;
-            reg.update_status(
-                run_id,
-                RunStatus::Stopped,
-                None,
-                Some("stopped (no tmux session)".to_string()),
-            )?;
+            {
+                let mut reg = registry.lock().await;
+                reg.update_status(
+                    run_id,
+                    RunStatus::Stopped,
+                    None,
+                    Some("stopped (no tmux session)".to_string()),
+                )?;
+            }
+            // Drain next queued run for this repo — parity with heartbeat.rs
+            // completion paths. Without this, the queue stalls until the next
+            // completion event (which may never arrive if no run is active).
+            crate::daemon::server::drain_if_available(
+                Arc::clone(&registry),
+                &repo_dir,
+                false,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -351,6 +362,13 @@ pub async fn stop_run(
 
     info!(run_id = %run_id, "run stopped");
     crate::daemon::heartbeat::log_run_stopped(run_id);
+
+    // Drain next queued run for this repo — parity with heartbeat.rs
+    // completion paths (GAP-6). Without this, stopping the last Running run
+    // leaves the queue stalled indefinitely because drain_if_available is
+    // only invoked on completion events.
+    crate::daemon::server::drain_if_available(Arc::clone(&registry), &repo_dir, false).await;
+
     Ok(())
 }
 
