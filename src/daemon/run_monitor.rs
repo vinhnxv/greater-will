@@ -501,19 +501,36 @@ impl DaemonRunMonitor {
     /// Read checkpoint via spawn_blocking (same async pattern as has_session).
     /// Used in session vanish disambiguation where we need checkpoint state
     /// after the tmux session is already gone.
+    ///
+    /// FLAW-003 fix: wrapped in 10s timeout to prevent monitor loop freeze on
+    /// filesystem hang. BACK-001 fix: propagates cached path back from closure.
     async fn read_checkpoint_sync(&mut self) -> Option<crate::checkpoint::schema::Checkpoint> {
         let dir = self.repo_dir.clone();
         let mut path = self.cached_checkpoint_path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            read_cached_checkpoint(&dir, &mut path)
-        })
+        let task = tokio::task::spawn_blocking(move || {
+            let cp = read_cached_checkpoint(&dir, &mut path);
+            (cp, path)
+        });
+        // FLAW-003: timeout prevents infinite block on filesystem hang.
+        let (result, updated_path) = match tokio::time::timeout(
+            StdDuration::from_secs(10),
+            task,
+        )
         .await
-        .ok()
-        .flatten();
-        // Update cached path from the spawn_blocking result if we found one.
-        if result.is_some() && self.cached_checkpoint_path.is_none() {
-            self.cached_checkpoint_path =
-                find_artifact_dir_cached(&self.cached_checkpoint_path, &self.repo_dir);
+        {
+            Ok(Ok((cp, path))) => (cp, path),
+            Ok(Err(_join_err)) => (None, self.cached_checkpoint_path.clone()),
+            Err(_timeout) => {
+                warn!(
+                    run_id = %self.run_id,
+                    "read_checkpoint_sync timed out after 10s"
+                );
+                (None, self.cached_checkpoint_path.clone())
+            }
+        };
+        // BACK-001: propagate the cached path discovered inside spawn_blocking.
+        if updated_path.is_some() && self.cached_checkpoint_path.is_none() {
+            self.cached_checkpoint_path = updated_path;
         }
         result
     }
@@ -784,16 +801,26 @@ impl DaemonRunMonitor {
         }
 
         // Transition/failed gap state tracking.
+        // FLAW-001 fix: seed timers using real checkpoint gap duration so that
+        // a daemon starting mid-transition doesn't get an extra 11 min of tolerance.
         if nav.has_failure() {
             if self.in_failed_since.is_none() {
-                self.in_failed_since = Some(Instant::now());
+                // Backdate using checkpoint's real gap if available.
+                let backdate = nav.transition_gap_secs()
+                    .and_then(|s| Instant::now().checked_sub(StdDuration::from_secs(s)))
+                    .unwrap_or_else(Instant::now);
+                self.in_failed_since = Some(backdate);
                 self.failed_nudge_count = 0;
             }
             self.in_transition_since = None;
             self.transition_nudge_count = 0;
         } else if nav.is_transitioning() {
             if self.in_transition_since.is_none() {
-                self.in_transition_since = Some(Instant::now());
+                // Backdate using checkpoint's real gap if available.
+                let backdate = nav.transition_gap_secs()
+                    .and_then(|s| Instant::now().checked_sub(StdDuration::from_secs(s)))
+                    .unwrap_or_else(Instant::now);
+                self.in_transition_since = Some(backdate);
                 self.transition_nudge_count = 0;
             }
             self.in_failed_since = None;
