@@ -173,14 +173,28 @@ gw daemon start --foreground # run in foreground (for debugging)
 gw daemon start -vv          # with debug logging (-v info, -vv debug, -vvv trace)
 gw daemon stop               # graceful shutdown
 gw daemon restart             # stop + start
-gw daemon status             # show PID, uptime, socket path, run counts
+gw daemon status             # show PID, uptime, socket path, run counts, network: online/waiting
 gw daemon install            # register as macOS launchd service (auto-start on login)
 gw daemon uninstall          # remove launchd service
 ```
 
+### `gw queue` — Manage pending runs
+
+Inspect and manage the daemon's pending run queue. Runs are auto-queued when `max_concurrent_runs` is reached.
+
+```bash
+gw queue list                # show all queued plans across repos
+gw queue list --repo .       # filter to current repo
+gw queue remove <run-id>     # remove a specific queued plan (prefix match)
+gw queue clear               # clear all queued runs
+gw queue clear --repo .      # clear queued runs for current repo only
+```
+
+When `max_concurrent_runs` (default: 4, set in `~/.gw/config.toml`) is reached, additional `gw run` submissions are automatically queued and executed in FIFO order as capacity frees up. The queue persists across daemon restarts via `~/.gw/queue.json`.
+
 ### `gw ps` — List runs
 
-Lists all daemon-tracked runs with color-coded statuses.
+Lists all daemon-tracked runs with color-coded statuses. Queued runs show a "(queued)" annotation, and runs waiting for network connectivity show "(waiting for network)".
 
 ```bash
 gw ps                 # active runs

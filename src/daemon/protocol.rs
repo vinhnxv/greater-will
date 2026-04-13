@@ -73,6 +73,12 @@ pub enum Request {
     PauseSchedule { id: String },
     /// Resume a paused schedule.
     ResumeSchedule { id: String },
+    /// List all queued (pending) runs.
+    ListQueue,
+    /// Remove a specific queued run by ID.
+    RemoveQueued { run_id: String },
+    /// Clear queued runs, optionally filtered by repo directory.
+    ClearQueue { repo_dir: Option<PathBuf> },
 }
 
 // ── Response types ───────────────────────────────────────────────────
@@ -105,6 +111,8 @@ pub enum Response {
         id: String,
         next_fire: Option<String>,
     },
+    /// List of queued runs.
+    QueueList { entries: Vec<QueuedRunInfo> },
 }
 
 // ── Supporting types ─────────────────────────────────────────────────
@@ -123,6 +131,9 @@ pub struct RunInfo {
     /// Schedule ID that triggered this run, if any.
     #[serde(default)]
     pub schedule_id: Option<String>,
+    /// Whether the daemon is currently waiting for network connectivity.
+    #[serde(default)]
+    pub waiting_for_network: bool,
 }
 
 /// Status of an arc run.
@@ -201,6 +212,19 @@ pub enum ScheduleKindInfo {
     Cron { expression: String },
     OneShot { at: String },
     Delayed { fires_at: String },
+}
+
+// ── Queue wire types ──────────────────────────────────────────────
+
+/// Wire representation of a queued (pending) run for IPC responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedRunInfo {
+    pub run_id: String,
+    pub plan_path: PathBuf,
+    pub repo_dir: PathBuf,
+    pub position: usize,
+    pub queued_at: String,
+    pub session_name: Option<String>,
 }
 
 // ── Length-prefixed framing ──────────────────────────────────────────
@@ -301,6 +325,13 @@ mod tests {
             Request::ResumeSchedule {
                 id: "sched-abc".into(),
             },
+            Request::ListQueue,
+            Request::RemoveQueued {
+                run_id: "run-q1".into(),
+            },
+            Request::ClearQueue {
+                repo_dir: Some(PathBuf::from("/home/user/repo")),
+            },
         ];
 
         for req in &cases {
@@ -327,6 +358,7 @@ mod tests {
                     started_at: "2026-04-10T02:00:00Z".into(),
                     uptime_secs: 120,
                     schedule_id: None,
+                    waiting_for_network: false,
                 }],
             },
             Response::LogChunk {
@@ -362,6 +394,16 @@ mod tests {
             Response::ScheduleAdded {
                 id: "sched-002".into(),
                 next_fire: Some("2026-04-13T04:00:00Z".into()),
+            },
+            Response::QueueList {
+                entries: vec![QueuedRunInfo {
+                    run_id: "run-q1".into(),
+                    plan_path: PathBuf::from("plans/feat.md"),
+                    repo_dir: PathBuf::from("/repo"),
+                    position: 1,
+                    queued_at: "2026-04-13T05:00:00Z".into(),
+                    session_name: Some("sess-q1".into()),
+                }],
             },
         ];
 
@@ -404,6 +446,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_info_waiting_for_network_round_trip() {
+        let info = RunInfo {
+            run_id: "net-001".into(),
+            plan_path: PathBuf::from("plans/net.md"),
+            repo_dir: PathBuf::from("/repo"),
+            session_name: "sess-net".into(),
+            status: RunStatus::Running,
+            current_phase: Some("phase_work".into()),
+            started_at: "2026-04-13T10:00:00Z".into(),
+            uptime_secs: 300,
+            schedule_id: Some("sched-net".into()),
+            waiting_for_network: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deser: RunInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, deser);
+        assert!(deser.waiting_for_network);
+    }
+
+    #[test]
+    fn queued_run_info_serde_round_trip() {
+        let entry = QueuedRunInfo {
+            run_id: "q-rt1".into(),
+            plan_path: PathBuf::from("plans/queued.md"),
+            repo_dir: PathBuf::from("/repo/queued"),
+            position: 3,
+            queued_at: "2026-04-13T08:00:00Z".into(),
+            session_name: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deser: QueuedRunInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, deser);
+        assert_eq!(deser.session_name, None);
+    }
+
     #[tokio::test]
     async fn framing_round_trip() {
         let req = Request::SubmitRun {
@@ -437,6 +515,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".into(),
                 uptime_secs: 60,
                 schedule_id: None,
+                waiting_for_network: false,
             }],
         };
 

@@ -4,6 +4,7 @@
 //! run state, configuration, and per-repo metadata.
 
 use crate::daemon::protocol::RunStatus;
+use chrono::{DateTime, Utc};
 use color_eyre::{eyre::WrapErr, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,44 @@ const DEFAULT_SCHEDULE_INTERVAL: u64 = 30;
 
 /// Default maximum concurrent scheduled runs.
 const DEFAULT_MAX_SCHEDULED_RUNS: usize = 2;
+
+// ── Network state ───────────────────────────────────────────────────
+
+/// Daemon-level network connectivity state.
+///
+/// Shared via `Arc<tokio::sync::RwLock<NetworkState>>` — read-heavy
+/// (every heartbeat tick + every `gw ps` query), write-rare (only
+/// probe updates). RwLock avoids reader-writer contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkState {
+    /// Network is available.
+    Online,
+    /// Connectivity lost at this timestamp. Probing every 30s.
+    WaitingForNetwork { since: DateTime<Utc> },
+}
+
+impl Default for NetworkState {
+    fn default() -> Self {
+        Self::Online
+    }
+}
+
+impl std::fmt::Display for NetworkState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Online => write!(f, "online"),
+            Self::WaitingForNetwork { since } => {
+                let elapsed = Utc::now().signed_duration_since(*since);
+                let secs = elapsed.num_seconds().max(0) as u64;
+                if secs < 60 {
+                    write!(f, "waiting (since {}s ago)", secs)
+                } else {
+                    write!(f, "waiting (since {}m ago)", secs / 60)
+                }
+            }
+        }
+    }
+}
 
 // ── Path helpers ─────────────────────────────────────────────────────
 

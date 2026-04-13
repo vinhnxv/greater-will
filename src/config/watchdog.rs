@@ -18,6 +18,7 @@
 //! | `GW_PROMPT_ACCEPT_DEBOUNCE_SECS` | 5 | seconds | Debounce between auto-accepts |
 //! | `GW_CRASH_WINDOW_SECS` | 900 | seconds | Rolling window for crash loop detection |
 //! | `GW_CRASH_STABILITY_SECS` | 1800 | seconds | Healthy running time to reset crash counters |
+//! | `GW_MAX_TOTAL_CRASH_RETRIES` | 10 | count | Absolute ceiling on total crash-recovery restarts |
 //! | `GW_LOOP_STATE_WARMUP_SECS` | 300 | seconds | Max wait for arc-phase-loop.local.md to appear |
 
 use std::time::Duration;
@@ -66,6 +67,11 @@ pub struct WatchdogConfig {
     /// Cooldown between crash-recovery restarts (seconds). Default 60s (1 min).
     /// Gives Claude Code time to fully initialize before the next attempt.
     pub restart_cooldown_secs: u64,
+    /// Absolute ceiling on total crash-recovery restarts per run. Default 10.
+    /// The sliding window alone is defeated when each recovery session survives
+    /// long enough to push earlier crashes out of the window. This provides a
+    /// hard stop after N total restarts regardless of timing.
+    pub max_total_crash_retries: u32,
 }
 
 impl WatchdogConfig {
@@ -89,6 +95,7 @@ impl WatchdogConfig {
             crash_stability_secs: env_or("GW_CRASH_STABILITY_SECS", 1800).clamp(60, 7200),
             loop_state_warmup_secs: env_or("GW_LOOP_STATE_WARMUP_SECS", 300).clamp(30, 1800),
             restart_cooldown_secs: env_or("GW_RESTART_COOLDOWN_SECS", 60).clamp(5, 600),
+            max_total_crash_retries: env_or("GW_MAX_TOTAL_CRASH_RETRIES", 10).clamp(2, 50) as u32,
         }
     }
 }
@@ -140,5 +147,6 @@ mod tests {
         assert_eq!(config.crash_stability_secs, 1800);
         assert_eq!(config.loop_state_warmup_secs, 300);
         assert_eq!(config.restart_cooldown_secs, 60);
+        assert_eq!(config.max_total_crash_retries, 10);
     }
 }

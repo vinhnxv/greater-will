@@ -71,6 +71,13 @@ pub async fn spawn_run(
     crate::cleanup::health::check_disk_space_at(&crate::daemon::state::gw_home())
         .map_err(|e| eyre!("GW_HOME disk space check failed: {e}"))?;
 
+    // Pre-flight: network connectivity.
+    // Uses spawn_blocking internally — safe for the tokio runtime.
+    // On failure the caller (server.rs SubmitRun) enqueues via the existing queue path.
+    if !crate::daemon::network::is_online_async().await {
+        return Err(eyre!("network unavailable"));
+    }
+
     // ── Register run ────────────────────────────────────────────────
     let run_id = {
         let mut reg = registry.lock().await;

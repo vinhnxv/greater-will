@@ -19,9 +19,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+use crate::daemon::network;
+use crate::daemon::state::NetworkState;
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -66,16 +69,24 @@ pub struct HeartbeatMonitor {
     /// Cached watchdog config — resolved once at construction to avoid
     /// re-parsing env vars on every heartbeat tick (BACK-002).
     watchdog: WatchdogConfig,
+    /// Shared network state for internet recovery.
+    /// Lock ordering: registry → network_state → monitors.
+    network_state: Arc<RwLock<NetworkState>>,
 }
 
 impl HeartbeatMonitor {
     /// Create a new heartbeat monitor wrapping the shared registry.
-    pub fn new(registry: Arc<Mutex<RunRegistry>>, global_cancel: CancellationToken) -> Self {
+    pub fn new(
+        registry: Arc<Mutex<RunRegistry>>,
+        global_cancel: CancellationToken,
+        network_state: Arc<RwLock<NetworkState>>,
+    ) -> Self {
         Self {
             registry,
             monitors: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             global_cancel,
             watchdog: WatchdogConfig::from_env(),
+            network_state,
         }
     }
 
@@ -204,6 +215,7 @@ impl HeartbeatMonitor {
             let outcome_registry = Arc::clone(&self.registry);
             let outcome_run_id = run_id.clone();
             let outcome_cancel = self.global_cancel.clone();
+            let outcome_network_state = Arc::clone(&self.network_state);
             let join = tokio::spawn(async move {
                 match monitor_join.await {
                     Ok(outcome) => {
@@ -212,6 +224,7 @@ impl HeartbeatMonitor {
                             outcome,
                             outcome_registry,
                             outcome_cancel,
+                            outcome_network_state,
                         )
                         .await;
                     }
@@ -536,6 +549,7 @@ async fn handle_monitor_outcome(
     outcome: DaemonRunOutcome,
     registry: Arc<Mutex<RunRegistry>>,
     cancel: CancellationToken,
+    network_state: Arc<RwLock<NetworkState>>,
 ) {
     match outcome {
         DaemonRunOutcome::Completed => {
@@ -599,6 +613,62 @@ async fn handle_monitor_outcome(
                 };
                 if let Some(dir) = repo_dir_for_drain {
                     drain_if_available(Arc::clone(&registry), &dir, true).await;
+                }
+                return;
+            }
+
+            // ── NetworkError: wait for connectivity instead of blind backoff ──
+            //
+            // Instead of retrying 3 times with 30s backoff (which wastes 5-6 min
+            // spawning tmux sessions that immediately fail), wait for actual
+            // connectivity restoration (up to 30 min, polling every 30s).
+            if matches!(error_class, crate::engine::retry::ErrorClass::NetworkError) {
+                info!(run_id = %run_id, "network error — waiting for connectivity");
+
+                // Update shared network state
+                {
+                    let mut state = network_state.write().await;
+                    *state = NetworkState::WaitingForNetwork { since: chrono::Utc::now() };
+                }
+
+                append_event(run_id, "waiting_for_network", &format!(
+                    "NetworkError: {} — waiting up to 30min for connectivity",
+                    reason
+                ));
+
+                let restored = network::wait_for_connectivity(
+                    network::CONNECTIVITY_POLL_INTERVAL,
+                    network::CONNECTIVITY_MAX_WAIT,
+                    cancel.clone(),
+                ).await;
+
+                // Restore network state
+                {
+                    let mut state = network_state.write().await;
+                    *state = NetworkState::Online;
+                }
+
+                if restored {
+                    info!(run_id = %run_id, "connectivity restored — attempting recovery");
+                    let (repo_dir, plan_path, config_dir) = {
+                        let reg = registry.lock().await;
+                        match reg.get(run_id) {
+                            Some(e) => (e.repo_dir.clone(), e.plan_path.clone(), e.config_dir.clone()),
+                            None => return,
+                        }
+                    };
+                    attempt_recovery(run_id, &repo_dir, &plan_path, config_dir, registry).await;
+                } else {
+                    // Cancelled or timed out after 30 min
+                    let mut reg = registry.lock().await;
+                    let _ = reg.update_status(
+                        run_id,
+                        RunStatus::Failed,
+                        None,
+                        Some("Network unavailable for 30 minutes — giving up".to_string()),
+                    );
+                    drop(reg);
+                    append_event(run_id, "network_timeout", "30min connectivity timeout exceeded");
                 }
                 return;
             }
@@ -1066,7 +1136,7 @@ mod tests {
     async fn heartbeat_monitor_new_creates_empty_monitors() {
         let reg = Arc::new(Mutex::new(RunRegistry::new()));
         let cancel = CancellationToken::new();
-        let hb = HeartbeatMonitor::new(reg, cancel);
+        let hb = HeartbeatMonitor::new(reg, cancel, Arc::new(RwLock::new(NetworkState::default())));
         let monitors = hb.monitors();
         let map = monitors.lock().await;
         assert!(map.is_empty(), "new HeartbeatMonitor should have no monitors");
@@ -1076,7 +1146,7 @@ mod tests {
     async fn monitors_arc_is_shared() {
         let reg = Arc::new(Mutex::new(RunRegistry::new()));
         let cancel = CancellationToken::new();
-        let hb = HeartbeatMonitor::new(reg, cancel);
+        let hb = HeartbeatMonitor::new(reg, cancel, Arc::new(RwLock::new(NetworkState::default())));
         let monitors1 = hb.monitors();
         let monitors2 = hb.monitors();
         assert!(Arc::ptr_eq(&monitors1, &monitors2));
@@ -1261,7 +1331,7 @@ mod tests {
         let (registry, _run_id) = setup_running_entry(&tmp);
 
         let cancel = CancellationToken::new();
-        let hb = HeartbeatMonitor::new(Arc::clone(&registry), cancel.clone());
+        let hb = HeartbeatMonitor::new(Arc::clone(&registry), cancel.clone(), Arc::new(RwLock::new(NetworkState::default())));
         let monitors = hb.monitors();
 
         let _handle = hb.start();

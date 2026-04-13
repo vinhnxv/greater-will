@@ -1015,11 +1015,17 @@ impl DaemonRunMonitor {
 
         // Recovery signals cancel the kill.
         let swarm_active = self.check_swarm_active().await;
+        // 6th recovery signal: network offline. When the network is down,
+        // Claude Code may stall silently — this is not a real bug, so don't
+        // escalate to Stuck/kill. Reset idle timer to give more time.
+        let network_offline = !crate::daemon::network::is_online();
+
         let has_recovery = self.last_activity.elapsed().as_secs() < KILL_GATE_RECOVERY_WINDOW_SECS
             || self.last_checkpoint_activity.elapsed().as_secs() < KILL_GATE_RECOVERY_WINDOW_SECS
             || self.last_artifact_activity.elapsed().as_secs() < KILL_GATE_RECOVERY_WINDOW_SECS
             || self.last_loop_state_change.elapsed().as_secs() < KILL_GATE_RECOVERY_WINDOW_SECS
-            || swarm_active;
+            || swarm_active
+            || network_offline;
 
         if has_recovery && gate_elapsed > 10 {
             info!(
