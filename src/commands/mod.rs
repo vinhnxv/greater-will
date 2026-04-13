@@ -10,6 +10,7 @@ pub mod history;
 pub mod logs;
 pub mod ps;
 pub mod replay;
+pub mod schedule;
 pub mod run;
 pub mod status;
 pub mod stop;

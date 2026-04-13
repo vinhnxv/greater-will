@@ -13,11 +13,15 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
+use std::str::FromStr;
+
 use crate::daemon::heartbeat::MonitorHandle;
 use crate::daemon::protocol::{
-    read_message, write_message, ErrorCode, Request, Response, RunStatus,
+    read_message, write_message, ErrorCode, Request, Response, RunStatus, ScheduleInfo,
+    ScheduleKindInfo,
 };
 use crate::daemon::registry::RunRegistry;
+use crate::daemon::schedule::{ScheduleEntry, ScheduleRegistry};
 
 /// Per-request timeout: 30 seconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,6 +34,7 @@ const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// Daemon socket server.
 pub struct DaemonServer {
     registry: Arc<Mutex<RunRegistry>>,
+    schedule_registry: Arc<Mutex<ScheduleRegistry>>,
     socket_path: PathBuf,
     cancel: CancellationToken,
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
@@ -39,12 +44,14 @@ impl DaemonServer {
     /// Create a new server instance.
     pub fn new(
         registry: Arc<Mutex<RunRegistry>>,
+        schedule_registry: Arc<Mutex<ScheduleRegistry>>,
         socket_path: PathBuf,
         cancel: CancellationToken,
         monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
     ) -> Self {
         Self {
             registry,
+            schedule_registry,
             socket_path,
             cancel,
             monitors,
@@ -85,10 +92,11 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             let registry = Arc::clone(&self.registry);
+                            let sched_registry = Arc::clone(&self.schedule_registry);
                             let cancel = self.cancel.clone();
                             let monitors = Arc::clone(&self.monitors);
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, registry, cancel, monitors).await {
+                                if let Err(e) = handle_connection(stream, registry, sched_registry, cancel, monitors).await {
                                     tracing::warn!(error = %e, "connection handler error");
                                 }
                             });
@@ -165,6 +173,7 @@ impl DaemonServer {
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     registry: Arc<Mutex<RunRegistry>>,
+    schedule_registry: Arc<Mutex<ScheduleRegistry>>,
     cancel: CancellationToken,
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
 ) -> Result<()> {
@@ -231,7 +240,7 @@ async fn handle_connection(
 
         let request_type = request_type_name(&request);
         let start = std::time::Instant::now();
-        let response = dispatch_request(request, &registry, &cancel, &monitors).await;
+        let response = dispatch_request(request, &registry, &schedule_registry, &cancel, &monitors).await;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::info!(
@@ -422,6 +431,7 @@ where
 async fn dispatch_request(
     request: Request,
     registry: &Arc<Mutex<RunRegistry>>,
+    schedule_registry: &Arc<Mutex<ScheduleRegistry>>,
     cancel: &CancellationToken,
     monitors: &Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
 ) -> Response {
@@ -669,9 +679,12 @@ async fn dispatch_request(
             let reg = registry.lock().await;
             let active = reg.count_runs(false);
             let total = reg.count_runs(true);
+            let sched = schedule_registry.lock().await;
+            let active_schedules = sched.count_active();
             Response::Ok {
                 message: format!(
-                    "daemon running — {active} active run(s), {total} total, pid {}",
+                    "daemon running — {active} active run(s), {total} total, \
+                     {active_schedules} schedule(s), pid {}",
                     std::process::id()
                 ),
             }
@@ -691,6 +704,145 @@ async fn dispatch_request(
             };
             Response::Ok { message: msg }
         }
+
+        Request::AddSchedule {
+            plan_path,
+            repo_dir,
+            kind,
+            config_dir,
+            verbose,
+            label,
+        } => {
+            // Validate plan_path exists
+            if !plan_path.exists() {
+                return Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("plan file not found: {}", plan_path.display()),
+                };
+            }
+
+            // Validate cron expression if applicable
+            if let crate::daemon::schedule::ScheduleKind::Cron { ref expression } = kind {
+                if cron::Schedule::from_str(expression).is_err() {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid cron expression: {expression}"),
+                    };
+                }
+            }
+
+            let now = chrono::Utc::now();
+            let next_fire = match &kind {
+                crate::daemon::schedule::ScheduleKind::Delayed { delay_secs } => {
+                    Some(now + chrono::Duration::seconds(*delay_secs as i64))
+                }
+                other => crate::daemon::schedule::compute_next_fire(other, now),
+            };
+
+            let entry = crate::daemon::schedule::ScheduleEntry {
+                id: crate::daemon::registry::RunRegistry::generate_id(),
+                plan_path,
+                repo_dir,
+                config_dir,
+                verbose,
+                kind,
+                status: crate::daemon::schedule::ScheduleStatus::Active,
+                created_at: now,
+                last_fired: None,
+                next_fire,
+                fire_count: 0,
+                label,
+            };
+
+            let mut sched = schedule_registry.lock().await;
+            match sched.add(entry) {
+                Ok(id) => Response::ScheduleAdded {
+                    id,
+                    next_fire: next_fire.map(|t| t.to_rfc3339()),
+                },
+                Err(e) => Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::ListSchedules => {
+            let sched = schedule_registry.lock().await;
+            let schedules = sched
+                .list()
+                .iter()
+                .map(|e| schedule_entry_to_info(e))
+                .collect();
+            Response::ScheduleList { schedules }
+        }
+
+        Request::RemoveSchedule { id } => {
+            let mut sched = schedule_registry.lock().await;
+            // Support prefix match
+            let full_id = match sched.find_by_prefix(&id) {
+                Some(entry) => entry.id.clone(),
+                None => {
+                    return Response::Error {
+                        code: ErrorCode::ScheduleNotFound,
+                        message: format!("no schedule matching: {id}"),
+                    };
+                }
+            };
+            match sched.remove(&full_id) {
+                Ok(()) => Response::Ok {
+                    message: format!("schedule {full_id} removed"),
+                },
+                Err(e) => Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::PauseSchedule { id } => {
+            let mut sched = schedule_registry.lock().await;
+            let full_id = match sched.find_by_prefix(&id) {
+                Some(entry) => entry.id.clone(),
+                None => {
+                    return Response::Error {
+                        code: ErrorCode::ScheduleNotFound,
+                        message: format!("no schedule matching: {id}"),
+                    };
+                }
+            };
+            match sched.pause(&full_id) {
+                Ok(()) => Response::Ok {
+                    message: format!("schedule {full_id} paused"),
+                },
+                Err(e) => Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::ResumeSchedule { id } => {
+            let mut sched = schedule_registry.lock().await;
+            let full_id = match sched.find_by_prefix(&id) {
+                Some(entry) => entry.id.clone(),
+                None => {
+                    return Response::Error {
+                        code: ErrorCode::ScheduleNotFound,
+                        message: format!("no schedule matching: {id}"),
+                    };
+                }
+            };
+            match sched.resume(&full_id) {
+                Ok(()) => Response::Ok {
+                    message: format!("schedule {full_id} resumed"),
+                },
+                Err(e) => Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -704,6 +856,11 @@ fn request_type_name(req: &Request) -> &'static str {
         Request::DetachRun { .. } => "DetachRun",
         Request::DaemonStatus => "DaemonStatus",
         Request::Shutdown => "Shutdown",
+        Request::AddSchedule { .. } => "AddSchedule",
+        Request::ListSchedules => "ListSchedules",
+        Request::RemoveSchedule { .. } => "RemoveSchedule",
+        Request::PauseSchedule { .. } => "PauseSchedule",
+        Request::ResumeSchedule { .. } => "ResumeSchedule",
     }
 }
 
@@ -808,6 +965,40 @@ fn validate_plan_path(plan_path: &Path, allowed_root: &Path) -> Result<PathBuf> 
     }
 
     Ok(canonical)
+}
+
+/// Convert a `ScheduleEntry` to the wire `ScheduleInfo` type.
+fn schedule_entry_to_info(entry: &ScheduleEntry) -> ScheduleInfo {
+    let kind = match &entry.kind {
+        crate::daemon::schedule::ScheduleKind::Cron { expression } => {
+            ScheduleKindInfo::Cron {
+                expression: expression.clone(),
+            }
+        }
+        crate::daemon::schedule::ScheduleKind::OneShot { at } => {
+            ScheduleKindInfo::OneShot {
+                at: at.to_rfc3339(),
+            }
+        }
+        crate::daemon::schedule::ScheduleKind::Delayed { delay_secs } => {
+            let fires_at = entry.created_at + chrono::Duration::seconds(*delay_secs as i64);
+            ScheduleKindInfo::Delayed {
+                fires_at: fires_at.to_rfc3339(),
+            }
+        }
+    };
+
+    ScheduleInfo {
+        id: entry.id.clone(),
+        plan_path: entry.plan_path.clone(),
+        repo_dir: entry.repo_dir.clone(),
+        kind,
+        status: entry.status.clone(),
+        next_fire: entry.next_fire.map(|t| t.to_rfc3339()),
+        last_fired: entry.last_fired.map(|t| t.to_rfc3339()),
+        fire_count: entry.fire_count,
+        label: entry.label.clone(),
+    }
 }
 
 /// Classify an error returned from `executor::spawn_run` (or its inner
@@ -917,9 +1108,13 @@ mod tests {
         let registry = Arc::new(Mutex::new(RunRegistry::new()));
         let cancel = CancellationToken::new();
 
+        let schedule_registry = Arc::new(Mutex::new(
+            crate::daemon::schedule::ScheduleRegistry::new(tmp.path().join("schedules.json")),
+        ));
         let monitors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let server = DaemonServer::new(
             Arc::clone(&registry),
+            Arc::clone(&schedule_registry),
             socket_path.clone(),
             cancel.clone(),
             monitors,

@@ -730,6 +730,7 @@ mod tests {
             error_message: None,
             restartable: true,
             claude_pid: None,
+            schedule_id: None,
         }
     }
 

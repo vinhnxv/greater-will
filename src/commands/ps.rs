@@ -109,12 +109,17 @@ fn print_table(runs: &[RunInfo]) {
             };
             let status_plain = format_status_plain(run.status);
             let status_styled = format_status(run.status);
+            let plan_display = if run.schedule_id.is_some() {
+                format!("{} (scheduled)", abbreviate_home(&run.plan_path.to_string_lossy()))
+            } else {
+                abbreviate_home(&run.plan_path.to_string_lossy())
+            };
             (sort_key, RowData {
                 id: short_id(&run.run_id).to_string(),
                 tmux: run.session_name.clone(),
                 status_plain,
                 status_styled,
-                plan: abbreviate_home(&run.plan_path.to_string_lossy()),
+                plan: plan_display,
                 repo: abbreviate_home(&run.repo_dir.to_string_lossy()),
                 phase: run.current_phase.as_deref().unwrap_or("-").to_string(),
                 uptime: format_uptime(run.uptime_secs),

@@ -5,6 +5,7 @@ pub mod protocol;
 pub mod reconciler;
 pub mod registry;
 pub mod run_monitor;
+pub mod schedule;
 pub mod server;
 pub mod state;
 
@@ -328,7 +329,31 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     let heartbeat_handle = heartbeat.start();
     info!("heartbeat monitor spawned");
 
-    let server = DaemonServer::new(Arc::clone(&registry), socket_path, cancel.clone(), monitors);
+    let schedule_registry = Arc::new(Mutex::new(
+        schedule::ScheduleRegistry::load(&home.join("schedules.json"))
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "failed to load schedule registry, starting empty");
+                schedule::ScheduleRegistry::new(home.join("schedules.json"))
+            }),
+    ));
+
+    // 7c. Spawn schedule runner (polls for ready schedules and fires them)
+    let sched_reg = Arc::clone(&schedule_registry);
+    let run_reg = Arc::clone(&registry);
+    let sched_cancel = cancel.clone();
+    let sched_interval = config.schedule_interval_secs;
+    tokio::spawn(async move {
+        schedule::run_schedule_loop(sched_reg, run_reg, sched_cancel, sched_interval).await;
+    });
+    info!(interval_secs = sched_interval, "schedule runner spawned");
+
+    let server = DaemonServer::new(
+        Arc::clone(&registry),
+        Arc::clone(&schedule_registry),
+        socket_path,
+        cancel.clone(),
+        monitors,
+    );
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.start().await {
