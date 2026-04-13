@@ -9,12 +9,32 @@ use color_eyre::{eyre::WrapErr, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::daemon::protocol::{RunInfo, RunStatus};
 use crate::daemon::state::gw_home;
+
+/// Maximum pending runs across all repos.
+const MAX_QUEUE_SIZE: usize = 50;
+
+/// Consecutive spawn failures before the circuit breaker trips.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+// ── Pending run (in-memory queue entry) ────────────────────────────
+
+/// In-memory record of a run waiting to be spawned.
+#[derive(Debug, Clone)]
+pub struct PendingRun {
+    pub run_id: String,
+    pub plan_path: PathBuf,
+    pub repo_dir: PathBuf,
+    pub session_name: Option<String>,
+    pub config_dir: Option<PathBuf>,
+    pub verbose: u8,
+    pub queued_at: DateTime<Utc>,
+}
 
 // ── Shared repo hash ────────────────────────────────────────────────
 
@@ -122,6 +142,10 @@ pub struct RunRegistry {
     /// Held file locks for per-repo exclusion (keyed by repo hash).
     #[allow(dead_code)]
     repo_locks: HashMap<String, fs::File>,
+    /// Per-repo pending run queues (keyed by repo hash).
+    pending_queues: HashMap<String, VecDeque<PendingRun>>,
+    /// Consecutive spawn failure count per repo (for circuit breaker).
+    consecutive_failures: HashMap<String, u32>,
 }
 
 impl RunRegistry {
@@ -130,6 +154,8 @@ impl RunRegistry {
         Self {
             runs: HashMap::new(),
             repo_locks: HashMap::new(),
+            pending_queues: HashMap::new(),
+            consecutive_failures: HashMap::new(),
         }
     }
 
@@ -182,7 +208,7 @@ impl RunRegistry {
     ///
     /// Uses nanosecond timestamp + PID + random bytes to avoid collisions
     /// on systems with low-resolution clocks or rapid sequential calls.
-    fn generate_id() -> String {
+    pub(crate) fn generate_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -395,6 +421,128 @@ impl RunRegistry {
             tracing::warn!(run_id = %run_id, error = %e, "failed to persist adopted entry");
         }
         self.runs.insert(run_id, entry);
+    }
+
+    // ── Queue operations ────────────────────────────────────────────
+
+    /// Enqueue a pending run for a repo. Returns queue position (1-indexed).
+    pub fn enqueue_run(&mut self, pending: PendingRun) -> Result<usize> {
+        // Global queue cap
+        let total: usize = self.pending_queues.values().map(|q| q.len()).sum();
+        if total >= MAX_QUEUE_SIZE {
+            return Err(color_eyre::eyre::eyre!("queue full: {total} pending runs"));
+        }
+        let hash = repo_hash(&pending.repo_dir);
+
+        // Duplicate detection (borrow pending_queues, then release)
+        {
+            let queue = self.pending_queues.entry(hash.clone()).or_default();
+            if queue.iter().any(|p| p.plan_path == pending.plan_path) {
+                return Err(color_eyre::eyre::eyre!(
+                    "plan already queued: {}",
+                    pending.plan_path.display()
+                ));
+            }
+        }
+
+        // Create a RunEntry for gw ps visibility
+        let entry = RunEntry {
+            run_id: pending.run_id.clone(),
+            plan_path: pending.plan_path.clone(),
+            repo_dir: pending.repo_dir.clone(),
+            session_name: format!("gw-{}", &pending.run_id),
+            tmux_session: None,
+            status: RunStatus::Queued,
+            current_phase: None,
+            started_at: pending.queued_at,
+            finished_at: None,
+            crash_restarts: 0,
+            config_dir: pending.config_dir.clone(),
+            error_message: None,
+            restartable: false,
+            claude_pid: None,
+        };
+        self.write_meta(&entry)?;
+        self.runs.insert(pending.run_id.clone(), entry);
+
+        let queue = self.pending_queues.entry(hash).or_default();
+        queue.push_back(pending);
+        Ok(queue.len())
+    }
+
+    /// Remove a queued run by ID. Returns the PendingRun if found.
+    pub fn dequeue_run(&mut self, run_id: &str) -> Option<PendingRun> {
+        for queue in self.pending_queues.values_mut() {
+            if let Some(pos) = queue.iter().position(|p| p.run_id == run_id) {
+                let pending = queue.remove(pos);
+                // Update the RunEntry to Stopped
+                let _ = self.update_status(
+                    run_id,
+                    RunStatus::Stopped,
+                    None,
+                    Some("removed from queue".into()),
+                );
+                return pending;
+            }
+        }
+        None
+    }
+
+    /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
+    pub fn drain_next(&mut self, repo_dir: &Path) -> Option<PendingRun> {
+        let hash = repo_hash(repo_dir);
+        if self
+            .consecutive_failures
+            .get(&hash)
+            .copied()
+            .unwrap_or(0)
+            >= MAX_CONSECUTIVE_FAILURES
+        {
+            return None;
+        }
+        self.pending_queues.get_mut(&hash)?.pop_front()
+    }
+
+    /// Record a queue spawn failure for the circuit breaker.
+    pub fn record_queue_failure(&mut self, repo_dir: &Path) {
+        let hash = repo_hash(repo_dir);
+        let count = self.consecutive_failures.entry(hash.clone()).or_insert(0);
+        *count += 1;
+        if *count >= MAX_CONSECUTIVE_FAILURES {
+            tracing::warn!(repo_hash = %hash, "circuit breaker tripped — draining remaining queue");
+            // Collect run IDs first to avoid borrowing self while iterating
+            let run_ids: Vec<String> = self
+                .pending_queues
+                .get_mut(&hash)
+                .map(|queue| queue.drain(..).map(|p| p.run_id).collect())
+                .unwrap_or_default();
+            for run_id in &run_ids {
+                let _ = self.update_status(
+                    run_id,
+                    RunStatus::Stopped,
+                    None,
+                    Some("circuit breaker tripped".into()),
+                );
+            }
+            self.consecutive_failures.remove(&hash);
+        }
+    }
+
+    /// Record a successful queue spawn, resetting the circuit breaker.
+    pub fn record_queue_success(&mut self, repo_dir: &Path) {
+        let hash = repo_hash(repo_dir);
+        self.consecutive_failures.remove(&hash);
+    }
+
+    /// Check whether a repo lock is currently held.
+    pub fn has_repo_lock(&self, repo_dir: &Path) -> bool {
+        let hash = repo_hash(repo_dir);
+        self.repo_locks.contains_key(&hash)
+    }
+
+    /// Total number of pending runs across all repos.
+    pub fn total_pending_count(&self) -> usize {
+        self.pending_queues.values().map(|q| q.len()).sum()
     }
 
     // ── Internal helpers ────────────────────────────────────────────
@@ -685,6 +833,108 @@ mod tests {
             let loaded = RunRegistry::load_from_disk().unwrap();
             let entry = loaded.get(&id).unwrap();
             assert_eq!(entry.claude_pid, Some(98765));
+        });
+    }
+
+    #[test]
+    fn enqueue_and_drain_order() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo");
+            // Enqueue two runs
+            let p1 = PendingRun {
+                run_id: "q1".into(),
+                plan_path: PathBuf::from("plan1.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            let p2 = PendingRun {
+                run_id: "q2".into(),
+                plan_path: PathBuf::from("plan2.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            assert_eq!(reg.enqueue_run(p1).unwrap(), 1);
+            assert_eq!(reg.enqueue_run(p2).unwrap(), 2);
+            // Drain returns FIFO order
+            let d1 = reg.drain_next(&repo).unwrap();
+            assert_eq!(d1.run_id, "q1");
+            let d2 = reg.drain_next(&repo).unwrap();
+            assert_eq!(d2.run_id, "q2");
+            assert!(reg.drain_next(&repo).is_none());
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_trips_and_resets() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo-cb");
+            // Enqueue a run so drain_next has something
+            let p = PendingRun {
+                run_id: "cb1".into(),
+                plan_path: PathBuf::from("plan.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            let _ = reg.enqueue_run(p);
+            // Record 3 failures — circuit breaker trips, queue is drained
+            reg.record_queue_failure(&repo);
+            reg.record_queue_failure(&repo);
+            reg.record_queue_failure(&repo);
+            // Queue should be empty and drain returns None
+            assert!(reg.drain_next(&repo).is_none());
+            // After trip, counter is reset — new enqueue should work
+            let p2 = PendingRun {
+                run_id: "cb2".into(),
+                plan_path: PathBuf::from("plan2.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            assert_eq!(reg.enqueue_run(p2).unwrap(), 1);
+            // One failure should not trip
+            reg.record_queue_failure(&repo);
+            assert!(reg.drain_next(&repo).is_some());
+        });
+    }
+
+    #[test]
+    fn duplicate_plan_rejected() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo-dup");
+            let p1 = PendingRun {
+                run_id: "d1".into(),
+                plan_path: PathBuf::from("same.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            let p2 = PendingRun {
+                run_id: "d2".into(),
+                plan_path: PathBuf::from("same.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            assert!(reg.enqueue_run(p1).is_ok());
+            assert!(reg.enqueue_run(p2).is_err()); // duplicate
         });
     }
 

@@ -64,6 +64,8 @@ pub enum Request {
 pub enum Response {
     /// A run was successfully queued.
     RunSubmitted { run_id: String },
+    /// A run was queued behind an active run in the same repo.
+    RunQueued { run_id: String, position: usize },
     /// List of runs.
     RunList { runs: Vec<RunInfo> },
     /// A chunk of log output.
@@ -110,6 +112,7 @@ pub enum ErrorCode {
     DaemonBusy,
     InvalidRequest,
     InternalError,
+    QueueFull,
 }
 
 impl ErrorCode {
@@ -133,6 +136,9 @@ impl ErrorCode {
             }
             ErrorCode::InternalError => {
                 "Internal daemon error. Check with: `gw daemon status`".to_string()
+            }
+            ErrorCode::QueueFull => {
+                "Queue is full. Wait for runs to complete or cancel queued entries with `gw stop`.".to_string()
             }
         }
     }
@@ -254,6 +260,10 @@ mod tests {
                 code: ErrorCode::RunNotFound,
                 message: "no such run".into(),
             },
+            Response::RunQueued {
+                run_id: "run-queue-1".into(),
+                position: 2,
+            },
         ];
 
         for resp in &cases {
@@ -286,6 +296,7 @@ mod tests {
             ErrorCode::DaemonBusy,
             ErrorCode::InvalidRequest,
             ErrorCode::InternalError,
+            ErrorCode::QueueFull,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let deser: ErrorCode = serde_json::from_str(&json).unwrap();
