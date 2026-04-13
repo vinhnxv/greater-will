@@ -14,6 +14,7 @@ use super::util::{
 };
 use super::{SingleSessionConfig, SessionOutcome, POLL_INTERVAL_SECS, STATUS_LOG_INTERVAL_SECS};
 use crate::cleanup;
+use crate::engine::monitor_constants::FOREGROUND_MIN_COMPLETION_AGE_SECS as MIN_COMPLETION_AGE_SECS;
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::{capture_pane, save_crash_dump};
 use crate::session::spawn::{
@@ -24,10 +25,6 @@ use color_eyre::Result;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-
-/// Minimum session age (seconds) before we treat a vanished session as
-/// "likely completed" rather than "crashed".  Used in multiple check branches.
-const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
 
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
 pub(crate) fn run_session_attempt(

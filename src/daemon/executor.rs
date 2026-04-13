@@ -29,11 +29,28 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// 1. Validate that the plan file exists and the repo is clean
 /// 2. Register the run in the registry (acquires per-repo lock)
-/// 3. Spawn a tmux session via `SpawnConfig`
-/// 4. Send the `/rune:arc` command
-/// 5. Update registry with tmux session info
+/// 3. Pre-flight: `cleanup::pre_phase_cleanup` + `elden::clear_signals`
+///    (parity with foreground `monitor::run_session_attempt` — plan GAP A3)
+/// 4. Spawn a tmux session via `SpawnConfig`
+/// 5. Write `session_owner.json` for adopt-orphaned-session recovery
+/// 6. Populate `last_recovery_at` so first-attempt uptime is measured from
+///    this spawn, not from daemon boot (plan GAP A5)
+/// 7. Send the `/rune:arc` command (persists crash dump on send failure)
+/// 8. Update registry with tmux session info
 ///
 /// Returns the run ID on success.
+///
+/// # Open question (plan Task 4)
+///
+/// The foreground path sleeps 12 s after spawn to let Claude Code finish
+/// initializing before dispatching the command (`monitor.rs:81`). The
+/// daemon currently dispatches immediately after `spawn_claude_session`
+/// returns. Whether the daemon needs the same 12 s wait is an empirical
+/// question (run three daemon spawns with `verbose=2`, look for
+/// `send_keys` failures or dropped commands in the first 12 s). Tracked
+/// in `plans/2026-04-14-refactor-daemon-foreground-shared-primitives-plan.md`
+/// Task 4 — deferred because resolving it requires live-process
+/// observation, not a code change.
 pub async fn spawn_run(
     registry: Arc<Mutex<RunRegistry>>,
     plan_path: &Path,
@@ -97,6 +114,19 @@ pub async fn spawn_run(
     };
     info!(run_id = %run_id, plan = %plan_path.display(), verbose = level_label, "run registered");
 
+    // ── Pre-flight: match foreground sequence ───────────────────────
+    // Parity with `engine::single_session::monitor::run_session_attempt`
+    // (see plan GAP A3). Runs BEFORE tmux spawn so a dirty process tree
+    // or stale signal files from a prior run do not corrupt the new
+    // session's state.
+    if let Err(e) = crate::cleanup::pre_phase_cleanup("daemon", "0") {
+        // Propagate like the foreground path does — a failed pre-flight
+        // indicates a process-tree state we cannot reason about.
+        warn!(run_id = %run_id, error = %e, "pre_phase_cleanup failed");
+        return Err(e);
+    }
+    crate::commands::elden::clear_signals();
+
     // ── Spawn tmux session ──────────────────────────────────────────
     let tmux_session = format!("gw-{}", run_id);
 
@@ -108,14 +138,35 @@ pub async fn spawn_run(
         mock: false,
     };
 
+    let plan_str = plan_path.to_string_lossy();
+
     match spawn::spawn_claude_session(&config) {
         Ok(pid) => {
             debug!(run_id = %run_id, pid = pid, tmux = %tmux_session, "tmux session spawned");
-            // Persist claude PID for downstream liveness checks (DaemonRunMonitor).
-            // Held only for the mutation and released before any tmux I/O.
+
+            // Write session_owner.json so a subsequent `gw run` (foreground)
+            // can adopt this daemon-spawned session if the daemon crashes.
+            // Parity with monitor.rs:73-77 (plan GAP A3).
+            if let Err(e) = crate::monitor::session_owner::write_session_owner(
+                repo_dir,
+                &tmux_session,
+                &plan_str,
+                pid,
+            ) {
+                warn!(run_id = %run_id, error = %e, "failed to write session owner (non-fatal)");
+            }
+
+            // Persist claude PID + set last_recovery_at so the first-attempt
+            // uptime window (used at heartbeat.rs:697) is measured from the
+            // current spawn, not from daemon boot. Plan GAP A5.
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(&run_id) {
                 entry.claude_pid = Some(pid);
+                // See heartbeat.rs:697 — `run_uptime = now - session_start`
+                // where `session_start = last_recovery_at.unwrap_or(started_at)`.
+                // Without this, a first-attempt crash produces a run_uptime
+                // measured from daemon boot, inflating `record_healthy_runtime`.
+                entry.last_recovery_at = Some(chrono::Utc::now());
             }
             drop(reg);
         }
@@ -136,12 +187,17 @@ pub async fn spawn_run(
     }
 
     // ── Send arc command ────────────────────────────────────────────
-    let plan_str = plan_path.to_string_lossy();
-    let arc_cmd = build_arc_command(&plan_str);
+    // Shared with the foreground path — see
+    // `crate::engine::single_session::util::build_arc_command` for the
+    // flag-aware variant used on foreground restarts.
+    let arc_cmd = crate::engine::single_session::util::build_arc_command_plain(&plan_str);
 
     if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &arc_cmd) {
         warn!(error = %e, "failed to send arc command — killing session");
         let reason = format!("failed to send arc command: {e}");
+        // Persist pane capture before kill so post-mortem debugging works —
+        // parity with monitor.rs:88 (plan GAP A3).
+        crate::session::detect::save_crash_dump(&tmux_session, repo_dir, &reason);
         crate::daemon::heartbeat::append_event(&run_id, "kill_session", &format!(
             "gw killed session '{}' — reason: {} (killed by: executor/send_keys_failed)",
             tmux_session, reason,
@@ -289,17 +345,6 @@ pub async fn stop_run(
 
 // ── Helper functions ────────────────────────────────────────────────
 
-/// Build the `/rune:arc` command string.
-///
-/// Follows the pattern from `engine/single_session/util.rs::build_arc_command`
-/// but simplified for daemon use (no resume flag on initial spawn).
-fn build_arc_command(plan_path: &str) -> String {
-    format!(
-        "/rune:arc '{}'",
-        plan_path.replace('\'', "'\\''")
-    )
-}
-
 /// Check if the git working tree is clean.
 ///
 /// Returns `Some(warning)` if dirty, `None` if clean.
@@ -344,16 +389,21 @@ async fn wait_for_session_exit(tmux_session: &str, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::single_session::util::build_arc_command_plain;
 
+    // Mirror tests pinning the escaping behavior of the shared
+    // `build_arc_command_plain` helper from the daemon's call-site. Any
+    // change to the escaping (e.g., heartbeat.rs:925 path) must also be
+    // reflected here so the daemon spawn → send_keys contract stays tight.
     #[test]
     fn build_arc_command_simple() {
-        let cmd = build_arc_command("plans/feat.md");
+        let cmd = build_arc_command_plain("plans/feat.md");
         assert_eq!(cmd, "/rune:arc 'plans/feat.md'");
     }
 
     #[test]
     fn build_arc_command_escapes_quotes() {
-        let cmd = build_arc_command("plans/it's-a-plan.md");
+        let cmd = build_arc_command_plain("plans/it's-a-plan.md");
         assert_eq!(cmd, "/rune:arc 'plans/it'\\''s-a-plan.md'");
     }
 

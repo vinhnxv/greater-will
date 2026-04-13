@@ -35,6 +35,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::registry::{RunEntry, RunRegistry};
+use crate::engine::monitor_constants::{
+    COMPLETION_GRACE_SECS, DAEMON_MIN_COMPLETION_AGE_SECS as MIN_COMPLETION_AGE_SECS,
+    KILL_GATE_MIN_SECS, KILL_GATE_RECOVERY_WINDOW_SECS, LOOP_STATE_GONE_GRACE_SECS,
+    POLL_INTERVAL_SECS, STATUS_LOG_INTERVAL_SECS,
+};
 use crate::engine::phase_profile::{self, PhaseProfile};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::engine::single_session::util::{
@@ -45,18 +50,9 @@ use crate::monitor::loop_state::{read_arc_loop_state, ArcLoopState};
 use crate::monitor::phase_nav;
 use crate::monitor::prompt_accept::PromptAcceptor;
 
-/// Re-declared constants (mirrors function-scoped values in `monitor_session`).
-///
-/// Note: `POLL_INTERVAL_SECS` and `STATUS_LOG_INTERVAL_SECS` exist at module
-/// level in `engine::single_session::mod`, but we re-declare here to keep the
-/// daemon module self-contained. Values match the foreground source.
-const KILL_GATE_MIN_SECS: u64 = 300; // 5 min silence before kill fires
-const COMPLETION_GRACE_SECS: u64 = 300; // 5 min after completion signal
-const MIN_COMPLETION_AGE_SECS: u64 = 60; // 1 min (DET-6: reduced from 300s; checkpoint-based disambiguation handles the rest)
-const POLL_INTERVAL_SECS: u64 = 5;
-const STATUS_LOG_INTERVAL_SECS: u64 = 30;
-const LOOP_STATE_GONE_GRACE_SECS: u64 = 300; // 5 min before loop state gone → crash
-const KILL_GATE_RECOVERY_WINDOW_SECS: u64 = 30; // activity within N secs cancels kill
+// Constants are now sourced from `crate::engine::monitor_constants` — see the
+// module docstring there for divergence rationale (DAEMON vs FOREGROUND
+// `MIN_COMPLETION_AGE_SECS`, 60 s vs 300 s).
 
 // ──────────────────────────────────────────────────────────────────────
 // Outcomes and state enums
@@ -454,7 +450,23 @@ impl DaemonRunMonitor {
     }
 
     /// State-changing wrapper — error-log on failure; caller reports.
-    async fn kill_session(&self) -> bool {
+    ///
+    /// Persists a crash dump (pane capture + reason) before killing so
+    /// post-mortem debugging has context — parity with the foreground
+    /// `monitor.rs:88` behavior (plan GAP A4).
+    async fn kill_session(&self, reason: &str) -> bool {
+        // Save crash dump BEFORE the kill so the pane state is captured
+        // while the session is still alive. Non-fatal: a missing dump
+        // must not prevent the kill (we still need to reclaim the tmux
+        // session).
+        let session = self.tmux_session.clone();
+        let repo_dir = self.repo_dir.clone();
+        let reason_owned = reason.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::detect::save_crash_dump(&session, &repo_dir, &reason_owned);
+        })
+        .await;
+
         let session = self.tmux_session.clone();
         match tokio::task::spawn_blocking(move || {
             let _ = crate::session::spawn::kill_session(&session);
@@ -466,7 +478,8 @@ impl DaemonRunMonitor {
                 info!(
                     run_id = %self.run_id,
                     tmux_session = %self.tmux_session,
-                    "session killed"
+                    reason = %reason,
+                    "session killed (crash dump saved)"
                 );
                 true
             }
@@ -1226,8 +1239,9 @@ impl DaemonRunMonitor {
         }
 
         if gate_elapsed >= KILL_GATE_MIN_SECS {
-            // Execute kill after full silence.
-            let _killed = self.kill_session().await;
+            // Execute kill after full silence — pass the reason so the
+            // wrapper can persist a crash dump before tmux teardown.
+            let _killed = self.kill_session(&pk_reason).await;
             self.pending_kill = None;
             // REFINE-003: exhaustive match on typed enum.
             let final_outcome = match pk_outcome {
