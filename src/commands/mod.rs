@@ -9,6 +9,7 @@ pub mod elden;
 pub mod history;
 pub mod logs;
 pub mod ps;
+pub mod queue;
 pub mod replay;
 pub mod schedule;
 pub mod run;

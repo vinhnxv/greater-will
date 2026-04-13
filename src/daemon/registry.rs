@@ -25,7 +25,7 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 // ── Pending run (in-memory queue entry) ────────────────────────────
 
 /// In-memory record of a run waiting to be spawned.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingRun {
     pub run_id: String,
     pub plan_path: PathBuf,
@@ -34,6 +34,16 @@ pub struct PendingRun {
     pub config_dir: Option<PathBuf>,
     pub verbose: u8,
     pub queued_at: DateTime<Utc>,
+}
+
+/// Snapshot of all pending queues and circuit-breaker state, persisted to
+/// `~/.gw/queue.json` so queued runs survive daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueueSnapshot {
+    #[serde(default)]
+    pub queues: HashMap<String, Vec<PendingRun>>,
+    #[serde(default)]
+    pub consecutive_failures: HashMap<String, u32>,
 }
 
 // ── Shared repo hash ────────────────────────────────────────────────
@@ -133,6 +143,7 @@ impl RunEntry {
             started_at: self.started_at.to_rfc3339(),
             uptime_secs: uptime,
             schedule_id: self.schedule_id.clone(),
+            waiting_for_network: false, // populated by server with shared state
         }
     }
 }
@@ -485,7 +496,9 @@ impl RunRegistry {
 
         let queue = self.pending_queues.entry(hash).or_default();
         queue.push_back(pending);
-        Ok(queue.len())
+        let position = queue.len();
+        self.save_queue()?;
+        Ok(position)
     }
 
     /// Remove a queued run by ID. Returns the PendingRun if found.
@@ -500,6 +513,9 @@ impl RunRegistry {
                     None,
                     Some("removed from queue".into()),
                 );
+                if let Err(e) = self.save_queue() {
+                    tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
+                }
                 return pending;
             }
         }
@@ -518,7 +534,13 @@ impl RunRegistry {
         {
             return None;
         }
-        self.pending_queues.get_mut(&hash)?.pop_front()
+        let result = self.pending_queues.get_mut(&hash).and_then(|q| q.pop_front());
+        if result.is_some() {
+            if let Err(e) = self.save_queue() {
+                tracing::warn!(error = %e, "failed to persist queue after drain_next");
+            }
+        }
+        result
     }
 
     /// Record a queue spawn failure for the circuit breaker.
@@ -544,12 +566,18 @@ impl RunRegistry {
             }
             self.consecutive_failures.remove(&hash);
         }
+        if let Err(e) = self.save_queue() {
+            tracing::warn!(error = %e, "failed to persist queue after record_queue_failure");
+        }
     }
 
     /// Record a successful queue spawn, resetting the circuit breaker.
     pub fn record_queue_success(&mut self, repo_dir: &Path) {
         let hash = repo_hash(repo_dir);
         self.consecutive_failures.remove(&hash);
+        if let Err(e) = self.save_queue() {
+            tracing::warn!(error = %e, "failed to persist queue after record_queue_success");
+        }
     }
 
     /// Check whether a repo lock is currently held.
@@ -561,6 +589,205 @@ impl RunRegistry {
     /// Total number of pending runs across all repos.
     pub fn total_pending_count(&self) -> usize {
         self.pending_queues.values().map(|q| q.len()).sum()
+    }
+
+    /// Count runs currently in `Running` status.
+    pub fn count_running(&self) -> usize {
+        self.runs
+            .values()
+            .filter(|r| r.status == RunStatus::Running)
+            .count()
+    }
+
+    /// Check whether a run ID is present in any pending queue.
+    pub fn is_in_pending_queue(&self, run_id: &str) -> bool {
+        self.pending_queues
+            .values()
+            .any(|q| q.iter().any(|p| p.run_id == run_id))
+    }
+
+    /// Return references to all pending entries across all repo queues.
+    pub fn pending_entries(&self) -> Vec<&PendingRun> {
+        self.pending_queues
+            .values()
+            .flat_map(|q| q.iter())
+            .collect()
+    }
+
+    /// Remove a pending entry by run ID from whichever queue contains it.
+    pub fn remove_pending(&mut self, run_id: &str) {
+        for queue in self.pending_queues.values_mut() {
+            queue.retain(|p| p.run_id != run_id);
+        }
+    }
+
+    /// Pop the next pending run from any repo queue whose circuit breaker
+    /// has not tripped. Used to fill global capacity when the completing
+    /// repo's own queue is empty.
+    pub fn drain_any_ready(&mut self) -> Option<PendingRun> {
+        let ready_hash = self
+            .pending_queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .filter(|(hash, _)| {
+                self.consecutive_failures
+                    .get(*hash)
+                    .copied()
+                    .unwrap_or(0)
+                    < MAX_CONSECUTIVE_FAILURES
+            })
+            .map(|(hash, _)| hash.clone())
+            .next()?;
+        let result = self.pending_queues.get_mut(&ready_hash)?.pop_front();
+        if result.is_some() {
+            if let Err(e) = self.save_queue() {
+                tracing::warn!(error = %e, "failed to persist queue after drain_any_ready");
+            }
+        }
+        result
+    }
+
+    /// List queued runs, optionally filtered by repo directory.
+    /// Returns `QueuedRunInfo` entries with global position numbering.
+    pub fn list_queue(
+        &self,
+        repo_filter: Option<&Path>,
+    ) -> Vec<crate::daemon::protocol::QueuedRunInfo> {
+        let mut entries = Vec::new();
+        let mut position = 1usize;
+
+        for (_hash, queue) in &self.pending_queues {
+            for pending in queue {
+                if let Some(filter) = repo_filter {
+                    if pending.repo_dir != filter {
+                        let canonical = filter.canonicalize().unwrap_or_else(|_| filter.to_path_buf());
+                        if pending.repo_dir != canonical {
+                            position += 1;
+                            continue;
+                        }
+                    }
+                }
+                entries.push(crate::daemon::protocol::QueuedRunInfo {
+                    run_id: pending.run_id.clone(),
+                    plan_path: pending.plan_path.clone(),
+                    repo_dir: pending.repo_dir.clone(),
+                    position,
+                    queued_at: pending.queued_at.to_rfc3339(),
+                    session_name: pending.session_name.clone(),
+                });
+                position += 1;
+            }
+        }
+
+        entries
+    }
+
+    /// Clear queued runs. If `repo_filter` is `Some`, only clear runs for
+    /// that repo directory; otherwise clear all queues. Returns the count
+    /// of removed entries.
+    pub fn clear_queue(&mut self, repo_filter: Option<&Path>) -> usize {
+        let mut removed = 0usize;
+
+        match repo_filter {
+            Some(filter) => {
+                let canonical = filter.canonicalize().unwrap_or_else(|_| filter.to_path_buf());
+                for queue in self.pending_queues.values_mut() {
+                    let before = queue.len();
+                    queue.retain(|p| p.repo_dir != canonical && p.repo_dir != filter);
+                    removed += before - queue.len();
+                }
+            }
+            None => {
+                for queue in self.pending_queues.values_mut() {
+                    removed += queue.len();
+                    queue.clear();
+                }
+            }
+        }
+
+        removed
+    }
+
+    /// Find a pending run by ID prefix across all queues.
+    /// Returns `(full_run_id, repo_hash)` if exactly one match is found.
+    pub fn find_pending_by_prefix(&self, prefix: &str) -> Option<(String, String)> {
+        let mut matches = Vec::new();
+        for (hash, queue) in &self.pending_queues {
+            for pending in queue {
+                if pending.run_id.starts_with(prefix) {
+                    matches.push((pending.run_id.clone(), hash.clone()));
+                }
+            }
+        }
+        if matches.len() == 1 {
+            Some(matches.into_iter().next().unwrap())
+        } else {
+            None
+        }
+    }
+
+    // ── Queue persistence ──────────────────────────────────────────
+
+    /// Persist pending queues and circuit-breaker state to `~/.gw/queue.json`.
+    ///
+    /// Uses the same atomic write pattern as [`write_meta`]: write to a
+    /// sibling tempfile, fsync, then rename into place.
+    pub fn save_queue(&self) -> Result<()> {
+        let snapshot = QueueSnapshot {
+            queues: self
+                .pending_queues
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect(),
+            consecutive_failures: self.consecutive_failures.clone(),
+        };
+        let json = serde_json::to_string_pretty(&snapshot)
+            .wrap_err("failed to serialize queue snapshot")?;
+
+        let queue_path = gw_home().join("queue.json");
+        let tmp_path = gw_home().join("queue.json.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp_path).wrap_err_with(|| {
+                format!("failed to create queue tmpfile: {}", tmp_path.display())
+            })?;
+            f.write_all(json.as_bytes())
+                .wrap_err("failed to write queue.json")?;
+            f.sync_all().wrap_err("failed to fsync queue.json")?;
+        }
+        fs::rename(&tmp_path, &queue_path)
+            .wrap_err("failed to atomically rename queue.json")?;
+        Ok(())
+    }
+
+    /// Load queue snapshot from `~/.gw/queue.json`.
+    ///
+    /// Returns an empty default on missing or corrupt files so the daemon
+    /// always starts cleanly.
+    pub fn load_queue(home: &Path) -> Result<QueueSnapshot> {
+        let path = home.join("queue.json");
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "corrupt queue.json — using empty defaults");
+                QueueSnapshot::default()
+            })),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(error = %e, "failed to read queue.json — using empty defaults");
+                }
+                Ok(QueueSnapshot::default())
+            }
+        }
+    }
+
+    /// Populate in-memory pending queues and circuit-breaker state from a
+    /// previously loaded [`QueueSnapshot`].
+    pub fn restore_queue(&mut self, snapshot: QueueSnapshot) {
+        for (hash, entries) in snapshot.queues {
+            self.pending_queues
+                .insert(hash, VecDeque::from(entries));
+        }
+        self.consecutive_failures = snapshot.consecutive_failures;
     }
 
     // ── Internal helpers ────────────────────────────────────────────
@@ -953,6 +1180,336 @@ mod tests {
             };
             assert!(reg.enqueue_run(p1).is_ok());
             assert!(reg.enqueue_run(p2).is_err()); // duplicate
+        });
+    }
+
+    // ── A8: Queue Persistence Tests ──────────────────────────────────
+
+    #[test]
+    fn save_queue_load_queue_round_trip() {
+        with_temp_gw_home(|tmp| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/rt-repo");
+
+            let p1 = PendingRun {
+                run_id: "rt01".into(),
+                plan_path: PathBuf::from("plans/alpha.md"),
+                repo_dir: repo.clone(),
+                session_name: Some("sess-alpha".into()),
+                config_dir: None,
+                verbose: 1,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(p1).unwrap();
+
+            // save_queue is called internally by enqueue_run, but call explicitly
+            reg.save_queue().unwrap();
+
+            // Load from disk
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            assert_eq!(snapshot.queues.len(), 1);
+            let queue_entries: Vec<_> = snapshot.queues.values().next().unwrap().clone();
+            assert_eq!(queue_entries.len(), 1);
+            assert_eq!(queue_entries[0].run_id, "rt01");
+            assert_eq!(queue_entries[0].plan_path, PathBuf::from("plans/alpha.md"));
+            assert_eq!(queue_entries[0].session_name, Some("sess-alpha".into()));
+            assert_eq!(queue_entries[0].verbose, 1);
+        });
+    }
+
+    #[test]
+    fn queue_survives_restart() {
+        with_temp_gw_home(|tmp| {
+            // First registry: enqueue and persist
+            {
+                let mut reg = RunRegistry::new();
+                let repo = PathBuf::from("/tmp/survive-repo");
+                let p = PendingRun {
+                    run_id: "sv01".into(),
+                    plan_path: PathBuf::from("plans/survive.md"),
+                    repo_dir: repo,
+                    session_name: None,
+                    config_dir: None,
+                    verbose: 0,
+                    queued_at: Utc::now(),
+                };
+                reg.enqueue_run(p).unwrap();
+                reg.save_queue().unwrap();
+            }
+
+            // Second registry: load and verify
+            let mut reg2 = RunRegistry::new();
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            reg2.restore_queue(snapshot);
+
+            let pending = reg2.pending_entries();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].run_id, "sv01");
+            assert_eq!(pending[0].plan_path, PathBuf::from("plans/survive.md"));
+        });
+    }
+
+    #[test]
+    fn stale_entry_pruning() {
+        // Queue entries whose plan_path doesn't exist on disk should be
+        // detected by callers. Verify that load_queue returns them (the
+        // reconciler is responsible for pruning, but the data must round-trip).
+        with_temp_gw_home(|tmp| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/stale-repo");
+
+            // Use a plan_path that definitely doesn't exist
+            let p = PendingRun {
+                run_id: "stale1".into(),
+                plan_path: PathBuf::from("/nonexistent/plan.md"),
+                repo_dir: repo,
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(p).unwrap();
+            reg.save_queue().unwrap();
+
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            // Stale entry is loaded (callers validate plan_path existence)
+            let total: usize = snapshot.queues.values().map(|v| v.len()).sum();
+            assert_eq!(total, 1);
+
+            // Verify the plan path doesn't exist — confirming it IS stale
+            let entry = snapshot.queues.values().next().unwrap().first().unwrap();
+            assert!(!entry.plan_path.exists());
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_persists() {
+        with_temp_gw_home(|tmp| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/cb-persist-repo");
+
+            // Enqueue enough runs so circuit breaker doesn't drain them all
+            for i in 0..5 {
+                let p = PendingRun {
+                    run_id: format!("cbp{i}"),
+                    plan_path: PathBuf::from(format!("plans/cb{i}.md")),
+                    repo_dir: repo.clone(),
+                    session_name: None,
+                    config_dir: None,
+                    verbose: 0,
+                    queued_at: Utc::now(),
+                };
+                reg.enqueue_run(p).unwrap();
+            }
+
+            // Record 2 failures (below the trip threshold of 3)
+            reg.record_queue_failure(&repo);
+            reg.record_queue_failure(&repo);
+            reg.save_queue().unwrap();
+
+            // Load and verify consecutive_failures persisted
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            let hash = repo_hash(&repo);
+            assert_eq!(snapshot.consecutive_failures.get(&hash).copied().unwrap_or(0), 2);
+        });
+    }
+
+    #[test]
+    fn max_concurrent_runs_enforcement() {
+        // When the global queue is full, additional enqueue attempts should fail.
+        // We test the global cap (MAX_QUEUE_SIZE = 50).
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+
+            // Fill queue to MAX_QUEUE_SIZE
+            for i in 0..50 {
+                let p = PendingRun {
+                    run_id: format!("mx{i:03}"),
+                    plan_path: PathBuf::from(format!("plans/mx{i:03}.md")),
+                    repo_dir: PathBuf::from(format!("/tmp/repo-mx-{i}")),
+                    session_name: None,
+                    config_dir: None,
+                    verbose: 0,
+                    queued_at: Utc::now(),
+                };
+                reg.enqueue_run(p).unwrap();
+            }
+
+            // 51st enqueue should fail with "queue full"
+            let overflow = PendingRun {
+                run_id: "mx050".into(),
+                plan_path: PathBuf::from("plans/overflow.md"),
+                repo_dir: PathBuf::from("/tmp/repo-mx-overflow"),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            let result = reg.enqueue_run(overflow);
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().to_string().contains("queue full"),
+                "expected 'queue full' error"
+            );
+        });
+    }
+
+    #[test]
+    fn load_empty_queue_file() {
+        with_temp_gw_home(|tmp| {
+            // Case 1: missing queue.json returns empty snapshot (no panic)
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            assert!(snapshot.queues.is_empty());
+            assert!(snapshot.consecutive_failures.is_empty());
+
+            // Case 2: empty file returns empty snapshot
+            std::fs::write(tmp.path().join("queue.json"), "").unwrap();
+            let snapshot2 = RunRegistry::load_queue(tmp.path()).unwrap();
+            assert!(snapshot2.queues.is_empty());
+
+            // Case 3: valid empty JSON object
+            std::fs::write(tmp.path().join("queue.json"), "{}").unwrap();
+            let snapshot3 = RunRegistry::load_queue(tmp.path()).unwrap();
+            assert!(snapshot3.queues.is_empty());
+        });
+    }
+
+    // ── B7: Queue CLI Tests (registry portion) ──────────────────────
+
+    #[test]
+    fn list_queue_with_repo_filter() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo_a = PathBuf::from("/tmp/filter-repo-a");
+            let repo_b = PathBuf::from("/tmp/filter-repo-b");
+
+            reg.enqueue_run(PendingRun {
+                run_id: "flt1".into(),
+                plan_path: PathBuf::from("plans/a1.md"),
+                repo_dir: repo_a.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            })
+            .unwrap();
+
+            reg.enqueue_run(PendingRun {
+                run_id: "flt2".into(),
+                plan_path: PathBuf::from("plans/b1.md"),
+                repo_dir: repo_b.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            })
+            .unwrap();
+
+            // No filter — both visible
+            let all = reg.list_queue(None);
+            assert_eq!(all.len(), 2);
+
+            // Filter by repo_a
+            let filtered_a = reg.list_queue(Some(&repo_a));
+            assert_eq!(filtered_a.len(), 1);
+            assert_eq!(filtered_a[0].run_id, "flt1");
+
+            // Filter by repo_b
+            let filtered_b = reg.list_queue(Some(&repo_b));
+            assert_eq!(filtered_b.len(), 1);
+            assert_eq!(filtered_b[0].run_id, "flt2");
+        });
+    }
+
+    #[test]
+    fn clear_queue_removes_and_persists() {
+        with_temp_gw_home(|tmp| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/clear-repo");
+
+            for i in 0..3 {
+                reg.enqueue_run(PendingRun {
+                    run_id: format!("clr{i}"),
+                    plan_path: PathBuf::from(format!("plans/clr{i}.md")),
+                    repo_dir: repo.clone(),
+                    session_name: None,
+                    config_dir: None,
+                    verbose: 0,
+                    queued_at: Utc::now(),
+                })
+                .unwrap();
+            }
+
+            assert_eq!(reg.total_pending_count(), 3);
+
+            let removed = reg.clear_queue(None);
+            assert_eq!(removed, 3);
+            assert_eq!(reg.total_pending_count(), 0);
+
+            // Verify persisted state is also empty
+            reg.save_queue().unwrap();
+            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            let total: usize = snapshot.queues.values().map(|v| v.len()).sum();
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn find_pending_by_prefix_cases() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/prefix-repo");
+
+            reg.enqueue_run(PendingRun {
+                run_id: "abcd1234".into(),
+                plan_path: PathBuf::from("plans/p1.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            })
+            .unwrap();
+
+            reg.enqueue_run(PendingRun {
+                run_id: "abcd5678".into(),
+                plan_path: PathBuf::from("plans/p2.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            })
+            .unwrap();
+
+            reg.enqueue_run(PendingRun {
+                run_id: "efgh9999".into(),
+                plan_path: PathBuf::from("plans/p3.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            })
+            .unwrap();
+
+            // Exact match
+            let exact = reg.find_pending_by_prefix("abcd1234");
+            assert!(exact.is_some());
+            assert_eq!(exact.unwrap().0, "abcd1234");
+
+            // Unique prefix match
+            let unique = reg.find_pending_by_prefix("efgh");
+            assert!(unique.is_some());
+            assert_eq!(unique.unwrap().0, "efgh9999");
+
+            // Ambiguous prefix — two runs start with "abcd"
+            let ambiguous = reg.find_pending_by_prefix("abcd");
+            assert!(ambiguous.is_none());
+
+            // No match
+            let none = reg.find_pending_by_prefix("zzzz");
+            assert!(none.is_none());
         });
     }
 

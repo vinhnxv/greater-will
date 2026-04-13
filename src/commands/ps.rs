@@ -107,8 +107,16 @@ fn print_table(runs: &[RunInfo]) {
                 RunStatus::Queued => 1,
                 _ => 2,
             };
-            let status_plain = format_status_plain(run.status);
-            let status_styled = format_status(run.status);
+            let status_plain = if run.waiting_for_network {
+                format!("{} (waiting for network)", format_status_plain(run.status))
+            } else {
+                format_status_plain(run.status)
+            };
+            let status_styled = if run.waiting_for_network {
+                format!("{} (waiting for network)", format_status(run.status))
+            } else {
+                format_status(run.status)
+            };
             let plan_display = if run.schedule_id.is_some() {
                 format!("{} (scheduled)", abbreviate_home(&run.plan_path.to_string_lossy()))
             } else {

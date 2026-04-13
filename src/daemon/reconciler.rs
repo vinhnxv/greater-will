@@ -168,7 +168,12 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
         }
     }
 
-    // Step 4: Process stale registry entries (Running but no tmux)
+    // Step 4: Process stale registry entries (Running but no tmux).
+    //
+    // A7: Queued entries that are still in pending_queues are legitimate —
+    // they never had a tmux session and should NOT be treated as stale.
+    // Only Queued entries that are NOT in any pending queue are stale
+    // (e.g., a crash between register and the first status update).
     let live_set: HashSet<&str> = live_sessions.iter().map(|s| s.as_str()).collect();
     let stale_runs = find_stale_runs(registry, &live_set);
 
@@ -259,6 +264,41 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
                     warn!(run_id = %run_id, error = %e, "failed to mark stale run as failed");
                 }
                 report.marked_failed += 1;
+            }
+        }
+    }
+
+    // Step 5: Validate pending queue entries (A7).
+    //
+    // Check that each queued run's plan_path and repo_dir still exist on disk.
+    // If either was deleted while the daemon was down, remove the stale entry
+    // from the queue and mark its RunEntry as Failed.
+    let pending_snapshot: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = registry
+        .pending_entries()
+        .iter()
+        .map(|p| (p.run_id.clone(), p.plan_path.clone(), p.repo_dir.clone()))
+        .collect();
+
+    for (run_id, plan_path, repo_dir) in &pending_snapshot {
+        let plan_ok = plan_path.exists();
+        let repo_ok = repo_dir.exists();
+        if !plan_ok || !repo_ok {
+            warn!(
+                run_id = %run_id,
+                plan_exists = plan_ok,
+                repo_exists = repo_ok,
+                "stale pending queue entry — removing"
+            );
+            registry.remove_pending(run_id);
+            if let Err(e) = registry.update_status(
+                run_id,
+                RunStatus::Failed,
+                None,
+                Some(format!(
+                    "removed from queue by reconciler: plan_exists={plan_ok}, repo_exists={repo_ok}",
+                )),
+            ) {
+                warn!(run_id = %run_id, error = %e, "failed to mark stale queue entry as failed");
             }
         }
     }
@@ -418,6 +458,11 @@ fn find_stale_runs(
         .iter()
         .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
         .filter(|r| {
+            // A7: Skip Queued entries that are legitimately waiting in
+            // pending_queues — they never had a tmux session and are not stale.
+            if r.status == RunStatus::Queued && registry.is_in_pending_queue(&r.run_id) {
+                return false;
+            }
             // Check if tmux session is alive
             let tmux_name = format!("gw-{}", r.run_id);
             !live_sessions.contains(tmux_name.as_str())

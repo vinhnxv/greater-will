@@ -22,6 +22,7 @@ use crate::daemon::protocol::{
 };
 use crate::daemon::registry::RunRegistry;
 use crate::daemon::schedule::{ScheduleEntry, ScheduleRegistry};
+use crate::daemon::state::NetworkState;
 
 /// Per-request timeout: 30 seconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,6 +39,10 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     cancel: CancellationToken,
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
+    /// Global cap on concurrent running sessions. `0` means unlimited.
+    max_concurrent_runs: usize,
+    /// Shared network state for internet recovery display.
+    network_state: Arc<tokio::sync::RwLock<NetworkState>>,
 }
 
 impl DaemonServer {
@@ -48,13 +53,20 @@ impl DaemonServer {
         socket_path: PathBuf,
         cancel: CancellationToken,
         monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
+        network_state: Arc<tokio::sync::RwLock<NetworkState>>,
     ) -> Self {
+        // Load max_concurrent_runs from GlobalConfig
+        let max_concurrent_runs = crate::daemon::state::GlobalConfig::load()
+            .map(|c| c.max_concurrent_runs)
+            .unwrap_or(4);
         Self {
             registry,
             schedule_registry,
             socket_path,
             cancel,
             monitors,
+            max_concurrent_runs,
+            network_state,
         }
     }
 
@@ -95,8 +107,10 @@ impl DaemonServer {
                             let sched_registry = Arc::clone(&self.schedule_registry);
                             let cancel = self.cancel.clone();
                             let monitors = Arc::clone(&self.monitors);
+                            let max_concurrent = self.max_concurrent_runs;
+                            let net_state = Arc::clone(&self.network_state);
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, registry, sched_registry, cancel, monitors).await {
+                                if let Err(e) = handle_connection(stream, registry, sched_registry, cancel, monitors, max_concurrent, net_state).await {
                                     tracing::warn!(error = %e, "connection handler error");
                                 }
                             });
@@ -176,6 +190,8 @@ async fn handle_connection(
     schedule_registry: Arc<Mutex<ScheduleRegistry>>,
     cancel: CancellationToken,
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
+    max_concurrent_runs: usize,
+    network_state: Arc<tokio::sync::RwLock<NetworkState>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -240,7 +256,7 @@ async fn handle_connection(
 
         let request_type = request_type_name(&request);
         let start = std::time::Instant::now();
-        let response = dispatch_request(request, &registry, &schedule_registry, &cancel, &monitors).await;
+        let response = dispatch_request(request, &registry, &schedule_registry, &cancel, &monitors, max_concurrent_runs, &network_state).await;
         let elapsed_ms = start.elapsed().as_millis();
 
         tracing::info!(
@@ -434,6 +450,8 @@ async fn dispatch_request(
     schedule_registry: &Arc<Mutex<ScheduleRegistry>>,
     cancel: &CancellationToken,
     monitors: &Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
+    max_concurrent_runs: usize,
+    network_state: &Arc<tokio::sync::RwLock<NetworkState>>,
 ) -> Response {
     match request {
         Request::SubmitRun {
@@ -466,10 +484,13 @@ async fn dispatch_request(
                 }
             };
 
-            // Check if repo already has an active run — enqueue if so
+            // Check if repo already has an active run OR global capacity is
+            // exhausted — enqueue if so (A6: max_concurrent_runs enforcement).
             {
                 let mut reg = registry.lock().await;
-                if reg.has_repo_lock(&canonical_repo) {
+                let at_capacity = max_concurrent_runs > 0
+                    && reg.count_running() >= max_concurrent_runs;
+                if reg.has_repo_lock(&canonical_repo) || at_capacity {
                     // Repo is busy — enqueue for later
                     let run_id = crate::daemon::registry::RunRegistry::generate_id();
                     let pending = crate::daemon::registry::PendingRun {
@@ -525,7 +546,17 @@ async fn dispatch_request(
 
         Request::ListRuns { all } => {
             let reg = registry.lock().await;
-            let runs = reg.list_runs(all);
+            let mut runs = reg.list_runs(all);
+            drop(reg);
+            // Annotate runs with network state
+            let net = network_state.read().await;
+            if matches!(*net, NetworkState::WaitingForNetwork { .. }) {
+                for run in &mut runs {
+                    if run.status == RunStatus::Running {
+                        run.waiting_for_network = true;
+                    }
+                }
+            }
             Response::RunList { runs }
         }
 
@@ -679,12 +710,16 @@ async fn dispatch_request(
             let reg = registry.lock().await;
             let active = reg.count_runs(false);
             let total = reg.count_runs(true);
+            drop(reg);
             let sched = schedule_registry.lock().await;
             let active_schedules = sched.count_active();
+            drop(sched);
+            let net = network_state.read().await;
+            let net_display = format!("{}", *net);
             Response::Ok {
                 message: format!(
                     "daemon running — {active} active run(s), {total} total, \
-                     {active_schedules} schedule(s), pid {}",
+                     {active_schedules} schedule(s), network: {net_display}, pid {}",
                     std::process::id()
                 ),
             }
@@ -843,6 +878,42 @@ async fn dispatch_request(
                 },
             }
         }
+
+        Request::ListQueue => {
+            let reg = registry.lock().await;
+            let entries = reg.list_queue(None);
+            Response::QueueList { entries }
+        }
+
+        Request::RemoveQueued { run_id } => {
+            let mut reg = registry.lock().await;
+            match reg.find_pending_by_prefix(&run_id) {
+                Some((full_id, _repo_hash)) => {
+                    reg.remove_pending(&full_id);
+                    if let Err(e) = reg.save_queue() {
+                        tracing::warn!(error = %e, "failed to persist queue after remove");
+                    }
+                    Response::Ok {
+                        message: format!("removed queued run {full_id}"),
+                    }
+                }
+                None => Response::Error {
+                    code: ErrorCode::RunNotFound,
+                    message: format!("no queued run matching prefix: {run_id}"),
+                },
+            }
+        }
+
+        Request::ClearQueue { repo_dir } => {
+            let mut reg = registry.lock().await;
+            let count = reg.clear_queue(repo_dir.as_deref());
+            if let Err(e) = reg.save_queue() {
+                tracing::warn!(error = %e, "failed to persist queue after clear");
+            }
+            Response::Ok {
+                message: format!("cleared {count} queued run(s)"),
+            }
+        }
     }
 }
 
@@ -861,6 +932,9 @@ fn request_type_name(req: &Request) -> &'static str {
         Request::RemoveSchedule { .. } => "RemoveSchedule",
         Request::PauseSchedule { .. } => "PauseSchedule",
         Request::ResumeSchedule { .. } => "ResumeSchedule",
+        Request::ListQueue => "ListQueue",
+        Request::RemoveQueued { .. } => "RemoveQueued",
+        Request::ClearQueue { .. } => "ClearQueue",
     }
 }
 
@@ -1040,7 +1114,9 @@ pub(crate) async fn drain_if_available(
         } else {
             reg.record_queue_success(repo_dir);
         }
-        reg.drain_next(repo_dir)
+        // Try the completing repo's queue first, then any other queue
+        // with available capacity (handles runs queued by A6 global cap).
+        reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready())
     };
 
     if let Some(pending) = next {
@@ -1112,12 +1188,14 @@ mod tests {
             crate::daemon::schedule::ScheduleRegistry::new(tmp.path().join("schedules.json")),
         ));
         let monitors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let network_state = Arc::new(tokio::sync::RwLock::new(NetworkState::default()));
         let server = DaemonServer::new(
             Arc::clone(&registry),
             Arc::clone(&schedule_registry),
             socket_path.clone(),
             cancel.clone(),
             monitors,
+            network_state,
         );
 
         // Spawn server in background
