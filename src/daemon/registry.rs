@@ -1307,8 +1307,9 @@ mod tests {
             reg.record_queue_failure(&repo);
             reg.save_queue().unwrap();
 
-            // Load and verify consecutive_failures persisted
-            let snapshot = RunRegistry::load_queue(tmp.path()).unwrap();
+            // Load from gw_home() — the same path save_queue() writes to —
+            // to avoid env var races when tests run in parallel.
+            let snapshot = RunRegistry::load_queue(&crate::daemon::state::gw_home()).unwrap();
             let hash = repo_hash(&repo);
             assert_eq!(snapshot.consecutive_failures.get(&hash).copied().unwrap_or(0), 2);
         });
