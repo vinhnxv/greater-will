@@ -326,6 +326,7 @@ mod tests {
                     current_phase: Some("phase_2_work".into()),
                     started_at: "2026-04-10T02:00:00Z".into(),
                     uptime_secs: 120,
+                    schedule_id: None,
                 }],
             },
             Response::LogChunk {
@@ -435,6 +436,7 @@ mod tests {
                 current_phase: None,
                 started_at: "2026-01-01T00:00:00Z".into(),
                 uptime_secs: 60,
+                schedule_id: None,
             }],
         };
 
