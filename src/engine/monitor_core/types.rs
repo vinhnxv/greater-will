@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code)] // TODO: Remove once detectors consume these types (Task 2)
 //! Core types for the phase monitor evaluator.
 //!
 //! These types decouple the monitor's *evaluation logic* from the I/O and
@@ -190,6 +190,23 @@ pub struct TickHistory {
     pub last_checkpoint_hash: Option<u64>,
 }
 
+/// Typed outcome kind for pending kill requests.
+///
+/// Replaces `&'static str` with a proper enum for compile-time exhaustive
+/// matching. Follows the REFINE-003 pattern from
+/// [`crate::daemon::run_monitor::KillOutcomeKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcomeKind {
+    /// Session was idle past the kill threshold.
+    Stuck,
+    /// Phase or pipeline timeout exceeded.
+    Timeout,
+    /// Error evidence reached the confidence threshold.
+    ErrorDetected,
+    /// Session process vanished (crash).
+    Crashed,
+}
+
 /// A pending kill request tracked inside [`TickHistory`].
 #[derive(Debug, Clone)]
 pub struct PendingKill {
@@ -197,8 +214,8 @@ pub struct PendingKill {
     pub reason: String,
     /// Error classification, if the kill is error-driven.
     pub error_class: Option<ErrorClass>,
-    /// Outcome label for logging ("stuck", "crashed", "timeout", etc.).
-    pub outcome: &'static str,
+    /// Typed outcome kind (REFINE-003: enum instead of `&'static str`).
+    pub outcome: KillOutcomeKind,
     /// Seconds the kill request has been pending.
     pub pending_secs: u64,
     /// Whether a midway nudge has been sent during the gate period.
@@ -297,8 +314,8 @@ pub enum MonitorEvent {
         reason: String,
         /// Error classification for retry decisions.
         error_class: Option<ErrorClass>,
-        /// Outcome label ("stuck", "crashed", "timeout", "error").
-        outcome: &'static str,
+        /// Typed outcome kind (REFINE-003).
+        outcome: KillOutcomeKind,
     },
 
     /// A pending kill was cancelled because recovery signals appeared.

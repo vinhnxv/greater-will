@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// TODO: Remove #[allow(dead_code)] from types.rs once detectors are wired (Task 2).
 //! Core monitor evaluator — pure-logic phase monitoring.
 //!
 //! This module separates the monitor's *decision logic* from I/O concerns
