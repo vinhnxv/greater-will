@@ -658,9 +658,21 @@ async fn handle_monitor_outcome(
             attempt_recovery(run_id, &repo_dir, &plan_path, config_dir, registry).await;
         }
 
-        DaemonRunOutcome::Crashed { reason }
-        | DaemonRunOutcome::Stuck { reason }
-        | DaemonRunOutcome::Timeout { reason } => {
+        outcome @ (DaemonRunOutcome::Crashed { .. }
+        | DaemonRunOutcome::Stuck { .. }
+        | DaemonRunOutcome::Timeout { .. }) => {
+            // Extract reason and classify outcome kind for logging.
+            let (outcome_kind, reason) = match outcome {
+                DaemonRunOutcome::Crashed { reason } => ("crashed", reason),
+                DaemonRunOutcome::Stuck { reason } => ("stuck", reason),
+                DaemonRunOutcome::Timeout { reason } => ("timeout", reason),
+                _ => unreachable!(),
+            };
+
+            // Log the reason that triggered recovery (closes logging gap
+            // where only "cooldown 60s" appeared without explaining WHY).
+            append_event(run_id, outcome_kind, &reason);
+
             let (repo_dir, plan_path, config_dir) = {
                 let reg = registry.lock().await;
                 match reg.get(run_id) {
