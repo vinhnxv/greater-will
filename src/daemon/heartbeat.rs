@@ -556,21 +556,54 @@ async fn handle_monitor_outcome(
         DaemonRunOutcome::Completed => {
             // QUAL-013: Single lock scope to prevent TOCTOU race where
             // stop_run could overwrite status between two acquisitions.
-            let repo_dir = {
+            let (repo_dir, tmux_session) = {
                 let mut reg = registry.lock().await;
-                let dir = reg.get(run_id).map(|e| e.repo_dir.clone());
+                let entry = reg.get(run_id);
+                let dir = entry.map(|e| e.repo_dir.clone());
+                let tmux = entry.and_then(|e| e.tmux_session.clone());
                 let _ = reg.update_status(
                     run_id,
                     RunStatus::Succeeded,
                     Some("complete".to_string()),
                     None,
                 );
-                dir
+                (dir, tmux)
             };
             if let Some(ref dir) = repo_dir {
                 CrashLoopDetector::clear_history(dir);
             }
             append_event(run_id, "completed", "pipeline finished");
+
+            // Reap the tmux session — natural completion paths
+            // (`check_completion_grace`, `poll_loop_state`) can return
+            // `Completed` while the session is still alive (e.g. arc reached
+            // terminal phase but Claude pane is still rendering). Without
+            // this kill, sessions linger forever as `gw-*` orphans even
+            // after the run is `Succeeded`. Run in a blocking task so the
+            // sync `tmux kill-session` call doesn't stall the async runtime.
+            if let Some(session) = tmux_session {
+                append_event(run_id, "kill_session", &format!(
+                    "gw reaped session '{}' — reason: pipeline completed (killed by: heartbeat/handle_monitor_outcome)",
+                    session,
+                ));
+                let session_for_kill = session.clone();
+                let join = tokio::task::spawn_blocking(move || {
+                    spawn::kill_session(&session_for_kill)
+                })
+                .await;
+                match join {
+                    Ok(Ok(())) => {
+                        debug!(run_id = %run_id, tmux = %session, "reaped tmux session after completion");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(run_id = %run_id, tmux = %session, error = %e, "failed to reap tmux session after completion");
+                    }
+                    Err(join_err) => {
+                        warn!(run_id = %run_id, tmux = %session, error = %join_err, "kill_session task panicked after completion");
+                    }
+                }
+            }
+
             // Drain next queued run for this repo
             if let Some(ref dir) = repo_dir {
                 drain_if_available(Arc::clone(&registry), dir, false).await;

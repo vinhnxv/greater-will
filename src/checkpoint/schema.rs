@@ -507,18 +507,19 @@ impl Checkpoint {
             })
     }
 
-    /// Check if the terminal phase (last in PHASE_ORDER) is completed.
+    /// Check if the terminal phase (last in PHASE_ORDER) is done.
     ///
     /// This is a stronger signal than `completed_at` because Rune doesn't
-    /// always set that field. If the last phase ran to completion, the
-    /// pipeline is definitively done.
+    /// always set that field. If the last phase ran to completion (or was
+    /// intentionally skipped, e.g. `auto_merge=false` skipping `merge`),
+    /// the pipeline is definitively done.
     pub fn is_terminal_phase_completed(&self) -> bool {
         let terminal = crate::checkpoint::phase_order::phase_at(
             crate::checkpoint::phase_order::PHASE_COUNT - 1,
         );
         terminal
             .and_then(|name| self.phases.get(name))
-            .is_some_and(|p| p.status == "completed")
+            .is_some_and(|p| p.status == "completed" || p.status == "skipped")
     }
 
     /// Check if a phase is in the skip_map (will be auto-skipped by Rune).
@@ -1330,6 +1331,21 @@ mod tests {
             ..Default::default()
         });
         assert!(!cp.is_terminal_phase_completed());
+    }
+
+    #[test]
+    fn test_is_terminal_phase_completed_true_when_merge_skipped() {
+        // auto_merge=false case: Rune marks merge as "skipped", which is
+        // still a successful terminal state — pipeline ran to its end.
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "skipped".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            cp.is_terminal_phase_completed(),
+            "skipped merge (auto_merge=false) must count as terminal completion"
+        );
     }
 
     #[test]

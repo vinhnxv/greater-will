@@ -261,6 +261,12 @@ pub(crate) fn is_pipeline_complete(pane_content: &str) -> bool {
         || tail.contains("pipeline completed")
         || tail.contains("merge completed")
         || tail.contains("arc run finished")
+        // auto_merge=false: terminal phase ends with "skipped" rather than
+        // "completed". Treat skipped-terminal as a successful end-of-pipeline
+        // signal so the monitor doesn't keep the tmux session pinned forever.
+        || tail.contains("merge skipped")
+        || tail.contains("merge: skipped")
+        || tail.contains("skipping merge")
         // Rune-specific completion markers
         || tail.contains("the tarnished rests")
         || tail.contains("arc result: success")
@@ -585,5 +591,14 @@ mod tests {
         assert!(is_pipeline_complete("The Tarnished rests after a long journey"));
         assert!(!is_pipeline_complete("still working on phase 5..."));
         assert!(!is_pipeline_complete(""));
+    }
+
+    #[test]
+    fn test_is_pipeline_complete_recognises_skipped_merge() {
+        // auto_merge=false: pane never says "merge completed" — only that
+        // merge was skipped. The monitor must still treat this as end-of-pipeline.
+        assert!(is_pipeline_complete("Phase 41/41: merge skipped (auto_merge=false)\n❯"));
+        assert!(is_pipeline_complete("merge: skipped\n❯"));
+        assert!(is_pipeline_complete("Skipping merge — auto_merge disabled\n❯"));
     }
 }
