@@ -113,6 +113,11 @@ pub struct RunEntry {
     /// Schedule ID that triggered this run, if any.
     #[serde(default)]
     pub schedule_id: Option<String>,
+    /// When the current session started (reset on each recovery spawn).
+    /// Used to compute per-session uptime for crash loop stability checks.
+    /// `None` for runs created before this field was added.
+    #[serde(default)]
+    pub last_recovery_at: Option<DateTime<Utc>>,
 }
 
 fn default_restartable() -> bool {
@@ -289,6 +294,7 @@ impl RunRegistry {
             restartable: true,
             claude_pid: None,
             schedule_id,
+            last_recovery_at: None,
         };
 
         // Persist to disk
@@ -490,6 +496,7 @@ impl RunRegistry {
             restartable: false,
             claude_pid: None,
             schedule_id: None,
+            last_recovery_at: None,
         };
         self.write_meta(&entry)?;
         self.runs.insert(pending.run_id.clone(), entry);

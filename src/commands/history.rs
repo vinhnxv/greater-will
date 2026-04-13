@@ -731,6 +731,7 @@ mod tests {
             restartable: true,
             claude_pid: None,
             schedule_id: None,
+            last_recovery_at: None,
         }
     }
 

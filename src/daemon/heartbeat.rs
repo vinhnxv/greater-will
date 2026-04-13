@@ -13,6 +13,7 @@ use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
+use crate::engine::retry::ErrorClass;
 use crate::engine::single_session::util::is_pipeline_complete;
 use crate::session::spawn;
 use std::collections::HashMap;
@@ -622,7 +623,7 @@ async fn handle_monitor_outcome(
             // Instead of retrying 3 times with 30s backoff (which wastes 5-6 min
             // spawning tmux sessions that immediately fail), wait for actual
             // connectivity restoration (up to 30 min, polling every 30s).
-            if matches!(error_class, crate::engine::retry::ErrorClass::NetworkError) {
+            if matches!(error_class, ErrorClass::NetworkError) {
                 info!(run_id = %run_id, "network error — waiting for connectivity");
 
                 // Update shared network state
@@ -686,6 +687,20 @@ async fn handle_monitor_outcome(
             let mut detector = CrashLoopDetector::from_watchdog(&watchdog);
             detector.load_history(&repo_dir);
 
+            // GAP 2: Check if session ran long enough to count as healthy.
+            // Use last_recovery_at (per-session) to avoid inflating uptime across
+            // multiple recovery cycles (FLAW-001 fix).
+            let run_uptime = {
+                let reg = registry.lock().await;
+                reg.get(run_id)
+                    .map(|e| {
+                        let session_start = e.last_recovery_at.unwrap_or(e.started_at);
+                        chrono::Utc::now().signed_duration_since(session_start).num_seconds().max(0) as u64
+                    })
+                    .unwrap_or(0)
+            };
+            detector.record_healthy_runtime(run_uptime);
+
             match detector.record_restart() {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
@@ -698,6 +713,8 @@ async fn handle_monitor_outcome(
                     drop(reg);
                     CrashLoopDetector::clear_history(&repo_dir);
                     append_event(run_id, "crash_loop", &format!("{:?}: {}", error_class, reason));
+                    // GAP 6: Drain next queued run so the queue doesn't get stuck
+                    drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
                     return;
                 }
                 CrashLoopDecision::AllowRestart => {}
@@ -707,11 +724,29 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // Per-error-class exponential backoff (P1: cancellation-aware)
+            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
             let crash_count = {
                 let reg = registry.lock().await;
                 reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
             };
+            if crash_count >= error_class.max_retries() {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!(
+                        "Max retries ({}) for {:?}: {}",
+                        error_class.max_retries(), error_class, reason
+                    )),
+                );
+                drop(reg);
+                append_event(run_id, "max_retries", &format!("{:?}: {}", error_class, reason));
+                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
+                return;
+            }
+
+            // Per-error-class exponential backoff (P1: cancellation-aware)
             let backoff = error_class.backoff_for_attempt(crash_count);
             append_event(run_id, "backoff", &format!(
                 "{:?}: {}s before retry",
@@ -731,11 +766,16 @@ async fn handle_monitor_outcome(
         outcome @ (DaemonRunOutcome::Crashed { .. }
         | DaemonRunOutcome::Stuck { .. }
         | DaemonRunOutcome::Timeout { .. }) => {
-            // Extract reason and classify outcome kind for logging.
-            let (outcome_kind, reason) = match outcome {
-                DaemonRunOutcome::Crashed { reason } => ("crashed", reason),
-                DaemonRunOutcome::Stuck { reason } => ("stuck", reason),
-                DaemonRunOutcome::Timeout { reason } => ("timeout", reason),
+            // Extract reason, classify outcome kind for logging, and map to
+            // implicit ErrorClass for per-class retry/backoff policy (GAP 1, 5).
+            //
+            // Note: Foreground treats Timeout as terminal (no retry).
+            // Daemon retries because headless runs benefit from automatic recovery.
+            // Per-class max_retries (3) still limits total attempts.
+            let (implicit_class, outcome_kind, reason) = match outcome {
+                DaemonRunOutcome::Crashed { reason } => (ErrorClass::Crash, "crashed", reason),
+                DaemonRunOutcome::Stuck { reason } => (ErrorClass::Stuck, "stuck", reason),
+                DaemonRunOutcome::Timeout { reason } => (ErrorClass::Timeout, "timeout", reason),
                 _ => unreachable!(),
             };
 
@@ -756,6 +796,16 @@ async fn handle_monitor_outcome(
             let mut detector = CrashLoopDetector::from_watchdog(&watchdog);
             detector.load_history(&repo_dir);
 
+            // GAP 2: Check if session ran long enough to count as healthy.
+            // If so, reset crash counters before recording this new crash.
+            let run_uptime = {
+                let reg = registry.lock().await;
+                reg.get(run_id)
+                    .map(|e| chrono::Utc::now().signed_duration_since(e.started_at).num_seconds().max(0) as u64)
+                    .unwrap_or(0)
+            };
+            detector.record_healthy_runtime(run_uptime);
+
             match detector.record_restart() {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
@@ -763,11 +813,13 @@ async fn handle_monitor_outcome(
                         run_id,
                         RunStatus::Failed,
                         None,
-                        Some(format!("Crash loop: {}", reason)),
+                        Some(format!("Crash loop ({:?}): {}", implicit_class, reason)),
                     );
                     drop(reg);
                     CrashLoopDetector::clear_history(&repo_dir);
-                    append_event(run_id, "crash_loop", &reason);
+                    append_event(run_id, "crash_loop", &format!("{:?}: {}", implicit_class, reason));
+                    // GAP 6: Drain next queued run so the queue doesn't get stuck
+                    drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
                     return;
                 }
                 CrashLoopDecision::AllowRestart => {}
@@ -777,15 +829,38 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // Cooldown before recovery (P1: cancellation-aware)
-            let cooldown = Duration::from_secs(watchdog.restart_cooldown_secs);
-            append_event(run_id, "cooldown", &format!(
-                "{}s before recovery attempt", cooldown.as_secs()
+            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
+            let crash_count = {
+                let reg = registry.lock().await;
+                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
+            };
+            if crash_count >= implicit_class.max_retries() {
+                let mut reg = registry.lock().await;
+                let _ = reg.update_status(
+                    run_id,
+                    RunStatus::Failed,
+                    None,
+                    Some(format!(
+                        "Max retries ({}) for {:?}: {}",
+                        implicit_class.max_retries(), implicit_class, reason
+                    )),
+                );
+                drop(reg);
+                append_event(run_id, "max_retries", &format!("{:?}: {}", implicit_class, reason));
+                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
+                return;
+            }
+
+            // GAP 5: Per-class backoff instead of flat cooldown (parity with foreground)
+            let backoff = implicit_class.backoff_for_attempt(crash_count);
+            append_event(run_id, "backoff", &format!(
+                "{:?}: {}s before retry",
+                implicit_class, backoff.as_secs()
             ));
             tokio::select! {
-                _ = tokio::time::sleep(cooldown) => {}
+                _ = tokio::time::sleep(backoff) => {}
                 _ = cancel.cancelled() => {
-                    debug!(run_id = %run_id, "cooldown interrupted by shutdown");
+                    debug!(run_id = %run_id, "backoff interrupted by shutdown");
                     return;
                 }
             }
@@ -983,6 +1058,7 @@ async fn spawn_recovery_with_command(
                 entry.current_phase = Some("resuming".to_string());
                 entry.crash_restarts = entry.crash_restarts.saturating_add(1);
                 entry.claude_pid = Some(pid);
+                entry.last_recovery_at = Some(chrono::Utc::now());
             }
             if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
                 warn!(run_id = %run_id, error = %e, "failed to persist recovery state");
