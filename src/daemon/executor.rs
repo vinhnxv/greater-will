@@ -121,8 +121,19 @@ pub async fn spawn_run(
     // session's state.
     if let Err(e) = crate::cleanup::pre_phase_cleanup("daemon", "0") {
         // Propagate like the foreground path does — a failed pre-flight
-        // indicates a process-tree state we cannot reason about.
+        // indicates a process-tree state we cannot reason about. Mark the
+        // registry entry Failed so consumers see accurate status (matches
+        // the tmux-spawn-failure path below — addresses BACK-002).
         warn!(run_id = %run_id, error = %e, "pre_phase_cleanup failed");
+        let reason = format!("pre_phase_cleanup failed: {e}");
+        crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
+        let mut reg = registry.lock().await;
+        let _ = reg.update_status(
+            &run_id,
+            RunStatus::Failed,
+            None,
+            Some(reason),
+        );
         return Err(e);
     }
     crate::commands::elden::clear_signals();
