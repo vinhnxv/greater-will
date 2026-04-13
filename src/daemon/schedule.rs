@@ -314,6 +314,13 @@ pub async fn run_schedule_loop(
                     match result {
                         Ok(run_id) => {
                             tracing::info!(schedule_id = %entry.id, run_id = %run_id, "schedule fired");
+                            // Tag the run with the schedule ID for `gw ps` annotation
+                            {
+                                let mut reg = run_registry.lock().await;
+                                if let Some(run_entry) = reg.get_mut(&run_id) {
+                                    run_entry.schedule_id = Some(entry.id.clone());
+                                }
+                            }
                             sched.record_fired(&entry.id).ok();
                         }
                         Err(e) => {

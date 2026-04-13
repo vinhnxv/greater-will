@@ -100,6 +100,9 @@ pub struct RunEntry {
     /// and for runs whose spawn failed before a PID was captured.
     #[serde(default)]
     pub claude_pid: Option<u32>,
+    /// Schedule ID that triggered this run, if any.
+    #[serde(default)]
+    pub schedule_id: Option<String>,
 }
 
 fn default_restartable() -> bool {
@@ -129,6 +132,7 @@ impl RunEntry {
             current_phase: self.current_phase.clone(),
             started_at: self.started_at.to_rfc3339(),
             uptime_secs: uptime,
+            schedule_id: self.schedule_id.clone(),
         }
     }
 }
@@ -240,6 +244,18 @@ impl RunRegistry {
         session_name: Option<String>,
         config_dir: Option<PathBuf>,
     ) -> Result<String> {
+        self.register_run_with_schedule(plan_path, repo_dir, session_name, config_dir, None)
+    }
+
+    /// Register a new run triggered by a schedule.
+    pub fn register_run_with_schedule(
+        &mut self,
+        plan_path: PathBuf,
+        repo_dir: PathBuf,
+        session_name: Option<String>,
+        config_dir: Option<PathBuf>,
+        schedule_id: Option<String>,
+    ) -> Result<String> {
         // Acquire per-repo lock first
         self.acquire_repo_lock(&repo_dir)?;
 
@@ -261,6 +277,7 @@ impl RunRegistry {
             error_message: None,
             restartable: true,
             claude_pid: None,
+            schedule_id,
         };
 
         // Persist to disk
@@ -461,6 +478,7 @@ impl RunRegistry {
             error_message: None,
             restartable: false,
             claude_pid: None,
+            schedule_id: None,
         };
         self.write_meta(&entry)?;
         self.runs.insert(pending.run_id.clone(), entry);

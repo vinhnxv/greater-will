@@ -120,6 +120,9 @@ pub struct RunInfo {
     pub current_phase: Option<String>,
     pub started_at: String,
     pub uptime_secs: u64,
+    /// Schedule ID that triggered this run, if any.
+    #[serde(default)]
+    pub schedule_id: Option<String>,
 }
 
 /// Status of an arc run.
