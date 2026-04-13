@@ -37,11 +37,12 @@ use std::time::Duration;
 // Re-export the public API
 pub use orchestrator::{run_single_session, run_single_session_batch};
 
-/// Poll interval for monitoring the session (seconds).
-pub(crate) const POLL_INTERVAL_SECS: u64 = 5;
-
-/// How often to print a status line during monitoring (seconds).
-pub(crate) const STATUS_LOG_INTERVAL_SECS: u64 = 30;
+// Re-exported from the shared monitor_constants module so foreground
+// callers (using `super::POLL_INTERVAL_SECS`) keep compiling while the
+// single source of truth lives in `crate::engine::monitor_constants`.
+pub(crate) use crate::engine::monitor_constants::{
+    POLL_INTERVAL_SECS, STATUS_LOG_INTERVAL_SECS,
+};
 
 /// Result of a single-session pipeline run.
 #[derive(Debug, Clone)]

@@ -14,6 +14,10 @@ use super::util::{
 };
 use super::{SingleSessionConfig, SessionOutcome, POLL_INTERVAL_SECS, STATUS_LOG_INTERVAL_SECS};
 use crate::cleanup;
+use crate::engine::monitor_constants::{
+    COMPLETION_GRACE_SECS, FOREGROUND_MIN_COMPLETION_AGE_SECS as MIN_COMPLETION_AGE_SECS,
+    KILL_GATE_MIN_SECS, LOOP_STATE_GONE_GRACE_SECS,
+};
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::{capture_pane, save_crash_dump};
 use crate::session::spawn::{
@@ -24,10 +28,6 @@ use color_eyre::Result;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-
-/// Minimum session age (seconds) before we treat a vanished session as
-/// "likely completed" rather than "crashed".  Used in multiple check branches.
-const MIN_COMPLETION_AGE_SECS: u64 = 300; // 5 min
 
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
 pub(crate) fn run_session_attempt(
@@ -134,7 +134,7 @@ pub(crate) fn monitor_session(
     // When the file disappears, we wait for a grace period before acting,
     // to avoid false positives from Rune briefly rewriting the file.
     let mut loop_state_gone_since: Option<Instant> = None;
-    const LOOP_STATE_GONE_GRACE_SECS: u64 = 300; // 5 min minimum — give Rune time to self-heal
+    // LOOP_STATE_GONE_GRACE_SECS is imported from crate::engine::monitor_constants.
 
     // Content change tracking: detect field-level changes in the loop state file.
     // Tracks iteration progression, anomalous field mutations, and content stall.
@@ -160,10 +160,9 @@ pub(crate) fn monitor_session(
     // is broken. Rune and Claude Code have their own recovery mechanisms.
     // GW must give them time to self-heal.
 
-    /// Minimum confirmation period before ANY kill (seconds).
-    /// Rune and Claude Code have self-recovery mechanisms. GW must wait
-    /// at least this long and verify no recovery signals before killing.
-    const KILL_GATE_MIN_SECS: u64 = 300; // 5 minutes
+    // KILL_GATE_MIN_SECS is imported from crate::engine::monitor_constants.
+    // Rune and Claude Code have self-recovery mechanisms — GW must wait at
+    // least this long and verify no recovery signals before killing.
 
     /// A pending kill request. Set by detection logic, executed by the kill gate.
     struct PendingKillRequest {
@@ -216,7 +215,7 @@ pub(crate) fn monitor_session(
     // redraws (cursor, status bar, auto-compaction), causing the pane hash to
     // change every poll cycle and the idle timer to reset indefinitely.
     let mut completion_detected_at: Option<Instant> = None;
-    const COMPLETION_GRACE_SECS: u64 = 300; // 5 minutes from completion
+    // COMPLETION_GRACE_SECS is imported from crate::engine::monitor_constants.
 
     info!("Entering monitor loop (poll={}s, default nudge={}s, default kill={}s)",
         POLL_INTERVAL_SECS, wd.idle_nudge_secs, wd.idle_kill_secs);

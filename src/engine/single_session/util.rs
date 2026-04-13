@@ -13,9 +13,23 @@ use tracing::{debug, info, warn};
 // Command builders
 // ---------------------------------------------------------------------------
 
-/// Build the `/rune:arc` command string for initial run.
+/// Build the base `/rune:arc` command string (no flags, no `--resume`).
+///
+/// Shared helper used by both the foreground orchestrator (via
+/// [`build_arc_command`]) and the daemon spawn path
+/// (`crate::daemon::executor::spawn_run`). Keeps escaping behavior in one
+/// place — see also [`crate::session::spawn::shell_escape`] which is the
+/// underlying primitive, and the mirror tests in `daemon/executor.rs`.
+pub fn build_arc_command_plain(plan_path: &str) -> String {
+    format!("/rune:arc {}", shell_escape(plan_path))
+}
+
+/// Build the `/rune:arc` command string for initial foreground run.
+///
+/// Delegates to [`build_arc_command_plain`] for the base command, then
+/// appends `--resume` and any arc flags from the session config.
 pub(crate) fn build_arc_command(plan_path: &str, config: &SingleSessionConfig) -> String {
-    let mut cmd = format!("/rune:arc {}", shell_escape(plan_path));
+    let mut cmd = build_arc_command_plain(plan_path);
 
     if config.resume {
         cmd.push_str(" --resume");
