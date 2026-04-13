@@ -1,6 +1,7 @@
 pub mod drain;
 pub mod executor;
 pub mod heartbeat;
+pub mod network;
 pub mod protocol;
 pub mod reconciler;
 pub mod registry;
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_appender::rolling;
@@ -26,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 use crate::daemon::heartbeat::HeartbeatMonitor;
 use crate::daemon::registry::RunRegistry;
 use crate::daemon::server::DaemonServer;
-use crate::daemon::state::{ensure_gw_home, GlobalConfig};
+use crate::daemon::state::{ensure_gw_home, GlobalConfig, NetworkState};
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
 
 // ── Crash loop flag ─────────────────────────────────────────────────
@@ -305,7 +307,16 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
         socket = %config.socket_path().display(),
         "daemon starting"
     );
-    let registry = RunRegistry::load_from_disk()?;
+    let mut registry = RunRegistry::load_from_disk()?;
+    // A4: Restore pending queues from disk so queued runs survive restarts.
+    {
+        let snapshot = RunRegistry::load_queue(&home)?;
+        registry.restore_queue(snapshot);
+        info!(
+            pending = registry.total_pending_count(),
+            "restored pending queue from disk"
+        );
+    }
     let registry = Arc::new(Mutex::new(registry));
 
     // 6. Crash recovery reconciler
@@ -322,8 +333,18 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     let cancel = CancellationToken::new();
     let socket_path = config.socket_path();
 
+    // 7a. Network state — shared across heartbeat, server, and executor.
+    // Uses RwLock (not Mutex) because reads are frequent (every heartbeat
+    // tick, every `gw ps` query) and writes are rare (only probe updates).
+    // Lock ordering: registry → network_state → monitors.
+    let network_state = Arc::new(RwLock::new(NetworkState::default()));
+
     // 7b. Start heartbeat monitor (captures pane logs, tracks phases, spawns per-run monitors)
-    let heartbeat = HeartbeatMonitor::new(Arc::clone(&registry), cancel.clone());
+    let heartbeat = HeartbeatMonitor::new(
+        Arc::clone(&registry),
+        cancel.clone(),
+        Arc::clone(&network_state),
+    );
     // Extract monitors Arc BEFORE start() consumes self
     let monitors = heartbeat.monitors();
     let heartbeat_handle = heartbeat.start();
@@ -353,6 +374,7 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
         socket_path,
         cancel.clone(),
         monitors,
+        Arc::clone(&network_state),
     );
 
     let server_handle = tokio::spawn(async move {
@@ -422,6 +444,14 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     info!("daemon shutting down — draining running sessions");
     let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
     info!(drained = drained, "drain complete");
+
+    // A5: Flush queue state to disk before shutdown so queued runs persist.
+    {
+        let reg = registry.lock().await;
+        if let Err(e) = reg.save_queue() {
+            warn!(error = %e, "failed to flush queue on shutdown");
+        }
+    }
 
     state::cleanup_old_runs(config.retention)?;
 
