@@ -22,6 +22,12 @@ const DEFAULT_SOCKET_NAME: &str = "daemon.sock";
 /// explicitly in `~/.gw/config.toml`.
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 
+/// Default schedule polling interval in seconds.
+const DEFAULT_SCHEDULE_INTERVAL: u64 = 30;
+
+/// Default maximum concurrent scheduled runs.
+const DEFAULT_MAX_SCHEDULED_RUNS: usize = 2;
+
 // ── Path helpers ─────────────────────────────────────────────────────
 
 /// Resolve the GW home directory: `$GW_HOME` or `~/.gw/`.
@@ -102,6 +108,14 @@ pub struct GlobalConfig {
     /// exhaustion when the config file is missing or omits this field.
     #[serde(default = "default_max_concurrent_runs")]
     pub max_concurrent_runs: usize,
+
+    /// Schedule polling interval in seconds (default: 30).
+    #[serde(default = "default_schedule_interval")]
+    pub schedule_interval_secs: u64,
+
+    /// Maximum concurrent scheduled runs (default: 2).
+    #[serde(default = "default_max_scheduled_runs")]
+    pub max_scheduled_runs: usize,
 }
 
 fn default_retention() -> usize {
@@ -116,12 +130,22 @@ fn default_max_concurrent_runs() -> usize {
     DEFAULT_MAX_CONCURRENT_RUNS
 }
 
+fn default_schedule_interval() -> u64 {
+    DEFAULT_SCHEDULE_INTERVAL
+}
+
+fn default_max_scheduled_runs() -> usize {
+    DEFAULT_MAX_SCHEDULED_RUNS
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             retention: DEFAULT_RETENTION,
             socket_name: DEFAULT_SOCKET_NAME.to_string(),
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            schedule_interval_secs: DEFAULT_SCHEDULE_INTERVAL,
+            max_scheduled_runs: DEFAULT_MAX_SCHEDULED_RUNS,
         }
     }
 }

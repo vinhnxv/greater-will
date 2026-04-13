@@ -12,11 +12,15 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 // ── Schedule kind ──────────────────────────────────────────────────
 
 /// The type of schedule trigger.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScheduleKind {
     /// Recurring cron expression (7-field with seconds).
     Cron { expression: String },
@@ -270,6 +274,55 @@ impl ScheduleRegistry {
             )
         })?;
         Ok(())
+    }
+}
+
+// ── Schedule runner ────────────────────────────────────────────────
+
+/// Run the schedule polling loop.
+/// Ticks every `interval_secs` seconds, checking for ready schedules.
+/// When a schedule fires, submits a run via the existing executor path.
+pub async fn run_schedule_loop(
+    schedule_registry: Arc<Mutex<ScheduleRegistry>>,
+    run_registry: Arc<Mutex<crate::daemon::registry::RunRegistry>>,
+    cancel: CancellationToken,
+    interval_secs: u64,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    // Skip: don't catch up on missed ticks — fire once on next tick instead.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let ready = {
+                    let sched = schedule_registry.lock().await;
+                    sched.get_ready_schedules()
+                };
+                for entry in ready {
+                    let result = crate::daemon::executor::spawn_run(
+                        Arc::clone(&run_registry),
+                        &entry.plan_path,
+                        &entry.repo_dir,
+                        None,
+                        entry.config_dir.clone(),
+                        entry.verbose,
+                    )
+                    .await;
+                    let mut sched = schedule_registry.lock().await;
+                    match result {
+                        Ok(run_id) => {
+                            tracing::info!(schedule_id = %entry.id, run_id = %run_id, "schedule fired");
+                            sched.record_fired(&entry.id).ok();
+                        }
+                        Err(e) => {
+                            tracing::warn!(schedule_id = %entry.id, error = %e, "schedule fire failed");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -579,6 +632,136 @@ mod tests {
         let loaded = ScheduleRegistry::load(&path).unwrap();
         assert_eq!(loaded.list().len(), 1);
         assert_eq!(loaded.find_by_prefix("abcd").unwrap().label.as_deref(), Some("roundtrip test"));
+    }
+
+    #[test]
+    fn registry_get_ready_returns_past_not_future() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("schedules.json");
+        let mut reg = ScheduleRegistry::new(path);
+
+        // Entry with next_fire in the past — should be ready.
+        let past_entry = ScheduleEntry {
+            id: "past0001".into(),
+            plan_path: PathBuf::from("plans/test.md"),
+            repo_dir: PathBuf::from("/tmp/repo"),
+            config_dir: None,
+            verbose: 0,
+            kind: ScheduleKind::OneShot {
+                at: Utc::now() - chrono::Duration::hours(1),
+            },
+            status: ScheduleStatus::Active,
+            created_at: Utc::now(),
+            last_fired: None,
+            next_fire: Some(Utc::now() - chrono::Duration::hours(1)),
+            fire_count: 0,
+            label: None,
+        };
+
+        // Entry with next_fire in the future — should NOT be ready.
+        let future_entry = ScheduleEntry {
+            id: "futr0001".into(),
+            plan_path: PathBuf::from("plans/test.md"),
+            repo_dir: PathBuf::from("/tmp/repo"),
+            config_dir: None,
+            verbose: 0,
+            kind: ScheduleKind::OneShot {
+                at: Utc::now() + chrono::Duration::hours(1),
+            },
+            status: ScheduleStatus::Active,
+            created_at: Utc::now(),
+            last_fired: None,
+            next_fire: Some(Utc::now() + chrono::Duration::hours(1)),
+            fire_count: 0,
+            label: None,
+        };
+
+        reg.add(past_entry).unwrap();
+        reg.add(future_entry).unwrap();
+
+        let ready = reg.get_ready_schedules();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "past0001");
+    }
+
+    #[test]
+    fn registry_record_fired_cron_advances_next_fire() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("schedules.json");
+        let mut reg = ScheduleRegistry::new(path);
+
+        let entry = ScheduleEntry {
+            id: "cron0001".into(),
+            plan_path: PathBuf::from("plans/test.md"),
+            repo_dir: PathBuf::from("/tmp/repo"),
+            config_dir: None,
+            verbose: 0,
+            kind: ScheduleKind::Cron {
+                expression: "0 * * * * * *".into(), // every minute
+            },
+            status: ScheduleStatus::Active,
+            created_at: Utc::now(),
+            last_fired: None,
+            next_fire: Some(Utc::now()),
+            fire_count: 0,
+            label: None,
+        };
+
+        reg.add(entry).unwrap();
+        reg.record_fired("cron0001").unwrap();
+
+        let e = reg.find_by_prefix("cron").unwrap();
+        assert_eq!(e.status, ScheduleStatus::Active);
+        assert_eq!(e.fire_count, 1);
+        assert!(e.last_fired.is_some());
+        // next_fire should advance to a future time
+        assert!(e.next_fire.is_some());
+        assert!(e.next_fire.unwrap() > Utc::now());
+    }
+
+    #[test]
+    fn registry_find_by_prefix_unique_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("schedules.json");
+        let mut reg = ScheduleRegistry::new(path);
+
+        let make_entry = |id: &str| ScheduleEntry {
+            id: id.into(),
+            plan_path: PathBuf::from("plans/test.md"),
+            repo_dir: PathBuf::from("/tmp/repo"),
+            config_dir: None,
+            verbose: 0,
+            kind: ScheduleKind::Delayed { delay_secs: 60 },
+            status: ScheduleStatus::Active,
+            created_at: Utc::now(),
+            last_fired: None,
+            next_fire: None,
+            fire_count: 0,
+            label: None,
+        };
+
+        reg.add(make_entry("aabb1122")).unwrap();
+        reg.add(make_entry("aacc3344")).unwrap();
+
+        // Unique prefix → Some
+        assert!(reg.find_by_prefix("aabb").is_some());
+        assert_eq!(reg.find_by_prefix("aabb").unwrap().id, "aabb1122");
+
+        // Ambiguous prefix → None
+        assert!(reg.find_by_prefix("aa").is_none());
+
+        // No match → None
+        assert!(reg.find_by_prefix("zz").is_none());
+    }
+
+    #[test]
+    fn parse_duration_45s() {
+        assert_eq!(parse_duration_suffix("45s").unwrap(), 45);
+    }
+
+    #[test]
+    fn parse_duration_invalid_no_number() {
+        assert!(parse_duration_suffix("abc").is_err());
     }
 
     #[test]

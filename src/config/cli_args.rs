@@ -240,6 +240,12 @@ pub enum Commands {
     /// - Log files from previous runs
     Clean,
 
+    /// Manage scheduled plan executions.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+
     /// Browse history of past arc runs.
     ///
     /// Reads run metadata and logs directly from disk (~/.gw/runs/).
@@ -309,4 +315,55 @@ pub enum DaemonAction {
     Uninstall,
     /// Restart the daemon.
     Restart,
+}
+
+/// Subcommands for `gw schedule`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ScheduleAction {
+    /// Add a new scheduled plan execution.
+    Add {
+        /// Plan file path to schedule.
+        plan: String,
+
+        /// Cron expression (e.g. "*/5 * * * *").
+        #[arg(long, conflicts_with_all = ["at", "after"])]
+        cron: Option<String>,
+
+        /// Fire once at a specific time (ISO 8601 or "HH:MM").
+        #[arg(long, conflicts_with_all = ["cron", "after"])]
+        at: Option<String>,
+
+        /// Fire once after a delay (e.g. "30m", "2h", "1d").
+        #[arg(long, conflicts_with_all = ["cron", "at"])]
+        after: Option<String>,
+
+        /// Optional human-readable label.
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Custom configuration directory (CLAUDE_CONFIG_DIR).
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// List all schedules.
+    List {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a schedule by ID.
+    Remove {
+        /// Schedule ID (prefix match).
+        id: String,
+    },
+    /// Pause a schedule.
+    Pause {
+        /// Schedule ID (prefix match).
+        id: String,
+    },
+    /// Resume a paused schedule.
+    Resume {
+        /// Schedule ID (prefix match).
+        id: String,
+    },
 }

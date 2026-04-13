@@ -80,6 +80,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         commands::Commands::Clean => commands::clean::execute(),
+        commands::Commands::Schedule { action } => commands::schedule::execute(action),
         commands::Commands::History {
             limit,
             status,

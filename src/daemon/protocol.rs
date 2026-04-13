@@ -54,6 +54,25 @@ pub enum Request {
     DaemonStatus,
     /// Request graceful daemon shutdown.
     Shutdown,
+    /// Add a new schedule.
+    AddSchedule {
+        plan_path: PathBuf,
+        repo_dir: PathBuf,
+        kind: crate::daemon::schedule::ScheduleKind,
+        #[serde(default)]
+        config_dir: Option<PathBuf>,
+        #[serde(default)]
+        verbose: u8,
+        label: Option<String>,
+    },
+    /// List all schedules.
+    ListSchedules,
+    /// Remove a schedule by ID.
+    RemoveSchedule { id: String },
+    /// Pause a schedule.
+    PauseSchedule { id: String },
+    /// Resume a paused schedule.
+    ResumeSchedule { id: String },
 }
 
 // ── Response types ───────────────────────────────────────────────────
@@ -76,6 +95,15 @@ pub enum Response {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    /// List of schedules.
+    ScheduleList {
+        schedules: Vec<ScheduleInfo>,
+    },
+    /// A schedule was created.
+    ScheduleAdded {
+        id: String,
+        next_fire: Option<String>,
     },
 }
 
@@ -113,6 +141,7 @@ pub enum ErrorCode {
     InvalidRequest,
     InternalError,
     QueueFull,
+    ScheduleNotFound,
 }
 
 impl ErrorCode {
@@ -140,8 +169,35 @@ impl ErrorCode {
             ErrorCode::QueueFull => {
                 "Queue is full. Wait for runs to complete or cancel queued entries with `gw stop`.".to_string()
             }
+            ErrorCode::ScheduleNotFound => {
+                format!("No schedule matching '{context}'. Run `gw schedule list` to see schedules.")
+            }
         }
     }
+}
+
+// ── Schedule wire types ─────────────────────────────────────────────
+
+/// Wire representation of a schedule entry for IPC responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScheduleInfo {
+    pub id: String,
+    pub plan_path: PathBuf,
+    pub repo_dir: PathBuf,
+    pub kind: ScheduleKindInfo,
+    pub status: crate::daemon::schedule::ScheduleStatus,
+    pub next_fire: Option<String>,
+    pub last_fired: Option<String>,
+    pub fire_count: u32,
+    pub label: Option<String>,
+}
+
+/// Wire representation of schedule trigger kind.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ScheduleKindInfo {
+    Cron { expression: String },
+    OneShot { at: String },
+    Delayed { fires_at: String },
 }
 
 // ── Length-prefixed framing ──────────────────────────────────────────
@@ -222,6 +278,26 @@ mod tests {
             },
             Request::DaemonStatus,
             Request::Shutdown,
+            Request::AddSchedule {
+                plan_path: PathBuf::from("/tmp/plan.md"),
+                repo_dir: PathBuf::from("/home/user/repo"),
+                kind: crate::daemon::schedule::ScheduleKind::Cron {
+                    expression: "0 */5 * * * * *".into(),
+                },
+                config_dir: None,
+                verbose: 1,
+                label: Some("nightly build".into()),
+            },
+            Request::ListSchedules,
+            Request::RemoveSchedule {
+                id: "sched-abc".into(),
+            },
+            Request::PauseSchedule {
+                id: "sched-abc".into(),
+            },
+            Request::ResumeSchedule {
+                id: "sched-abc".into(),
+            },
         ];
 
         for req in &cases {
@@ -264,6 +340,25 @@ mod tests {
                 run_id: "run-queue-1".into(),
                 position: 2,
             },
+            Response::ScheduleList {
+                schedules: vec![ScheduleInfo {
+                    id: "sched-001".into(),
+                    plan_path: PathBuf::from("plans/nightly.md"),
+                    repo_dir: PathBuf::from("/repo"),
+                    kind: ScheduleKindInfo::Cron {
+                        expression: "0 0 * * * * *".into(),
+                    },
+                    status: crate::daemon::schedule::ScheduleStatus::Active,
+                    next_fire: Some("2026-04-13T03:00:00Z".into()),
+                    last_fired: None,
+                    fire_count: 0,
+                    label: Some("nightly".into()),
+                }],
+            },
+            Response::ScheduleAdded {
+                id: "sched-002".into(),
+                next_fire: Some("2026-04-13T04:00:00Z".into()),
+            },
         ];
 
         for resp in &cases {
@@ -297,6 +392,7 @@ mod tests {
             ErrorCode::InvalidRequest,
             ErrorCode::InternalError,
             ErrorCode::QueueFull,
+            ErrorCode::ScheduleNotFound,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let deser: ErrorCode = serde_json::from_str(&json).unwrap();
