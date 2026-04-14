@@ -271,6 +271,28 @@ async fn spawn_after_register(
                 &format!("pid={} — waiting 12s for Claude TUI", pid),
             );
             tokio::time::sleep(std::time::Duration::from_secs(SPAWN_INIT_WAIT_SECS)).await;
+
+            // After TUI init, `spawn_claude_session` returned the tmux pane (shell)
+            // pid. Claude itself is a child of that shell — refresh `claude_pid`
+            // with the real process so meta.json and any future signal/kill paths
+            // reference Claude rather than the shell session leader.
+            let session_for_pid = tmux_session.clone();
+            if let Some(real_pid) = tokio::task::spawn_blocking(move || {
+                spawn::get_claude_pid(&session_for_pid)
+            })
+            .await
+            .ok()
+            .flatten()
+            {
+                let mut reg = registry.lock().await;
+                if let Some(entry) = reg.get_mut(&run_id) {
+                    entry.claude_pid = Some(real_pid);
+                }
+                drop(reg);
+                debug!(run_id = %run_id, shell_pid = pid, claude_pid = real_pid, "refreshed claude_pid after TUI init");
+            } else {
+                warn!(run_id = %run_id, shell_pid = pid, "could not resolve Claude PID after TUI init — keeping shell pid");
+            }
         }
         Err(e) => {
             // Spawn failed — clean up registry entry
