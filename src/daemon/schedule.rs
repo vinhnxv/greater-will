@@ -255,9 +255,11 @@ impl ScheduleRegistry {
                 .and_then(|repo| validate_plan_path(&entry.plan_path, &repo).map(|plan| (repo, plan)))
             {
                 Ok((canonical_repo, canonical_plan)) => {
-                    entry.repo_dir = canonical_repo;
-                    entry.plan_path = canonical_plan;
-                    dirty = true;
+                    if entry.repo_dir != canonical_repo || entry.plan_path != canonical_plan {
+                        entry.repo_dir = canonical_repo;
+                        entry.plan_path = canonical_plan;
+                        dirty = true;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -278,7 +280,9 @@ impl ScheduleRegistry {
         };
 
         if dirty {
-            registry.save().ok();
+            if let Err(e) = registry.save() {
+                tracing::warn!(error = %e, "failed to persist schedule migration");
+            }
         }
 
         Ok(registry)
@@ -357,7 +361,9 @@ pub async fn run_schedule_loop(
                                 ent.status = ScheduleStatus::Rejected;
                                 ent.last_error = Some(format!("fire-time validation failed: {e}"));
                             }
-                            sched.save().ok();
+                            if let Err(save_err) = sched.save() {
+                                tracing::warn!(error = %save_err, "failed to persist schedule rejection");
+                            }
                             continue;
                         }
                     };
@@ -368,7 +374,9 @@ pub async fn run_schedule_loop(
                             ent.status = ScheduleStatus::Rejected;
                             ent.last_error = Some(format!("fire-time validation failed: {e}"));
                         }
-                        sched.save().ok();
+                        if let Err(save_err) = sched.save() {
+                            tracing::warn!(error = %save_err, "failed to persist schedule rejection");
+                        }
                         continue;
                     }
 
