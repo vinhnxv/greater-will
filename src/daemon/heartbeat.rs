@@ -1213,6 +1213,7 @@ async fn attempt_recovery(
                     None,
                     Some(format!("Recovery aborted (repo disk): {}", e)),
                 );
+                drop(reg);
                 return;
             }
             if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
@@ -1223,6 +1224,7 @@ async fn attempt_recovery(
                     None,
                     Some(format!("Recovery aborted (GW_HOME disk): {}", e)),
                 );
+                drop(reg);
                 return;
             }
 

@@ -1654,6 +1654,7 @@ mod tests {
             claude_pid: None,
             schedule_id: None,
             last_recovery_at: Some(chrono::Utc::now()),
+            write_epoch: 0,
         };
         let registry = Arc::new(Mutex::new(RunRegistry::new()));
         let monitor = DaemonRunMonitor::new(&entry, registry, WatchdogConfig::from_env());

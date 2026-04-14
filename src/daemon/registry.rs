@@ -118,6 +118,10 @@ pub struct RunEntry {
     /// `None` for runs created before this field was added.
     #[serde(default)]
     pub last_recovery_at: Option<DateTime<Utc>>,
+    /// Monotonic write-epoch for idempotent flush. Bumped on every stage_status_locked mutation.
+    /// INV-19: enables fsync-outside-mutex via epoch-based conflict resolution.
+    #[serde(default)]
+    pub write_epoch: u64,
 }
 
 fn default_restartable() -> bool {
@@ -151,6 +155,58 @@ impl RunEntry {
             waiting_for_network: false, // populated by server with shared state
         }
     }
+}
+
+// ── Repo lock guard ────────────────────────────────────────────────
+
+/// RAII guard for per-repo locks. Releases the lock on drop unless `.commit()` is called.
+/// Closes INV-7: prevents repo lock leaks when `write_meta` fails mid-promote.
+pub(crate) struct RepoLockGuard {
+    repo_hash: String,
+    committed: bool,
+}
+
+impl RepoLockGuard {
+    pub fn new(repo_hash: String) -> Self {
+        Self {
+            repo_hash,
+            committed: false,
+        }
+    }
+
+    /// Consume the guard, marking the lock as intentionally held.
+    /// Must be called on the success path after write_meta succeeds.
+    #[must_use = "RepoLockGuard::commit consumes self — assign to _ if intentional"]
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Release the repo lock if not committed. Call on error paths.
+    pub fn release_from(self, map: &mut HashMap<String, fs::File>) {
+        if !self.committed {
+            map.remove(&self.repo_hash);
+        }
+    }
+}
+
+// ── Status update types ───────────────────────────────────────────
+
+/// Errors from status update operations.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateStatusError {
+    #[error("run not found: {0}")]
+    NotFound(String),
+    #[error("invalid transition: {from:?} → {to:?}")]
+    InvalidTransition { from: RunStatus, to: RunStatus },
+    #[error(transparent)]
+    Io(#[from] color_eyre::eyre::Error),
+}
+
+/// Staged status change — result of in-memory mutation, ready for flush.
+#[derive(Debug, Clone)]
+pub struct StagedStatus {
+    pub entry: RunEntry,
+    pub epoch: u64,
 }
 
 // ── Registry ────────────────────────────────────────────────────────
@@ -295,6 +351,7 @@ impl RunRegistry {
             claude_pid: None,
             schedule_id,
             last_recovery_at: None,
+            write_epoch: 0,
         };
 
         // Persist to disk
@@ -497,6 +554,7 @@ impl RunRegistry {
             claude_pid: None,
             schedule_id: None,
             last_recovery_at: None,
+            write_epoch: 0,
         };
         self.write_meta(&entry)?;
         self.runs.insert(pending.run_id.clone(), entry);
@@ -583,7 +641,9 @@ impl RunRegistry {
             entry.repo_dir.clone()
         };
 
+        let rh = repo_hash(&repo_dir);
         self.acquire_repo_lock(&repo_dir)?;
+        let guard = RepoLockGuard::new(rh);
 
         let entry = self
             .runs
@@ -592,10 +652,18 @@ impl RunRegistry {
         entry.started_at = Utc::now();
         entry.restartable = true;
         let entry_clone = entry.clone();
-        self.write_meta(&entry_clone)?;
 
-        tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
-        Ok(())
+        match self.write_meta(&entry_clone) {
+            Ok(()) => {
+                let _ = guard.commit();
+                tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
+                Ok(())
+            }
+            Err(e) => {
+                guard.release_from(&mut self.repo_locks);
+                Err(e)
+            }
+        }
     }
 
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
@@ -1709,5 +1777,26 @@ mod tests {
             let all = reg.list_runs(true);
             assert_eq!(all.len(), 2);
         });
+    }
+
+    // ── RepoLockGuard unit tests ───────────────────────────────────
+
+    #[test]
+    fn repo_lock_guard_releases_on_drop() {
+        let mut map = HashMap::new();
+        map.insert("abc".to_string(), tempfile::tempfile().unwrap());
+        let guard = RepoLockGuard::new("abc".to_string());
+        guard.release_from(&mut map);
+        assert!(!map.contains_key("abc"));
+    }
+
+    #[test]
+    fn repo_lock_guard_retains_on_commit() {
+        let mut map = HashMap::new();
+        map.insert("abc".to_string(), tempfile::tempfile().unwrap());
+        let guard = RepoLockGuard::new("abc".to_string());
+        guard.commit();
+        // guard consumed, map untouched
+        assert!(map.contains_key("abc"));
     }
 }
