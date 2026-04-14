@@ -423,6 +423,24 @@ fn resolve_session_name_collisions(registry: &mut RunRegistry) -> u32 {
                 warn!(run_id = %run_id, error = %e, "failed to mark collision loser");
             } else {
                 resolved += 1;
+                // Reap the non-canonical entry's dedicated tmux session if it has one
+                // separate from the canonical's. Without this, Stopped entries leak
+                // their `gw-<ghost_id>` tmux session forever (bug: observed 2026-04-14).
+                if let Some(entry) = registry.get(run_id) {
+                    if let Some(ghost_tmux) = entry
+                        .tmux_session
+                        .as_deref()
+                        .filter(|t| *t != session_name.as_str())
+                    {
+                        if spawn::has_session(ghost_tmux) {
+                            if let Err(e) = spawn::kill_session(ghost_tmux) {
+                                warn!(run_id = %run_id, tmux = %ghost_tmux, error = %e, "failed to reap ghost tmux");
+                            } else {
+                                debug!(run_id = %run_id, tmux = %ghost_tmux, "reaped ghost tmux on collision");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
