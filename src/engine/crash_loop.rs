@@ -122,6 +122,7 @@ impl CrashLoopDetector {
     /// Defaults to [`DEFAULT_MAX_CRASHES_PER_PHASE`] (3). Pass 0 to
     /// disable per-phase gating entirely — the global counters then
     /// revert to being the only cap (legacy behavior).
+    #[cfg(test)]
     pub fn with_max_per_phase(mut self, max_per_phase: u32) -> Self {
         self.max_per_phase = max_per_phase;
         self
@@ -264,6 +265,7 @@ impl CrashLoopDetector {
 
     /// Per-phase crash count observed so far for `phase`. Returns 0 for
     /// unknown phases. Mainly for tests/telemetry.
+    #[cfg(test)]
     pub fn crashes_for_phase(&self, phase: &str) -> u32 {
         self.per_phase_crashes.get(phase).copied().unwrap_or(0)
     }
