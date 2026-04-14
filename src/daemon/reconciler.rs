@@ -9,8 +9,10 @@ use crate::daemon::drain;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::daemon::state::gw_home;
+use crate::monitor::loop_state::read_arc_loop_state;
 use crate::session::spawn;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -449,6 +451,28 @@ fn resolve_session_name_collisions(registry: &mut RunRegistry) -> u32 {
 
 // ── Helper functions ────────────────────────────────────────────────
 
+/// Compare two plan path references that may use different encodings.
+/// Returns true if they resolve to the same plan file under `repo_dir`.
+fn plans_match(a: &str, b: &str, repo_dir: &Path) -> bool {
+    let norm = |s: &str| -> PathBuf {
+        let p = Path::new(s);
+        if p.is_absolute() {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        } else {
+            std::fs::canonicalize(repo_dir.join(p))
+                .unwrap_or_else(|_| repo_dir.join(p))
+        }
+    };
+    let a_n = norm(a);
+    let b_n = norm(b);
+    if a_n == b_n {
+        return true;
+    }
+    // Filename fallback: same basename is a weak match but better than
+    // rejecting on trivial prefix drift (e.g., symlink farms).
+    a_n.file_name() == b_n.file_name() && a_n.file_name().is_some()
+}
+
 /// Try to adopt an orphaned tmux session by loading its meta.json from disk.
 ///
 /// Extracts the run_id from the tmux session name (e.g., `gw-abc12345` → `abc12345`),
@@ -500,6 +524,31 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
             return Some(run_id.to_string());
         }
     };
+
+    // Plan-match guard: verify the live tmux session is running the plan
+    // we're about to adopt it as. Skip if env var override is set.
+    if std::env::var("GW_DAEMON_SKIP_PLAN_MATCH").ok().as_deref() != Some("1") {
+        let loop_state_read = read_arc_loop_state(&entry.repo_dir);
+        if let Some(state) = loop_state_read.active() {
+            let live_plan = &state.plan_file;
+            let recorded_plan = entry.plan_path.to_string_lossy();
+            if !plans_match(live_plan, &recorded_plan, &entry.repo_dir) {
+                warn!(
+                    run_id = %run_id,
+                    recorded = %recorded_plan,
+                    live = %live_plan,
+                    "refusing to adopt orphan — plan mismatch between meta.json and live arc loop state"
+                );
+                crate::daemon::heartbeat::append_event(
+                    run_id,
+                    "adopt_refused_plan_mismatch",
+                    &format!("recorded={}, live={}", recorded_plan, live_plan),
+                );
+                return Some(run_id.to_string());
+            }
+        }
+        // No loop state file → proceed with adoption (pre-init window)
+    }
 
     // Update the entry to reflect reality: tmux is alive, mark as Running
     entry.tmux_session = Some(tmux_name.to_string());
