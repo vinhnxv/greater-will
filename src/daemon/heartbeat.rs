@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::network;
 use crate::daemon::state::NetworkState;
+use crate::monitor::loop_state::{read_arc_loop_state, LoopStateRead};
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -340,8 +341,8 @@ impl HeartbeatMonitor {
     /// Update the run's current phase from checkpoint.json (ground truth),
     /// falling back to pane content heuristics when no checkpoint is available.
     async fn update_phase_from_pane(&self, run_id: &str, pane_content: &str) {
-        // Try checkpoint.json first — this is the authoritative source
-        let checkpoint_phase = self.read_phase_from_checkpoint(run_id).await;
+        // Try loop-state → checkpoint first — this is the authoritative source
+        let checkpoint_phase = self.read_phase_via_loop_state(run_id).await;
         // Capture whether the checkpoint independently confirms completion,
         // BEFORE we move `checkpoint_phase` into the phase-update path below.
         // Used later as a cross-check gate against pane-text false positives
@@ -452,15 +453,21 @@ impl HeartbeatMonitor {
     ///
     /// This is the ground truth — it knows the exact phase name from the 41-phase
     /// PHASE_ORDER, not just the 5 coarse buckets from pane heuristics.
+    ///
+    /// Only checkpoints belonging to *this* run are considered: the discovery
+    /// is scoped by `plan_path` and `started_at` so stale `.rune/arc/`
+    /// directories from prior arcs cannot drive phase detection.
     async fn read_phase_from_checkpoint(&self, run_id: &str) -> Option<String> {
-        let repo_dir = {
+        let (repo_dir, plan_path, run_started_at) = {
             let registry = self.registry.lock().await;
-            registry.get(run_id).map(|e| e.repo_dir.clone())?
+            registry
+                .get(run_id)
+                .map(|e| (e.repo_dir.clone(), e.plan_path.clone(), e.started_at))?
         };
 
-        // Scan .rune/arc/*/checkpoint.json for the most recent checkpoint
         let arc_dir = repo_dir.join(".rune").join("arc");
-        let checkpoint_path = find_latest_checkpoint(&arc_dir)?;
+        let checkpoint_path =
+            find_latest_checkpoint(&arc_dir, &repo_dir, &plan_path, run_started_at)?;
 
         match crate::checkpoint::reader::read_checkpoint(&checkpoint_path) {
             Ok(cp) => {
@@ -1169,23 +1176,71 @@ fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
     }
 }
 
-/// Find the most recently modified checkpoint.json under .rune/arc/*/
-fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Find the most recently modified checkpoint.json under `.rune/arc/*/`
+/// that belongs to the given run.
+///
+/// `.rune/arc/` accumulates a directory per arc invocation. Picking by mtime
+/// alone is unsafe — a fresh run that hasn't yet emitted its first checkpoint
+/// would inherit the phase of the previous arc (e.g. `deploy_verify` from a
+/// completed run leaks into a brand-new `forge`-stage run).
+///
+/// Filters applied, in order:
+/// 1. `checkpoint.plan_file` (relative) joined to `repo_dir` must equal
+///    `plan_path` — different plans are not the same run.
+/// 2. `checkpoint.is_complete()` must be false — a finished arc must not
+///    drive phase for a still-running run.
+/// 3. `checkpoint.started_at` must be `>= run_started_at - 60s` — guards
+///    against a leftover in-progress checkpoint from a stale prior run on
+///    the same plan. The 60s tolerance absorbs the small delta between
+///    Rune writing `started_at` (inside the agent) and the daemon's
+///    `RunEntry.started_at` (recorded at submit time).
+///
+/// Returns `None` while no qualifying checkpoint exists yet (e.g. during
+/// arc pre-flight before Rune emits the first checkpoint). The caller
+/// then falls back to pane heuristics, which is the desired behaviour.
+fn find_latest_checkpoint(
+    arc_dir: &std::path::Path,
+    repo_dir: &std::path::Path,
+    plan_path: &std::path::Path,
+    run_started_at: chrono::DateTime<chrono::Utc>,
+) -> Option<std::path::PathBuf> {
     if !arc_dir.is_dir() {
         return None;
     }
+
+    let earliest_allowed = run_started_at - chrono::Duration::seconds(60);
 
     std::fs::read_dir(arc_dir)
         .ok()?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let cp = e.path().join("checkpoint.json");
-            if cp.exists() {
-                let mtime = std::fs::metadata(&cp).ok()?.modified().ok()?;
-                Some((cp, mtime))
-            } else {
-                None
+            let cp_path = e.path().join("checkpoint.json");
+            if !cp_path.exists() {
+                return None;
             }
+
+            let cp = crate::checkpoint::reader::read_checkpoint(&cp_path).ok()?;
+
+            // (1) plan match: cp.plan_file is repo-relative.
+            if repo_dir.join(&cp.plan_file) != plan_path {
+                return None;
+            }
+
+            // (2) reject finished arcs.
+            if cp.is_complete() {
+                return None;
+            }
+
+            // (3) reject checkpoints that started before this run.
+            let cp_started = chrono::DateTime::parse_from_rfc3339(&cp.started_at)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            if cp_started < earliest_allowed {
+                return None;
+            }
+
+            let mtime = std::fs::metadata(&cp_path).ok()?.modified().ok()?;
+            Some((cp_path, mtime))
         })
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(path, _)| path)
@@ -1504,5 +1559,173 @@ mod tests {
     #[test]
     fn heuristic_returns_none_on_empty() {
         assert_eq!(phase_from_pane_heuristic(""), None);
+    }
+
+    // ── find_latest_checkpoint scoping tests ──
+
+    fn write_checkpoint_dir(
+        arc_dir: &std::path::Path,
+        arc_id: &str,
+        plan_file: &str,
+        started_at: &str,
+        phase_status: &[(&str, &str)],
+        completed_at: Option<&str>,
+    ) -> std::path::PathBuf {
+        let dir = arc_dir.join(arc_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cp_path = dir.join("checkpoint.json");
+        let phases: serde_json::Map<String, serde_json::Value> = phase_status
+            .iter()
+            .map(|(name, status)| {
+                (
+                    (*name).to_string(),
+                    serde_json::json!({ "status": status }),
+                )
+            })
+            .collect();
+        let mut body = serde_json::json!({
+            "id": arc_id,
+            "schema_version": 28,
+            "plan_file": plan_file,
+            "phases": phases,
+            "started_at": started_at,
+        });
+        if let Some(ts) = completed_at {
+            body["completed_at"] = serde_json::Value::String(ts.into());
+        }
+        std::fs::write(&cp_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        cp_path
+    }
+
+    #[test]
+    fn find_latest_checkpoint_ignores_stale_prior_arc() {
+        // Repro of the deploy_verify ghost bug: a previous arc for the SAME
+        // plan completed and left a checkpoint behind. A brand-new run that
+        // hasn't emitted its own checkpoint must not inherit phase data
+        // from the stale one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let arc = repo.join(".rune").join("arc");
+        let plan_path = repo.join("plans").join("p.md");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan_path, "# plan").unwrap();
+
+        write_checkpoint_dir(
+            &arc,
+            "arc-prior",
+            "plans/p.md",
+            "2026-01-01T00:00:00Z",
+            &[
+                ("forge", "completed"),
+                ("merge", "completed"),
+            ],
+            Some("2026-01-01T01:00:00Z"),
+        );
+
+        let run_started =
+            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        assert!(
+            find_latest_checkpoint(&arc, repo, &plan_path, run_started).is_none(),
+            "stale completed checkpoint must not be selected for a fresh run"
+        );
+    }
+
+    #[test]
+    fn find_latest_checkpoint_rejects_unrelated_plan() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let arc = repo.join(".rune").join("arc");
+        let plan_path = repo.join("plans").join("ours.md");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+
+        write_checkpoint_dir(
+            &arc,
+            "arc-other",
+            "plans/theirs.md",
+            "2026-04-14T12:00:00Z",
+            &[("forge", "in_progress")],
+            None,
+        );
+
+        let run_started =
+            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        assert!(
+            find_latest_checkpoint(&arc, repo, &plan_path, run_started).is_none(),
+            "checkpoint for a different plan must be ignored"
+        );
+    }
+
+    #[test]
+    fn find_latest_checkpoint_picks_matching_in_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let arc = repo.join(".rune").join("arc");
+        let plan_path = repo.join("plans").join("p.md");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+
+        // Stale prior arc — must be rejected.
+        write_checkpoint_dir(
+            &arc,
+            "arc-prior",
+            "plans/p.md",
+            "2026-01-01T00:00:00Z",
+            &[("forge", "completed"), ("merge", "completed")],
+            Some("2026-01-01T01:00:00Z"),
+        );
+        // Fresh arc for our run — must be picked.
+        let fresh = write_checkpoint_dir(
+            &arc,
+            "arc-fresh",
+            "plans/p.md",
+            "2026-04-14T11:50:30Z",
+            &[("forge", "in_progress")],
+            None,
+        );
+
+        let run_started =
+            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            find_latest_checkpoint(&arc, repo, &plan_path, run_started),
+            Some(fresh)
+        );
+    }
+
+    #[test]
+    fn find_latest_checkpoint_tolerates_60s_clock_skew() {
+        // Rune may stamp checkpoint.started_at slightly before the daemon
+        // records RunEntry.started_at. Anything within 60s should still match.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let arc = repo.join(".rune").join("arc");
+        let plan_path = repo.join("plans").join("p.md");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+
+        let fresh = write_checkpoint_dir(
+            &arc,
+            "arc-fresh",
+            "plans/p.md",
+            "2026-04-14T11:49:30Z", // 30s before run_started
+            &[("forge", "in_progress")],
+            None,
+        );
+
+        let run_started =
+            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            find_latest_checkpoint(&arc, repo, &plan_path, run_started),
+            Some(fresh)
+        );
     }
 }
