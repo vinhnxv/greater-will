@@ -43,6 +43,7 @@
 pub mod completion;
 pub mod crash_loop;
 pub mod monitor_constants;
+pub mod monitor_core;
 pub mod phase_executor;
 pub mod phase_profile;
 pub mod retry;

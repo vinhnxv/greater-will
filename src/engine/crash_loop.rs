@@ -6,9 +6,25 @@
 
 use color_eyre::eyre::{self, WrapErr};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Per-phase retry budget. Each distinct phase (by name, not category)
+/// may be retried at most this many times before the pipeline stops.
+/// The counter resets when the pipeline advances to a different phase
+/// (see [`CrashLoopDetector::record_phase_transition`]) — user
+/// semantic: "khi qua next phase thì reset số lần retries".
+///
+/// With the default of 3: initial attempt + 3 retries = up to 4 total
+/// attempts per phase entry. The 4th crash trips the ceiling.
+///
+/// The motivation (DET-7): a single phase can enter a fast-fail loop
+/// where each recovery session survives long enough to drop earlier
+/// global crashes out of the rolling window, letting the run grind
+/// forever in the same broken phase. Per-phase budgets make that
+/// loop terminate deterministically.
+pub const DEFAULT_MAX_CRASHES_PER_PHASE: u32 = 3;
 
 /// Decision from the crash loop detector after recording a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,22 @@ pub struct CrashLoopDetector {
     /// can have infinite crashes as long as each run spaces them ~3+ min apart.
     /// This ceiling provides a hard stop after N total restarts per run.
     max_total_restarts: u32,
+    /// Lifetime crash count per phase name. Parallel to `crash_times` but
+    /// phase-scoped and *not* pruned by the rolling window — see
+    /// [`DEFAULT_MAX_CRASHES_PER_PHASE`] for rationale.
+    per_phase_crashes: HashMap<String, u32>,
+    /// Ceiling for `per_phase_crashes`. Stop the pipeline when any phase
+    /// reaches this count. A phase without a name (`None` at record time)
+    /// is recorded under the sentinel `"<unknown>"` bucket so we still
+    /// cap fast-fail loops before we know which phase is at fault.
+    max_per_phase: u32,
+    /// Phase name attributed to the most recent `record_restart_for_phase`.
+    /// When the next crash comes from a *different* phase we treat that
+    /// as forward progress and clear the per-phase buckets before
+    /// incrementing — matches the user semantic "khi qua next phase
+    /// thì reset số lần retries lại từ đầu". `None` means no
+    /// phase-tagged crash has been recorded yet in this run.
+    last_crash_phase: Option<String>,
 }
 
 impl CrashLoopDetector {
@@ -79,7 +111,20 @@ impl CrashLoopDetector {
             healthy_since: None,
             total_restarts: 0,
             max_total_restarts: max_total.max(max_crashes),
+            per_phase_crashes: HashMap::new(),
+            max_per_phase: DEFAULT_MAX_CRASHES_PER_PHASE,
+            last_crash_phase: None,
         }
+    }
+
+    /// Override the per-phase retry ceiling.
+    ///
+    /// Defaults to [`DEFAULT_MAX_CRASHES_PER_PHASE`] (3). Pass 0 to
+    /// disable per-phase gating entirely — the global counters then
+    /// revert to being the only cap (legacy behavior).
+    pub fn with_max_per_phase(mut self, max_per_phase: u32) -> Self {
+        self.max_per_phase = max_per_phase;
+        self
     }
 
     pub fn from_watchdog(cfg: &crate::config::watchdog::WatchdogConfig) -> Self {
@@ -91,16 +136,66 @@ impl CrashLoopDetector {
         )
     }
 
-    /// Record a crash/restart. Returns whether to continue or stop.
-    ///
-    /// The threshold check uses `>=`: the loop stops when crash count *reaches*
-    /// `max_crashes`, not when it *exceeds* it.  With `max_crashes = 5` the
-    /// detector allows crashes 1–4 and stops on the 5th.
+    /// Record a crash/restart without phase context. Prefer
+    /// [`Self::record_restart_for_phase`] in call sites that know the
+    /// current phase — the per-phase retry ceiling only fires when a
+    /// phase name is supplied. This method exists for backward
+    /// compatibility and for the daemon-startup path where no run-scoped
+    /// phase exists yet.
     pub fn record_restart(&mut self) -> CrashLoopDecision {
+        self.record_restart_for_phase(None)
+    }
+
+    /// Record a crash/restart attributed to a specific phase. Returns
+    /// whether to continue or stop.
+    ///
+    /// Three ceilings apply in order (first match wins):
+    ///   1. `max_total_restarts` — lifetime hard cap across the run.
+    ///   2. `max_per_phase`      — per-phase lifetime cap (DET-7 guard).
+    ///   3. `max_crashes`        — sliding-window rate cap.
+    ///
+    /// The threshold check uses `>=`: the loop stops when a counter
+    /// *reaches* its limit, not when it exceeds it. With `max_per_phase
+    /// = 3` the detector allows attempts 1–3 and stops the 4th.
+    pub fn record_restart_for_phase(&mut self, phase: Option<&str>) -> CrashLoopDecision {
         let now = Instant::now();
         self.total_restarts += 1;
         self.crash_times.push_back(now);
         self.healthy_since = None; // Reset healthy tracking
+
+        // Attribute the crash to a phase bucket, but only when the
+        // caller supplied a phase name. Legacy call sites that don't
+        // yet know the phase (`record_restart()` → None) skip per-phase
+        // tracking entirely so the global `max_crashes` / `max_total`
+        // remain the authoritative ceilings for them — otherwise any
+        // caller without phase context would be silently capped at
+        // `max_per_phase` and break existing behavior.
+        let phase_tracked = phase.is_some();
+        let (phase_key, phase_count_snapshot) = match phase {
+            Some(name) => {
+                let key = name.to_string();
+                // Implicit phase transition: if this crash is in a
+                // phase different from the previously-recorded one,
+                // the pipeline advanced past the old phase and we
+                // give the new phase a fresh retry budget. Global
+                // counters (window/total) are *not* cleared.
+                let is_transition = self.last_crash_phase
+                    .as_ref()
+                    .map(|prev| prev != &key)
+                    .unwrap_or(false);
+                if is_transition {
+                    self.record_phase_transition(Some(&key));
+                }
+                let count = self.per_phase_crashes
+                    .entry(key.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                let snapshot = *count;
+                self.last_crash_phase = Some(key.clone());
+                (key, snapshot)
+            }
+            None => (String::new(), 0),
+        };
 
         // Hard ceiling: stop regardless of window timing.
         // The sliding window is defeated when each recovery session survives 3-10 min
@@ -111,6 +206,38 @@ impl CrashLoopDetector {
                 max_total = self.max_total_restarts,
                 "Crash loop detected — {} total restarts reached ceiling of {}",
                 self.total_restarts, self.max_total_restarts
+            );
+            return CrashLoopDecision::StopCrashLoop;
+        }
+
+        // Per-phase ceiling (DET-7 guard). A phase that has burned its
+        // retry budget stops the run even if the global window/ceiling
+        // still has headroom — prevents a single broken phase from
+        // monopolising the retry budget.
+        //
+        // Semantics: `max_per_phase` is the number of *retries* allowed
+        // after the initial attempt. Strict `>` means attempts up to
+        // and including the (`max_per_phase`+1)-th crash are permitted;
+        // the ceiling fires when count exceeds budget.
+        //
+        //   max_per_phase = 3  →  crashes 1,2,3 allow (3 retries),
+        //                         crash 4 stops.
+        //
+        // This differs from the global `max_crashes` check below which
+        // uses `>=` (stops AT the threshold). The distinction is
+        // deliberate: the per-phase budget is expressed in the user's
+        // natural language ("retry N lần" = N retries allowed), while
+        // the global window is a rate-limit threshold.
+        if phase_tracked
+            && self.max_per_phase > 0
+            && phase_count_snapshot > self.max_per_phase
+        {
+            tracing::error!(
+                phase = %phase_key,
+                phase_crashes = phase_count_snapshot,
+                max_per_phase = self.max_per_phase,
+                "Crash loop detected — phase '{}' exceeded per-phase ceiling of {} retries",
+                phase_key, self.max_per_phase
             );
             return CrashLoopDecision::StopCrashLoop;
         }
@@ -135,6 +262,37 @@ impl CrashLoopDetector {
         }
     }
 
+    /// Per-phase crash count observed so far for `phase`. Returns 0 for
+    /// unknown phases. Mainly for tests/telemetry.
+    pub fn crashes_for_phase(&self, phase: &str) -> u32 {
+        self.per_phase_crashes.get(phase).copied().unwrap_or(0)
+    }
+
+    /// Signal that the arc pipeline has advanced to a new phase.
+    ///
+    /// Clears **per-phase** crash counters (all buckets). Each phase
+    /// should get a fresh 3-attempt budget on entry — even if the run
+    /// regresses back to a phase that had previously burned its budget,
+    /// the new entry starts from zero. Global counters
+    /// (`crash_times`, `total_restarts`) are intentionally *not*
+    /// touched here: they enforce pipeline-wide ceilings independent
+    /// of phase progress, so a run that advances through 10 phases
+    /// each crashing twice should still trip the global ceiling.
+    ///
+    /// Idempotent — call it on every observed transition; if nothing
+    /// to clear it is a cheap no-op.
+    pub fn record_phase_transition(&mut self, new_phase: Option<&str>) {
+        if self.per_phase_crashes.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            new_phase = new_phase.unwrap_or("<unknown>"),
+            cleared_buckets = self.per_phase_crashes.len(),
+            "Phase transition — clearing per-phase retry budgets"
+        );
+        self.per_phase_crashes.clear();
+    }
+
     /// Call periodically during healthy execution.
     /// If healthy for >= stability_period, reset crash counters.
     ///
@@ -153,10 +311,12 @@ impl CrashLoopDetector {
                 tracing::info!(
                     stability_secs = self.stability_period.as_secs(),
                     cleared_crashes = self.crash_times.len(),
+                    cleared_phase_buckets = self.per_phase_crashes.len(),
                     total_restarts_before = self.total_restarts,
-                    "Session stable — resetting crash counters (including total_restarts)"
+                    "Session stable — resetting crash counters (including total_restarts and per-phase)"
                 );
                 self.crash_times.clear();
+                self.per_phase_crashes.clear();
                 self.total_restarts = 0;
                 self.healthy_since = Some(now);
             }
@@ -187,10 +347,12 @@ impl CrashLoopDetector {
                 stability_secs = self.stability_period.as_secs(),
                 runtime_secs = duration_secs,
                 cleared_crashes = self.crash_times.len(),
+                cleared_phase_buckets = self.per_phase_crashes.len(),
                 total_restarts_before = self.total_restarts,
-                "Session ran long enough to reset crash counters (including total_restarts)"
+                "Session ran long enough to reset crash counters (including total_restarts and per-phase)"
             );
             self.crash_times.clear();
+            self.per_phase_crashes.clear();
             self.total_restarts = 0;
             self.healthy_since = Some(Instant::now());
         } else if self.healthy_since.is_none() {
@@ -247,6 +409,7 @@ impl CrashLoopDetector {
             total_restarts: self.total_restarts,
             window_secs: self.window.as_secs(),
             last_healthy_epoch,
+            per_phase_crashes: self.per_phase_crashes.clone(),
         };
 
         let path = Self::history_path(working_dir);
@@ -318,6 +481,11 @@ impl CrashLoopDetector {
         }
 
         self.total_restarts = record.total_restarts;
+        // Per-phase counts survive across gw restarts — a phase that
+        // already burned its budget should remain capped even after a
+        // daemon restart, otherwise we silently hand out another 3
+        // attempts on every gw process bounce.
+        self.per_phase_crashes = record.per_phase_crashes;
 
         // Restore healthy_since if it's still within the stability period (GAP 2/3)
         if let Some(epoch) = record.last_healthy_epoch {
@@ -371,6 +539,11 @@ struct CrashHistoryRecord {
     /// old files without this field deserialize correctly (`Option` defaults to `None`).
     #[serde(default)]
     last_healthy_epoch: Option<u64>,
+    /// Lifetime per-phase crash counts. `#[serde(default)]` keeps older
+    /// history files (pre per-phase ceiling) loadable — they just come
+    /// back with an empty map, which is a safe default.
+    #[serde(default)]
+    per_phase_crashes: HashMap<String, u32>,
 }
 
 #[cfg(test)]
@@ -517,6 +690,7 @@ mod tests {
             total_restarts: 5,
             window_secs: 900,
             last_healthy_epoch: None,
+            per_phase_crashes: HashMap::new(),
         };
 
         let gw_dir = dir.path().join(".gw");
@@ -591,6 +765,195 @@ mod tests {
         assert_eq!(d2.total_restarts(), 1);
         // healthy_since should be restored (within stability period)
         assert!(d2.healthy_since.is_some());
+    }
+
+    // ── Per-phase retry ceiling (DET-7) ─────────────────────────────────
+
+    #[test]
+    fn test_per_phase_ceiling_stops_flapping_phase() {
+        // max_per_phase = 3 retries → 3 crashes allowed, 4th stops.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        for i in 0..3 {
+            let decision = d.record_restart_for_phase(Some("test"));
+            assert!(
+                matches!(decision, CrashLoopDecision::AllowRestart),
+                "Retry {} should be allowed within the per-phase budget", i + 1,
+            );
+        }
+        assert_eq!(d.crashes_for_phase("test"), 3);
+        // 4th crash exceeds budget.
+        assert!(matches!(
+            d.record_restart_for_phase(Some("test")),
+            CrashLoopDecision::StopCrashLoop,
+        ));
+        assert_eq!(d.crashes_for_phase("test"), 4);
+    }
+
+    #[test]
+    fn test_phase_transition_resets_per_phase_counts() {
+        // User-specified semantic: "khi qua next phase thì reset timeout
+        // và số lần retries lại từ đầu" — advancing to a new phase gives
+        // that phase a fresh 3-attempt budget.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        d.record_restart_for_phase(Some("work"));
+        d.record_restart_for_phase(Some("work"));
+        assert_eq!(d.crashes_for_phase("work"), 2);
+
+        // Pipeline advances from "work" to "work_qa" — counters reset.
+        d.record_phase_transition(Some("work_qa"));
+        assert_eq!(d.crashes_for_phase("work"), 0);
+
+        // "work_qa" gets its own full 3 attempts.
+        for i in 0..3 {
+            let decision = d.record_restart_for_phase(Some("work_qa"));
+            assert!(
+                matches!(decision, CrashLoopDecision::AllowRestart),
+                "work_qa attempt {} should be allowed after transition reset",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_transition_preserves_global_counters() {
+        // Transition resets per-phase but MUST NOT touch the global
+        // sliding-window / total-restart counters — otherwise a run
+        // that advances through many flapping phases escapes the
+        // pipeline-wide ceiling.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        d.record_restart_for_phase(Some("work"));
+        d.record_restart_for_phase(Some("work"));
+        assert_eq!(d.total_restarts(), 2);
+        assert_eq!(d.crashes_in_window(), 2);
+
+        d.record_phase_transition(Some("work_qa"));
+        assert_eq!(d.total_restarts(), 2); // unchanged
+        assert_eq!(d.crashes_in_window(), 2); // unchanged
+    }
+
+    #[test]
+    fn test_per_phase_disable_with_zero_cap() {
+        // max_per_phase=0 disables per-phase gating (legacy behavior).
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(0);
+        for _ in 0..10 {
+            let decision = d.record_restart_for_phase(Some("work"));
+            assert!(matches!(decision, CrashLoopDecision::AllowRestart));
+        }
+    }
+
+    #[test]
+    fn test_unknown_phase_bypasses_per_phase_cap() {
+        // Legacy call sites (`record_restart()` / `None`) do not know the
+        // current phase and must not be capped by max_per_phase —
+        // otherwise they would silently become stricter. Their ceiling
+        // remains the global `max_crashes` / `max_total_restarts`.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        for _ in 0..10 {
+            let decision = d.record_restart_for_phase(None);
+            assert!(matches!(decision, CrashLoopDecision::AllowRestart));
+        }
+    }
+
+    #[test]
+    fn test_per_phase_counts_persist_across_reload() {
+        // Rationale for preserving across reload: if gw itself crashes
+        // mid-phase (e.g. daemon process bounce), the next process must
+        // see the same burned retries. Otherwise each gw restart
+        // silently hands out another full 3-retry budget to a phase
+        // that's already broken.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut d1 = CrashLoopDetector::new(5, 900, 1800);
+        d1.record_restart_for_phase(Some("test"));
+        d1.record_restart_for_phase(Some("test"));
+        d1.persist(dir.path()).unwrap();
+
+        let mut d2 = CrashLoopDetector::new(5, 900, 1800);
+        d2.load_history(dir.path());
+        assert_eq!(d2.crashes_for_phase("test"), 2);
+        // test already has 2 retries burned; 3rd is still within budget.
+        assert!(matches!(
+            d2.record_restart_for_phase(Some("test")),
+            CrashLoopDecision::AllowRestart,
+        ));
+        // 4th exceeds the budget (max_per_phase=3).
+        assert!(matches!(
+            d2.record_restart_for_phase(Some("test")),
+            CrashLoopDecision::StopCrashLoop,
+        ));
+    }
+
+    #[test]
+    fn test_implicit_transition_on_different_phase_resets_buckets() {
+        // User semantic: "khi qua next phase thì reset số lần retries lại
+        // từ đầu". When a crash comes from a different phase than the
+        // previous crash, that's forward progress — clear prior
+        // per-phase buckets before incrementing the new one.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        d.record_restart_for_phase(Some("work"));
+        d.record_restart_for_phase(Some("work"));
+        assert_eq!(d.crashes_for_phase("work"), 2);
+
+        // Crash arrives in a different phase → transition detected.
+        d.record_restart_for_phase(Some("work_qa"));
+        assert_eq!(d.crashes_for_phase("work"), 0, "work should be cleared");
+        assert_eq!(d.crashes_for_phase("work_qa"), 1, "work_qa starts fresh");
+    }
+
+    #[test]
+    fn test_implicit_transition_preserves_global_counters() {
+        // Transitions (implicit or explicit) must not reset the global
+        // crash window or total_restarts — only per-phase buckets.
+        let mut d = CrashLoopDetector::with_total_limit(100, 900, 1800, 100)
+            .with_max_per_phase(3);
+        d.record_restart_for_phase(Some("work"));
+        d.record_restart_for_phase(Some("work"));
+        d.record_restart_for_phase(Some("work_qa")); // implicit transition
+        assert_eq!(d.total_restarts(), 3);
+        assert_eq!(d.crashes_in_window(), 3);
+    }
+
+    #[test]
+    fn test_per_phase_counts_reset_on_stability() {
+        // A genuinely healthy run should clear per-phase counts too,
+        // otherwise a well-paced batch of small runs accumulates ghost
+        // failures forever.
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.record_restart_for_phase(Some("test"));
+        d.record_restart_for_phase(Some("test"));
+        assert_eq!(d.crashes_for_phase("test"), 2);
+
+        d.record_healthy_runtime(1800); // meets stability_period
+        assert_eq!(d.crashes_for_phase("test"), 0);
+    }
+
+    #[test]
+    fn test_load_old_history_without_per_phase_field() {
+        // Forward-compat: old history files predate per_phase_crashes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let json = serde_json::json!({
+            "crash_epochs": [now_epoch - 10],
+            "total_restarts": 1,
+            "window_secs": 900,
+            "last_healthy_epoch": null,
+        });
+        let gw_dir = dir.path().join(".gw");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        std::fs::write(gw_dir.join("crash-history.json"), json.to_string()).unwrap();
+
+        let mut d = CrashLoopDetector::new(5, 900, 1800);
+        d.load_history(dir.path());
+        assert_eq!(d.total_restarts(), 1);
+        assert_eq!(d.crashes_for_phase("any"), 0); // empty map default
     }
 
     #[test]

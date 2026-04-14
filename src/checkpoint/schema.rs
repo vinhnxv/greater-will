@@ -522,6 +522,75 @@ impl Checkpoint {
             .is_some_and(|p| p.status == "completed" || p.status == "skipped")
     }
 
+    /// Conservative "is the pipeline plausibly finishing right now?" check.
+    ///
+    /// Used as a verification gate before any monitor path returns
+    /// `Completed` from a soft signal — pane text match, loop-state
+    /// deactivation, or a stale `is_complete()` result (e.g. an
+    /// `auto_merge=false` checkpoint where `merge.status = skipped`
+    /// from the start would otherwise look "complete" at phase 1).
+    ///
+    /// Returns true only when at least one of:
+    /// - The terminal phase is completed or skipped
+    ///   ([`Self::is_terminal_phase_completed`]).
+    /// - The inferred current phase is at or past `ship` — the last
+    ///   four phases (ship, bot_review_wait, pr_comment_resolution,
+    ///   merge) are where completion signals can race ahead of
+    ///   checkpoint finalisation, so pane-text completions there are
+    ///   trustworthy.
+    ///
+    /// Anything earlier (forge, work, test, mend, …) is rejected:
+    /// a "pipeline completed" phrase appearing in pane output during
+    /// forge almost certainly came from an agent discussing the plan,
+    /// not from gw having actually finished.
+    ///
+    /// # Trade-off
+    /// This gate *delays* real completions at most one monitor tick
+    /// when the pane races ahead of the checkpoint — the next tick
+    /// re-reads both and converges. It never *prevents* a real
+    /// completion from being detected eventually.
+    pub fn is_near_completion(&self) -> bool {
+        use crate::checkpoint::phase_order::phase_index;
+
+        // Strong signal 1: Rune wrote an explicit completion timestamp.
+        if self.completed_at.is_some() {
+            return true;
+        }
+
+        // Strong signal 2: every known phase has reached a terminal
+        // status. This is materially stronger than
+        // `is_terminal_phase_completed` — the latter accepts a
+        // pre-populated `merge: skipped` even when earlier phases are
+        // still "pending" (the exact gap that masked the forge-phase
+        // false-completion bug on auto_merge=false runs).
+        if !self.phases.is_empty()
+            && self.phases.values().all(|p| {
+                p.status == "completed" || p.status == "skipped"
+            })
+        {
+            return true;
+        }
+
+        // Weak signal: the INFERRED current phase (not the often-stale
+        // `phase_sequence`) has reached the final stretch. "ship" is
+        // the first of the terminal phases (ship, bot_review_wait,
+        // pr_comment_resolution, merge) where pane-text completion
+        // signals can legitimately race ahead of checkpoint
+        // finalisation.
+        //
+        // Intentionally does NOT short-circuit on
+        // `is_terminal_phase_completed`: `auto_merge=false` pre-writes
+        // `merge: skipped` at run creation, so a skipped-merge alone
+        // does not prove the pipeline has progressed.
+        let ship_idx = match phase_index("ship") {
+            Some(i) => i,
+            None => return false, // PHASE_ORDER drift — be conservative.
+        };
+        self.inferred_phase_name()
+            .and_then(phase_index)
+            .is_some_and(|idx| idx >= ship_idx)
+    }
+
     /// Check if a phase is in the skip_map (will be auto-skipped by Rune).
     ///
     /// A phase in skip_map is "pending" in the phases map but will be
@@ -1331,6 +1400,121 @@ mod tests {
             ..Default::default()
         });
         assert!(!cp.is_terminal_phase_completed());
+    }
+
+    // ── is_near_completion guard tests ──────────────────────────────
+    //
+    // These tests pin the gate that protects against the forge-phase
+    // false-completion bug (gw logs 6ddbe6aa). `is_complete` accepts
+    // `merge: skipped` from the start, so it cannot be trusted alone.
+    // `is_near_completion` cross-checks the inferred current phase.
+
+    #[test]
+    fn test_is_near_completion_rejects_forge_phase() {
+        // The exact scenario from the bug report: run is in `forge` but
+        // some signal claims completion. `auto_merge=false` may even
+        // have pre-populated `merge: skipped`, which would make
+        // `is_complete` return true. The gate must still reject.
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".to_string(), PhaseStatus {
+            status: "in_progress".to_string(),
+            started_at: Some("2026-04-14T21:35:25Z".to_string()),
+            ..Default::default()
+        });
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "skipped".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            cp.is_complete(),
+            "is_complete returns true because merge is skipped — this is the bug surface"
+        );
+        assert!(
+            !cp.is_near_completion(),
+            "is_near_completion must still reject because current phase is forge"
+        );
+    }
+
+    #[test]
+    fn test_is_near_completion_accepts_ship_phase() {
+        // From ship onwards, pane-text completion signals are trusted
+        // (final stretch — pane can legitimately race ahead of
+        // checkpoint finalisation).
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("ship".to_string(), PhaseStatus {
+            status: "in_progress".to_string(),
+            started_at: Some("2026-04-14T22:00:00Z".to_string()),
+            ..Default::default()
+        });
+        assert!(cp.is_near_completion());
+    }
+
+    #[test]
+    fn test_is_near_completion_accepts_when_all_phases_done() {
+        // When every phase is completed or skipped, the pipeline
+        // definitively finished — this is the "strong signal 2" path
+        // in is_near_completion, independent of inferred phase.
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+        let mut cp = Checkpoint::default();
+        for &phase in PHASE_ORDER {
+            cp.phases.insert(phase.to_string(), PhaseStatus {
+                status: "completed".to_string(),
+                ..Default::default()
+            });
+        }
+        assert!(cp.is_near_completion());
+    }
+
+    #[test]
+    fn test_is_near_completion_accepts_when_completed_at_set() {
+        // `completed_at` is Rune's explicit "pipeline done" marker.
+        let mut cp = Checkpoint::default();
+        cp.completed_at = Some("2026-04-14T22:30:00Z".to_string());
+        assert!(cp.is_near_completion());
+    }
+
+    #[test]
+    fn test_is_near_completion_rejects_terminal_skipped_with_pending_earlier() {
+        // The exact auto_merge=false + pre-populated `merge: skipped`
+        // gap. Even though is_terminal_phase_completed() == true, we
+        // have pending phases BEFORE the terminal one → not done.
+        let cp = checkpoint_merge_done_but_pending_earlier();
+        assert!(
+            cp.is_terminal_phase_completed(),
+            "sanity: helper produces a checkpoint where terminal is skipped/completed"
+        );
+        // But the inferred phase lands on a pending earlier phase, and
+        // not every phase is completed → is_near_completion rejects.
+        assert!(
+            !cp.is_near_completion(),
+            "pre-populated terminal skip with pending earlier phases must not count as near-completion"
+        );
+    }
+
+    #[test]
+    fn test_is_near_completion_rejects_mid_pipeline_phases() {
+        // Spot-check a few mid-pipeline phases — none should pass.
+        for phase in ["work", "test", "mend", "code_review", "gap_analysis"] {
+            let mut cp = Checkpoint::default();
+            cp.phases.insert(phase.to_string(), PhaseStatus {
+                status: "in_progress".to_string(),
+                started_at: Some("2026-04-14T22:00:00Z".to_string()),
+                ..Default::default()
+            });
+            assert!(
+                !cp.is_near_completion(),
+                "phase '{}' should be rejected as not near-completion",
+                phase,
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_near_completion_rejects_empty_checkpoint() {
+        // Empty checkpoint — no inferred phase, no terminal phase data.
+        // Must reject (conservative default).
+        let cp = Checkpoint::default();
+        assert!(!cp.is_near_completion());
     }
 
     #[test]

@@ -708,10 +708,15 @@ async fn handle_monitor_outcome(
             }
 
             // Feed ALL recovery paths through CrashLoopDetector (P1: unified budget)
-            let (repo_dir, plan_path, config_dir) = {
+            let (repo_dir, plan_path, config_dir, current_phase) = {
                 let reg = registry.lock().await;
                 match reg.get(run_id) {
-                    Some(e) => (e.repo_dir.clone(), e.plan_path.clone(), e.config_dir.clone()),
+                    Some(e) => (
+                        e.repo_dir.clone(),
+                        e.plan_path.clone(),
+                        e.config_dir.clone(),
+                        e.current_phase.clone(),
+                    ),
                     None => return,
                 }
             };
@@ -734,7 +739,9 @@ async fn handle_monitor_outcome(
             };
             detector.record_healthy_runtime(run_uptime);
 
-            match detector.record_restart() {
+            // Phase-aware retry ceiling (DET-7): attribute this crash to
+            // the run's current phase so per-phase budgets apply.
+            match detector.record_restart_for_phase(current_phase.as_deref()) {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
                     let _ = reg.update_status(
@@ -816,10 +823,15 @@ async fn handle_monitor_outcome(
             // where only "cooldown 60s" appeared without explaining WHY).
             append_event(run_id, outcome_kind, &reason);
 
-            let (repo_dir, plan_path, config_dir) = {
+            let (repo_dir, plan_path, config_dir, current_phase) = {
                 let reg = registry.lock().await;
                 match reg.get(run_id) {
-                    Some(e) => (e.repo_dir.clone(), e.plan_path.clone(), e.config_dir.clone()),
+                    Some(e) => (
+                        e.repo_dir.clone(),
+                        e.plan_path.clone(),
+                        e.config_dir.clone(),
+                        e.current_phase.clone(),
+                    ),
                     None => return,
                 }
             };
@@ -839,7 +851,9 @@ async fn handle_monitor_outcome(
             };
             detector.record_healthy_runtime(run_uptime);
 
-            match detector.record_restart() {
+            // Phase-aware retry ceiling (DET-7): attribute this crash
+            // to the run's current phase so per-phase budgets apply.
+            match detector.record_restart_for_phase(current_phase.as_deref()) {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
                     let _ = reg.update_status(
