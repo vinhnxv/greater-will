@@ -48,6 +48,7 @@ pub(crate) fn run_session_attempt(
     cleanup::pre_phase_cleanup("single", "0")?;
 
     // Clear signal files from previous session
+    #[allow(deprecated)]
     crate::commands::elden::clear_signals();
 
     // Spawn session
@@ -268,6 +269,7 @@ pub(crate) fn monitor_session(
         // Action: log the signal, route through unified kill gate (5 min wait).
         // The kill gate will cancel if any recovery signal appears.
         if let Some(signal) = crate::commands::elden::read_stop_failure_signal() {
+            #[allow(deprecated)]
             crate::commands::elden::clear_signals();
 
             let signal_session = signal.get("session_id")

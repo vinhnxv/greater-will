@@ -36,18 +36,13 @@ const DEFAULT_MAX_SCHEDULED_RUNS: usize = 2;
 /// Shared via `Arc<tokio::sync::RwLock<NetworkState>>` — read-heavy
 /// (every heartbeat tick + every `gw ps` query), write-rare (only
 /// probe updates). RwLock avoids reader-writer contention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkState {
     /// Network is available.
+    #[default]
     Online,
     /// Connectivity lost at this timestamp. Probing every 30s.
     WaitingForNetwork { since: DateTime<Utc> },
-}
-
-impl Default for NetworkState {
-    fn default() -> Self {
-        Self::Online
-    }
 }
 
 impl std::fmt::Display for NetworkState {
@@ -122,6 +117,19 @@ pub fn ensure_dirs(base: &Path) -> Result<()> {
 }
 
 /// Create the standard directory hierarchy under GW_HOME.
+/// Cross-module test serialization lock for `GW_HOME` env-var mutation.
+///
+/// Every `daemon::*` test module that creates a temporary `GW_HOME` must
+/// hold this mutex while the env var is mutated. Without a shared lock,
+/// test modules serialize among themselves but race against each other —
+/// producing sporadic "No such file or directory" failures when one test
+/// reads `GW_HOME` mid-way through another's teardown.
+#[cfg(test)]
+pub(crate) fn gw_home_test_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub fn ensure_gw_home() -> Result<PathBuf> {
     let home = gw_home();
     ensure_dirs(&home)?;

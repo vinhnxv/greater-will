@@ -1121,15 +1121,16 @@ pub(crate) async fn drain_if_available(
 
     if let Some(pending) = next {
         let registry = Arc::clone(&registry);
-        let plan_path = pending.plan_path.clone();
+        // Preserve values needed in the error branch BEFORE moving `pending`
+        // into `spawn_queued_run`. The run_id is needed to mark the ghost
+        // RunEntry Failed so it doesn't linger as a Queued row in `gw ps`.
+        let pending_run_id = pending.run_id.clone();
         let repo_dir = pending.repo_dir.clone();
-        let session_name = pending.session_name.or_else(|| Some(format!("gw-{}", &pending.run_id)));
-        let config_dir = pending.config_dir.clone();
         let verbose = pending.verbose;
 
         tokio::spawn(async move {
-            match crate::daemon::executor::spawn_run(
-                Arc::clone(&registry), &plan_path, &repo_dir, session_name, config_dir, verbose,
+            match crate::daemon::executor::spawn_queued_run(
+                Arc::clone(&registry), pending, verbose,
             )
             .await
             {
@@ -1138,17 +1139,29 @@ pub(crate) async fn drain_if_available(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to spawn drained run — recording failure");
-                    // Record failure so circuit breaker tracks it, then try next entry
                     let mut reg = registry.lock().await;
+                    // Ensure the still-Queued RunEntry is cleared. Two cases:
+                    //   1. Pre-flight failed → entry stays Queued, lock never
+                    //      acquired. update_status(Failed) marks it terminal.
+                    //   2. promote_queued or later step failed → entry may
+                    //      still be Queued with lock held. update_status
+                    //      releases the lock via its Failed branch.
+                    // Without this, `drain_next` already popped the PendingRun
+                    // so the entry would ghost as "queued" forever.
+                    let _ = reg.update_status(
+                        &pending_run_id,
+                        RunStatus::Failed,
+                        None,
+                        Some(format!("drain spawn failed: {e}")),
+                    );
                     reg.record_queue_failure(&repo_dir);
                     let next = reg.drain_next(&repo_dir);
                     drop(reg);
                     if let Some(retry) = next {
                         tracing::info!("retrying with next queued run after spawn failure");
-                        let _ = crate::daemon::executor::spawn_run(
-                            registry, &retry.plan_path, &retry.repo_dir,
-                            retry.session_name.or_else(|| Some(format!("gw-{}", &retry.run_id))),
-                            retry.config_dir, retry.verbose,
+                        let retry_verbose = retry.verbose;
+                        let _ = crate::daemon::executor::spawn_queued_run(
+                            registry, retry, retry_verbose,
                         ).await;
                     }
                 }
@@ -1165,12 +1178,10 @@ mod tests {
 
     #[tokio::test]
     async fn server_accepts_and_responds() {
-        // Set up GW_HOME under the serializing mutex (sync section)
+        // Set up GW_HOME under the shared cross-module mutex so this
+        // server test doesn't race against registry/reconciler tests.
         let tmp = {
-            use std::sync::{Mutex as StdMutex, OnceLock};
-            static MUTEX: OnceLock<StdMutex<()>> = OnceLock::new();
-            let _guard = MUTEX
-                .get_or_init(|| StdMutex::new(()))
+            let _guard = crate::daemon::state::gw_home_test_mutex()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let tmp = TempDir::new().unwrap();

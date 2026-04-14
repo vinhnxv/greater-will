@@ -433,6 +433,10 @@ pub fn is_permission_pending_from(base_dir: &Path) -> bool {
 }
 
 /// Clean up signal files (called before starting a new session).
+#[deprecated(
+    since = "next-release",
+    note = "Use clear_signals_from(repo_dir) instead; the daemon manages multiple repos and the global path is ambiguous."
+)]
 pub fn clear_signals() {
     clear_signals_from(&current_dir_or_default())
 }

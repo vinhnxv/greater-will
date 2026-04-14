@@ -8,7 +8,7 @@
 
 use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::protocol::RunStatus;
-use crate::daemon::registry::RunRegistry;
+use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::network;
 use crate::daemon::state::NetworkState;
+use crate::monitor::loop_state::{read_arc_loop_state, LoopStateRead};
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -40,6 +41,31 @@ pub(crate) struct MonitorHandle {
     pub(crate) cancel: CancellationToken,
 }
 
+/// Per-run detection state for stage-transition logging.
+///
+/// Tracks what the daemon has already observed for each run so events
+/// fire only on *transitions*, not every heartbeat tick. Pruned when the
+/// run reaches a terminal state (see `prune_detection_state`).
+#[derive(Debug, Default, Clone)]
+// TODO(Patch-2): Wire event emission using detection_state fields in read_phase_via_loop_state.
+// Once wired, remove this #[allow(dead_code)] — all fields will be actively read/written.
+#[allow(dead_code)]
+struct DetectionSnapshot {
+    /// Whether an Active loop state has been seen at least once for this run.
+    loop_state_seen_once: bool,
+    /// Whether the `waiting_loop_state` event has been logged (fire-once).
+    waiting_loop_state_logged: bool,
+    /// Last observed loop state — used for `diff()`-based change detection.
+    last_loop_state: Option<crate::monitor::loop_state::ArcLoopState>,
+    /// Last resolved checkpoint path — for detecting path changes.
+    last_checkpoint_path: Option<std::path::PathBuf>,
+    /// Last effective phase name — for `phase_change` event dedup.
+    last_effective_phase: Option<String>,
+    /// Throttle for `checkpoint_missing` events (once per 60s per run).
+    /// Uses `Instant` (monotonic) to avoid issues with system clock changes.
+    last_checkpoint_missing_log: Option<std::time::Instant>,
+}
+
 /// Heartbeat monitor that watches over active runs.
 ///
 /// Spawns a background tokio task that periodically:
@@ -49,16 +75,17 @@ pub(crate) struct MonitorHandle {
 /// 4. Delegates crash recovery to [`handle_monitor_outcome`]
 /// ## Lock ordering convention (BACK-011)
 ///
-/// This module uses two `tokio::sync::Mutex`es: `registry` and `monitors`.
-/// They must **never be held simultaneously** — always acquire one, extract
-/// what you need, `drop` it, then acquire the other. The canonical order
-/// when both are needed in sequence is:
+/// This module uses three `tokio::sync::Mutex`es: `registry`, `monitors`,
+/// and `detection_state`. They must **never be held simultaneously** —
+/// always acquire one, extract what you need, `drop` it, then acquire
+/// the other. The canonical order when multiple are needed in sequence is:
 ///
 /// 1. `registry` — snapshot data, then drop
 /// 2. `monitors` — mutate monitor handles, then drop
+/// 3. `detection_state` — mutate per-run detection snapshots, then drop
 ///
 /// `executor.rs::stop_run` follows the same convention. Violating this
-/// (holding both locks at once) creates an AB/BA deadlock risk with
+/// (holding multiple locks at once) creates an AB/BA deadlock risk with
 /// concurrent stop_run calls.
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
@@ -71,8 +98,12 @@ pub struct HeartbeatMonitor {
     /// re-parsing env vars on every heartbeat tick (BACK-002).
     watchdog: WatchdogConfig,
     /// Shared network state for internet recovery.
-    /// Lock ordering: registry → network_state → monitors.
+    /// Lock ordering: registry → network_state → monitors → detection_state.
     network_state: Arc<RwLock<NetworkState>>,
+    /// Per-run detection state for stage-transition logging.
+    /// Map key: run_id. Value: last observed snapshot.
+    /// Lock ordering: acquire AFTER monitors (lowest priority lock).
+    detection_state: Arc<Mutex<HashMap<String, DetectionSnapshot>>>,
 }
 
 impl HeartbeatMonitor {
@@ -88,6 +119,7 @@ impl HeartbeatMonitor {
             global_cancel,
             watchdog: WatchdogConfig::from_env(),
             network_state,
+            detection_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -109,6 +141,25 @@ impl HeartbeatMonitor {
         if let Some(handle) = monitors.remove(run_id) {
             handle.cancel.cancel();
         }
+    }
+
+    /// Remove detection state entries for stopped runs and orphaned run_ids.
+    ///
+    /// Called after `monitors.retain()` on every heartbeat tick. Removes:
+    /// 1. Entries whose run_id is in the `stopped` list (normal terminal path).
+    /// 2. Entries whose run_id is not in `active_run_ids` (defensive — handles
+    ///    external removal via `gw rm` or registry mutation outside heartbeat).
+    async fn prune_detection_state(
+        &self,
+        stopped: &[String],
+        active_run_ids: &std::collections::HashSet<&String>,
+    ) {
+        let mut det = self.detection_state.lock().await;
+        for run_id in stopped {
+            det.remove(run_id);
+        }
+        // Defensive: prune orphaned entries not in active registry
+        det.retain(|id, _| active_run_ids.contains(id));
     }
 
     /// Start the heartbeat loop as a background tokio task.
@@ -263,7 +314,16 @@ impl HeartbeatMonitor {
         // Prune finished handles (outcome already processed)
         monitors.retain(|_, h| !h.join.is_finished());
 
+        // Collect active run_ids so we can prune orphaned detection state.
+        let active_run_ids: std::collections::HashSet<&String> =
+            running.iter().map(|(id, _, _)| id).collect();
+
         drop(monitors);
+
+        // Prune detection state for stopped runs and orphaned entries whose
+        // run_id has no corresponding registry entry (defensive — handles
+        // external removal via `gw rm`).
+        self.prune_detection_state(&stopped, &active_run_ids).await;
 
         // Lightweight phase tracking for `gw ps` — runs on every tick
         // independently of the per-run monitors.
@@ -340,19 +400,22 @@ impl HeartbeatMonitor {
     /// Update the run's current phase from checkpoint.json (ground truth),
     /// falling back to pane content heuristics when no checkpoint is available.
     async fn update_phase_from_pane(&self, run_id: &str, pane_content: &str) {
-        // Try checkpoint.json first — this is the authoritative source
-        let checkpoint_phase = self.read_phase_from_checkpoint(run_id).await;
+        // Try loop-state → checkpoint first — this is the authoritative source
+        let checkpoint_phase = self.read_phase_via_loop_state(run_id).await;
         // Capture whether the checkpoint independently confirms completion,
         // BEFORE we move `checkpoint_phase` into the phase-update path below.
         // Used later as a cross-check gate against pane-text false positives
         // (Claude writing documentation containing "arc completed", etc.).
         let cp_confirms_completion = checkpoint_phase.as_deref() == Some("complete");
 
-        // Fall back to pane heuristics only when checkpoint is unavailable
-        let phase = if let Some(cp_phase) = checkpoint_phase {
-            Some(cp_phase)
+        // Fall back to pane heuristics only when checkpoint is unavailable.
+        // Track whether the phase came from checkpoint (which already emitted
+        // the enriched phase_change event) or from heuristics (which needs a
+        // separate event).
+        let (phase, from_checkpoint) = if let Some(cp_phase) = checkpoint_phase {
+            (Some(cp_phase), true)
         } else {
-            phase_from_pane_heuristic(pane_content)
+            (phase_from_pane_heuristic(pane_content), false)
         };
 
         if let Some(phase_name) = phase {
@@ -381,7 +444,12 @@ impl HeartbeatMonitor {
                 }
 
                 drop(registry);
-                append_event(run_id, "phase_change", &phase_name);
+                // Only emit phase_change from here when the phase came from
+                // pane heuristics. Checkpoint-sourced phases already emitted
+                // the enriched phase_change event inside read_phase_via_loop_state.
+                if !from_checkpoint {
+                    append_event(run_id, "phase_change", &phase_name);
+                }
             } else {
                 drop(registry);
             }
@@ -448,31 +516,177 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Read the current phase directly from checkpoint.json in the repo.
+    /// Read the current phase from the authoritative checkpoint pointed to by
+    /// `.rune/arc-phase-loop.local.md`. No directory scanning — matches
+    /// `engine/single_session/util.rs::current_phase_from_checkpoint`.
     ///
-    /// This is the ground truth — it knows the exact phase name from the 41-phase
-    /// PHASE_ORDER, not just the 5 coarse buckets from pane heuristics.
-    async fn read_phase_from_checkpoint(&self, run_id: &str) -> Option<String> {
+    /// Returns:
+    /// - `Some(phase_name)` when loop state is Active AND checkpoint is readable
+    ///   AND `infer_phase_position().effective_phase()` yields a phase.
+    /// - `None` when loop state is Missing, Inactive, or checkpoint path does not
+    ///   exist yet (early arc bootstrap).
+    ///
+    /// Emits structured events via `append_event` on stage transitions:
+    /// - `waiting_loop_state`: once per run when loop state is Missing
+    /// - `loop_state_appeared`: once per run when Active first seen
+    /// - `loop_state_changed`: on field-level diffs (anomalous diffs use `warn!`)
+    /// - `checkpoint_missing`: throttled once per 60s when checkpoint not on disk
+    /// - `checkpoint_read_failed`: every read error (message truncated to 200 chars)
+    /// - `phase_change`: enriched with from/to/arc_id/iteration/checkpoint path
+    async fn read_phase_via_loop_state(&self, run_id: &str) -> Option<String> {
         let repo_dir = {
             let registry = self.registry.lock().await;
             registry.get(run_id).map(|e| e.repo_dir.clone())?
         };
 
-        // Scan .rune/arc/*/checkpoint.json for the most recent checkpoint
-        let arc_dir = repo_dir.join(".rune").join("arc");
-        let checkpoint_path = find_latest_checkpoint(&arc_dir)?;
+        let loop_state_read = read_arc_loop_state(&repo_dir);
+
+        let state = match loop_state_read {
+            LoopStateRead::Missing => {
+                // Emit waiting_loop_state once per run
+                let mut det = self.detection_state.lock().await;
+                let snap = det.entry(run_id.to_string()).or_default();
+                if !snap.waiting_loop_state_logged {
+                    snap.waiting_loop_state_logged = true;
+                    drop(det);
+                    info!(run_id = %run_id, "loop state missing — waiting for arc to initialize");
+                    append_event(run_id, "waiting_loop_state", "arc-phase-loop.local.md not found yet");
+                }
+                return None;
+            }
+            LoopStateRead::Inactive => {
+                debug!(run_id = %run_id, "loop state inactive — no phase from checkpoint");
+                return None;
+            }
+            LoopStateRead::Active(s) => s,
+        };
+
+        // Emit loop_state_appeared (once per run) and loop_state_changed (on diffs)
+        {
+            let mut det = self.detection_state.lock().await;
+            let snap = det.entry(run_id.to_string()).or_default();
+
+            if !snap.loop_state_seen_once {
+                snap.loop_state_seen_once = true;
+                let msg = format!(
+                    "loop state active: iteration {}/{} plan={} branch={}",
+                    state.iteration, state.max_iterations, state.plan_file, state.branch,
+                );
+                snap.last_loop_state = Some(state.clone());
+                drop(det);
+                info!(run_id = %run_id, "{}", msg);
+                append_event(run_id, "loop_state_appeared", &msg);
+            } else if let Some(ref prev) = snap.last_loop_state {
+                let changes = prev.diff(&state);
+                if !changes.is_empty() {
+                    let has_anomaly = changes.iter().any(|c| c.anomalous);
+                    let change_desc: Vec<String> = changes
+                        .iter()
+                        .map(|c| format!("{}={} → {}", c.field, c.old_value, c.new_value))
+                        .collect();
+                    let msg = change_desc.join(", ");
+                    if has_anomaly {
+                        warn!(run_id = %run_id, "loop state changed (anomalous): {}", msg);
+                    } else {
+                        info!(run_id = %run_id, "loop state changed: {}", msg);
+                    }
+                    snap.last_loop_state = Some(state.clone());
+                    drop(det);
+                    append_event(run_id, "loop_state_changed", &msg);
+                } else {
+                    drop(det);
+                }
+            } else {
+                snap.last_loop_state = Some(state.clone());
+                drop(det);
+            }
+        }
+
+        let checkpoint_path = state.resolve_checkpoint_path(&repo_dir);
+        if !checkpoint_path.exists() {
+            // Throttle checkpoint_missing: once per 60s per run
+            let mut det = self.detection_state.lock().await;
+            let snap = det.entry(run_id.to_string()).or_default();
+            let should_log = match snap.last_checkpoint_missing_log {
+                None => true,
+                Some(last) => last.elapsed() >= Duration::from_secs(60),
+            };
+            if should_log {
+                snap.last_checkpoint_missing_log = Some(std::time::Instant::now());
+                drop(det);
+                info!(
+                    run_id = %run_id,
+                    path = %checkpoint_path.display(),
+                    "checkpoint file not on disk yet"
+                );
+                append_event(
+                    run_id,
+                    "checkpoint_missing",
+                    &format!("checkpoint not found: {}", checkpoint_path.display()),
+                );
+            }
+            return None;
+        }
 
         match crate::checkpoint::reader::read_checkpoint(&checkpoint_path) {
             Ok(cp) => {
                 let position = cp.infer_phase_position();
-                Some(position.effective_phase()?.to_string())
+                let phase = position.effective_phase()?.to_string();
+
+                // Enriched phase_change event: emit only on transitions
+                let mut det = self.detection_state.lock().await;
+                let snap = det.entry(run_id.to_string()).or_default();
+                let prev_phase = snap.last_effective_phase.clone();
+                if prev_phase.as_deref() != Some(&phase) {
+                    snap.last_effective_phase = Some(phase.clone());
+                    snap.last_checkpoint_path = Some(checkpoint_path.clone());
+                    drop(det);
+
+                    let from = prev_phase.as_deref().unwrap_or("(none)");
+                    let arc_id = state.arc_id().unwrap_or("unknown");
+                    let msg = format!(
+                        "phase: {} → {} [arc_id={} iteration={}/{} checkpoint={}]",
+                        from, phase, arc_id,
+                        state.iteration, state.max_iterations,
+                        checkpoint_path.display(),
+                    );
+                    info!(run_id = %run_id, "{}", msg);
+                    // phase_change event name preserved for backward compat with
+                    // history.rs formatter — payload is enriched, not renamed.
+                    append_event(run_id, "phase_change", &msg);
+                }
+
+                Some(phase)
             }
             Err(e) => {
-                debug!(run_id = %run_id, error = %e, "failed to read checkpoint");
+                let err_msg = format!("{}", e);
+                let truncated = if err_msg.len() > 200 { &err_msg[..200] } else { &err_msg };
+                info!(run_id = %run_id, error = %truncated, "failed to read checkpoint");
+                append_event(
+                    run_id,
+                    "checkpoint_read_failed",
+                    &format!("error reading checkpoint: {}", truncated),
+                );
                 None
             }
         }
     }
+}
+
+// ── Uptime helpers ───────────────────────────────────────────────
+
+/// Compute uptime for the current session cycle.
+///
+/// Uses `last_recovery_at` if set (from a previous error recovery),
+/// otherwise falls back to `started_at` for the initial session.
+/// This ensures the crash-loop detector's budget resets correctly
+/// per recovery cycle, not across the lifetime of all crashes.
+fn compute_run_uptime_secs(entry: &RunEntry) -> u64 {
+    let session_start = entry.last_recovery_at.unwrap_or(entry.started_at);
+    chrono::Utc::now()
+        .signed_duration_since(session_start)
+        .num_seconds()
+        .max(0) as u64
 }
 
 // ── Structured event logging ───────────────────────────────────────
@@ -730,12 +944,7 @@ async fn handle_monitor_outcome(
             // multiple recovery cycles (FLAW-001 fix).
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id)
-                    .map(|e| {
-                        let session_start = e.last_recovery_at.unwrap_or(e.started_at);
-                        chrono::Utc::now().signed_duration_since(session_start).num_seconds().max(0) as u64
-                    })
-                    .unwrap_or(0)
+                reg.get(run_id).map(compute_run_uptime_secs).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 
@@ -845,9 +1054,7 @@ async fn handle_monitor_outcome(
             // If so, reset crash counters before recording this new crash.
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id)
-                    .map(|e| chrono::Utc::now().signed_duration_since(e.started_at).num_seconds().max(0) as u64)
-                    .unwrap_or(0)
+                reg.get(run_id).map(compute_run_uptime_secs).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 
@@ -1144,7 +1351,7 @@ fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
             // Extract phase name after "executing phase: "
             if let Some(phase_start) = rest.find("executing phase:") {
                 let after = &rest[phase_start + "executing phase:".len()..];
-                let phase = after.trim().split_whitespace().next()?;
+                let phase = after.split_whitespace().next()?;
                 return Some(phase.to_string());
             }
         }
@@ -1169,27 +1376,6 @@ fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
     }
 }
 
-/// Find the most recently modified checkpoint.json under .rune/arc/*/
-fn find_latest_checkpoint(arc_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !arc_dir.is_dir() {
-        return None;
-    }
-
-    std::fs::read_dir(arc_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let cp = e.path().join("checkpoint.json");
-            if cp.exists() {
-                let mtime = std::fs::metadata(&cp).ok()?.modified().ok()?;
-                Some((cp, mtime))
-            } else {
-                None
-            }
-        })
-        .max_by_key(|(_, mtime)| *mtime)
-        .map(|(path, _)| path)
-}
 
 // BACK-006: Legacy diagnose_session_death and diagnose_tmux_server_death
 // removed (~180 lines of dead code). DaemonRunMonitor performs its own
@@ -1505,4 +1691,5 @@ mod tests {
     fn heuristic_returns_none_on_empty() {
         assert_eq!(phase_from_pane_heuristic(""), None);
     }
+
 }

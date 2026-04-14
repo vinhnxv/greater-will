@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::watchdog::WatchdogConfig;
+use crate::daemon::heartbeat::append_event;
 use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::engine::monitor_constants::{
     COMPLETION_GRACE_SECS, DAEMON_MIN_COMPLETION_AGE_SECS as MIN_COMPLETION_AGE_SECS,
@@ -49,6 +50,7 @@ use crate::engine::single_session::util::{
 use crate::monitor::loop_state::{read_arc_loop_state, ArcLoopState};
 use crate::monitor::phase_nav;
 use crate::monitor::prompt_accept::PromptAcceptor;
+use crate::session::spawn;
 
 // Constants are now sourced from `crate::engine::monitor_constants` — see the
 // module docstring there for divergence rationale (DAEMON vs FOREGROUND
@@ -202,6 +204,12 @@ pub struct DaemonRunMonitor {
     claude_pid: Option<u32>,
     last_process_gone_at: Option<Instant>,
 
+    // Swarm activity
+    /// Cached swarm activity state (refreshed every 15s).
+    cached_swarm_active: bool,
+    /// Last time swarm activity was checked.
+    last_swarm_check: Instant,
+
     // Prompt handling
     prompt_acceptor: PromptAcceptor,
 
@@ -291,6 +299,8 @@ impl DaemonRunMonitor {
             failed_nudge_count: 0,
             claude_pid: entry.claude_pid,
             last_process_gone_at: None,
+            cached_swarm_active: false,
+            last_swarm_check: now,
             prompt_acceptor,
             last_status_log: now,
             poll_count: 0,
@@ -357,7 +367,7 @@ impl DaemonRunMonitor {
                         self.check_pane_completion(content);
 
                         // 11. Error evidence detection
-                        self.evaluate_error_evidence(content);
+                        self.evaluate_error_evidence(content).await;
                     }
 
                     // Steps below run regardless of pane capture success.
@@ -578,6 +588,23 @@ impl DaemonRunMonitor {
             .await
             .unwrap_or(false)
     }
+
+    /// Refresh cached swarm activity state (15-second poll interval).
+    async fn refresh_swarm_activity(&mut self) {
+        if self.last_swarm_check.elapsed() < std::time::Duration::from_secs(15) {
+            return; // honor cached value
+        }
+        self.last_swarm_check = Instant::now();
+        let prev = self.cached_swarm_active;
+        self.cached_swarm_active = self.check_swarm_active().await;
+        if prev != self.cached_swarm_active {
+            crate::daemon::heartbeat::append_event(
+                &self.run_id,
+                "swarm_state",
+                &format!("active={}", self.cached_swarm_active),
+            );
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -603,17 +630,26 @@ impl DaemonRunMonitor {
             }
         }
 
-        // StopFailure signal (API errors) → route to kill gate
-        if let Some(_signal) =
+        // StopFailure signal (API errors) → classify via pane output, route to kill gate.
+        // Event format: stop_failure_classified → "stop-failure signal [{ErrorClass}]: {summary}"
+        if let Some(signal) =
             crate::commands::elden::read_stop_failure_signal_from(&self.repo_dir)
         {
             crate::commands::elden::clear_signals_from(&self.repo_dir);
             if self.pending_kill.is_none() {
-                // Shard 4/follow-up: classify the signal and inject ErrorClass.
-                // For now, route a generic error to pending_kill.
+                let pane = spawn::capture_pane(&self.tmux_session).unwrap_or_default();
+                let class = ErrorClass::from_pane_output(&pane, false).unwrap_or(ErrorClass::Crash);
+
+                let summary = signal.get("error").and_then(|v| v.as_str())
+                    .or_else(|| signal.get("reason").and_then(|v| v.as_str()))
+                    .unwrap_or("stop-failure signal (no detail)");
+                let reason = format!("stop-failure signal [{:?}]: {}", class, summary);
+
+                crate::daemon::heartbeat::append_event(&self.run_id, "stop_failure_classified", &reason);
+
                 self.pending_kill = Some(PendingKillRequest {
-                    reason: "stop-failure signal received".to_string(),
-                    outcome: KillOutcomeKind::ErrorDetected(ErrorClass::Crash),
+                    reason,
+                    outcome: KillOutcomeKind::ErrorDetected(class),
                     started_at: Instant::now(),
                     nudge_sent: false,
                 });
@@ -883,14 +919,41 @@ impl DaemonRunMonitor {
                     &self.current_profile,
                 );
                 self.phase_started_at = Some(Instant::now());
-                debug!(
+                let prev = self.current_phase.as_deref().unwrap_or("none");
+                let completed = checkpoint.count_by_status("completed");
+                let skipped = checkpoint.count_by_status("skipped");
+                let total = checkpoint.phases.len();
+                let timeout = self.effective_phase_timeout;
+                info!(
                     run_id = %self.run_id,
-                    phase = %phase_name,
+                    from = prev,
+                    to = %phase_name,
+                    category = ?self.current_profile.category,
                     idle_nudge = self.current_profile.idle_nudge_secs,
                     idle_kill = self.current_profile.idle_kill_secs,
-                    phase_timeout = self.effective_phase_timeout,
-                    "phase changed — profile updated"
+                    phase_timeout = timeout,
+                    has_agents = self.current_profile.has_agent_teams,
+                    progress = format!("{}/{} done", completed + skipped, total),
+                    "Phase transition — applying {} profile (timeout={}m)",
+                    self.current_profile.description, timeout / 60,
                 );
+                println!(
+                    "[gw] Phase: {} → {} [{}] (nudge={}s, kill={}s, timeout={}m, {}/{})",
+                    prev, phase_name, self.current_profile.description,
+                    self.current_profile.idle_nudge_secs,
+                    self.current_profile.idle_kill_secs,
+                    timeout / 60,
+                    completed + skipped, total,
+                );
+                let event_msg = format!(
+                    "phase: {} → {} [{}] (nudge={}s, kill={}s, timeout={}m, {}/{})",
+                    prev, phase_name, self.current_profile.description,
+                    self.current_profile.idle_nudge_secs,
+                    self.current_profile.idle_kill_secs,
+                    timeout / 60,
+                    completed + skipped, total,
+                );
+                append_event(&self.run_id, "phase_profile_applied", &event_msg);
             }
             self.current_phase = new_phase;
         }
@@ -994,13 +1057,51 @@ impl DaemonRunMonitor {
             // Per-recovery clock — a freshly-recovered session deserves its
             // own warmup window, not inherited age from prior cycles.
             let age = self.monitor_started_at.elapsed().as_secs();
-            if age >= self.watchdog.loop_state_warmup_secs {
-                // Past warmup. If the screen is idle, this is a bootstrap failure.
-                if self.last_activity.elapsed().as_secs() >= self.watchdog.idle_kill_secs {
-                    return Some(DaemonRunOutcome::Failed {
-                        reason: "bootstrap error: no loop state after warmup".to_string(),
-                    });
-                }
+            let warmup = self.watchdog.loop_state_warmup_secs;
+            let screen_idle = self.last_activity.elapsed().as_secs();
+
+            // Re-read the loop state to distinguish Inactive (stale file from
+            // a prior run) vs Missing (never written). The outer match above
+            // consumed `current_opt` into `None`, but we need the categorical
+            // status to apply the 2× hard limit only to the Inactive case.
+            let loop_state_read = read_arc_loop_state(&self.repo_dir);
+            let stale_file_present = matches!(
+                loop_state_read,
+                crate::monitor::loop_state::LoopStateRead::Inactive,
+            );
+
+            // Path B (stale hard-limit — foreground parity with
+            // monitor.rs:884-910): stale file (active=false from a previous
+            // run) AND screen idle for > 2× warmup → Rune failed to
+            // re-initialize. Treat as BootstrapError so recovery logic runs.
+            //
+            // MUST be evaluated BEFORE Path A: since stale_hard_limit = 2 ×
+            // warmup, any scenario satisfying `age > stale_hard_limit` also
+            // satisfies `age >= warmup`. If Path A ran first, Path B would be
+            // dead code.
+            let stale_hard_limit = warmup.saturating_mul(2);
+            if stale_file_present && age > stale_hard_limit
+                && screen_idle >= self.watchdog.idle_kill_secs
+            {
+                let reason = format!(
+                    "arc-phase-loop.local.md stuck at active=false after {}s \
+                     (hard limit {}s, screen idle {}s)",
+                    age, stale_hard_limit, screen_idle,
+                );
+                append_event(&self.run_id, "stale_loop_state_timeout", &reason);
+                return Some(DaemonRunOutcome::ErrorDetected {
+                    error_class: ErrorClass::BootstrapError,
+                    reason,
+                });
+            }
+
+            // Path A (generic bootstrap timeout): past warmup + screen idle →
+            // bootstrap failure. Fires only when no stale file is present
+            // (Missing case) or when stale_hard_limit hasn't been reached yet.
+            if age >= warmup && screen_idle >= self.watchdog.idle_kill_secs {
+                return Some(DaemonRunOutcome::Failed {
+                    reason: "bootstrap error: no loop state after warmup".to_string(),
+                });
             }
             return None;
         }
@@ -1118,7 +1219,8 @@ impl DaemonRunMonitor {
     /// deferred to Shard 4 — current implementation uses a fixed 0.9 stand-in
     /// confidence. The structural pieces (timer, class-change reset, threshold
     /// floor, kill gate routing) are in place.
-    fn evaluate_error_evidence(&mut self, pane_content: &str) {
+    async fn evaluate_error_evidence(&mut self, pane_content: &str) {
+        self.refresh_swarm_activity().await;
         let screen_stall = self.last_activity.elapsed().as_secs();
 
         // Only scan keywords when screen is NOT changing (reduces false positives).
@@ -1136,8 +1238,7 @@ impl DaemonRunMonitor {
                 .claude_pid
                 .is_none_or(crate::cleanup::process::is_pid_alive),
             artifacts_active: self.last_artifact_activity.elapsed().as_secs() < 60,
-            // Swarm activity is updated by an external task; default false for now.
-            swarm_active: false,
+            swarm_active: self.cached_swarm_active,
         };
 
         match evidence.classify() {
@@ -1152,6 +1253,11 @@ impl DaemonRunMonitor {
                 match self.error_confirm_since {
                     None => {
                         self.error_confirm_since = Some((now, class, confidence));
+                        append_event(
+                            &self.run_id,
+                            "error_confirming",
+                            &format!("error signal detected: {:?} (confidence {:.1})", class, confidence),
+                        );
                     }
                     Some((start, prev_class, _prev_conf)) => {
                         if prev_class != class {
@@ -1165,11 +1271,17 @@ impl DaemonRunMonitor {
                             }
                             .max(KILL_GATE_MIN_SECS);
                             if start.elapsed().as_secs() >= need && self.pending_kill.is_none() {
+                                let reason = format!(
+                                    "error evidence confirmed for {}s (class {:?})",
+                                    need, class
+                                );
+                                append_event(
+                                    &self.run_id,
+                                    "error_confirming",
+                                    &format!("error confirmed: {:?} after {}s", class, need),
+                                );
                                 self.pending_kill = Some(PendingKillRequest {
-                                    reason: format!(
-                                        "error evidence confirmed for {}s (class {:?})",
-                                        need, class
-                                    ),
+                                    reason,
                                     outcome: KillOutcomeKind::ErrorDetected(class),
                                     started_at: now,
                                     nudge_sent: false,
@@ -1426,12 +1538,17 @@ impl DaemonRunMonitor {
 
         let cp_stale = self.last_checkpoint_activity.elapsed().as_secs();
         if cp_stale > LOOP_STALL_WARN_SECS {
+            let msg = format!(
+                "loop state stale {}s, checkpoint stale {}s — arc may be stuck",
+                loop_stall, cp_stale,
+            );
             warn!(
                 run_id = %self.run_id,
                 loop_stall_secs = loop_stall,
                 checkpoint_stale_secs = cp_stale,
                 "loop state AND checkpoint both stale — arc may be stuck"
             );
+            append_event(&self.run_id, "loop_stall", &msg);
         } else {
             debug!(
                 run_id = %self.run_id,

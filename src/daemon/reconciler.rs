@@ -9,8 +9,10 @@ use crate::daemon::drain;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::daemon::state::gw_home;
+use crate::monitor::loop_state::read_arc_loop_state;
 use crate::session::spawn;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -31,13 +33,15 @@ pub struct ReconciliationReport {
     pub respawned: u32,
     /// Total tmux sessions scanned.
     pub sessions_scanned: u32,
+    /// Non-canonical ghost entries resolved by the session-name collision guard.
+    pub collisions_resolved: u32,
 }
 
 impl std::fmt::Display for ReconciliationReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reconciled: {} scanned, {} recovered, {} adopted, {} cleaned, {} auto-resumed, {} respawned, {} failed",
+            "reconciled: {} scanned, {} recovered, {} adopted, {} cleaned, {} auto-resumed, {} respawned, {} failed, {} collisions resolved",
             self.sessions_scanned,
             self.recovered,
             self.adopted,
@@ -45,6 +49,7 @@ impl std::fmt::Display for ReconciliationReport {
             self.auto_resumed,
             self.respawned,
             self.marked_failed,
+            self.collisions_resolved,
         )
     }
 }
@@ -278,6 +283,16 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
         }
     }
 
+    // Step 4.5: Resolve session_name collisions.
+    //
+    // Invariant: at most one non-terminal entry may claim a given
+    // `session_name` ("gw-{run_id}"). The old drain-to-running path
+    // (pre-fix) created two entries sharing a session_name — one canonical
+    // (Queued, id matches the session) and one non-canonical (Running,
+    // fresh id but threaded-through session_name). That state survived
+    // on disk across daemon restarts; this step cleans it up.
+    report.collisions_resolved += resolve_session_name_collisions(registry);
+
     // Step 5: Validate pending queue entries (A7).
     //
     // Check that each queued run's plan_path and repo_dir still exist on disk.
@@ -321,12 +336,142 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
         auto_resumed = report.auto_resumed,
         respawned = report.respawned,
         marked_failed = report.marked_failed,
+        collisions_resolved = report.collisions_resolved,
         "reconciliation complete"
     );
     report
 }
 
+/// Find groups of non-terminal registry entries sharing the same
+/// `session_name`. Returns a map from session_name → Vec<run_id> for every
+/// colliding group (groups of size 1 are excluded).
+///
+/// Only considers `Running` and `Queued` entries — terminal states are
+/// excluded because they no longer hold a tmux claim. The caller resolves
+/// each group by preferring the canonical entry (run_id matches the
+/// `gw-<id>` pattern of session_name).
+fn find_session_name_collisions(
+    registry: &RunRegistry,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for info in registry.list_runs(false) {
+        if !matches!(info.status, RunStatus::Running | RunStatus::Queued) {
+            continue;
+        }
+        groups
+            .entry(info.session_name.clone())
+            .or_default()
+            .push(info.run_id.clone());
+    }
+    groups.retain(|_, ids| ids.len() > 1);
+    groups
+}
+
+/// Resolve every session_name collision by flipping non-canonical entries
+/// to Stopped. Returns the count of entries resolved (for reporting).
+///
+/// Resolution rule — the **canonical owner** of `gw-<id>` is the entry
+/// whose `run_id == <id>`. Non-canonical entries that collide are marked
+/// Stopped with an explicit reason — never Failed, because the tmux
+/// session they share is still owned by the canonical entry and work is
+/// not necessarily lost. If the canonical entry is absent from the group
+/// (no run_id matches the session_name pattern), the collision is left
+/// untouched and a warning is logged — we cannot safely pick a winner.
+///
+/// Extracted from `reconcile` so it can be unit-tested without the
+/// surrounding steps (repo lock re-acquisition, tmux discovery, pending
+/// queue validation) polluting the assertions.
+fn resolve_session_name_collisions(registry: &mut RunRegistry) -> u32 {
+    let collisions = find_session_name_collisions(registry);
+    let mut resolved = 0u32;
+    for (session_name, members) in collisions {
+        let canonical_id = session_name.strip_prefix("gw-").map(str::to_string);
+        let canonical_present = canonical_id
+            .as_deref()
+            .map(|id| members.iter().any(|m| m == id))
+            .unwrap_or(false);
+
+        if !canonical_present {
+            warn!(
+                session_name = %session_name,
+                members = ?members,
+                "session_name collision detected but no canonical owner — leaving untouched"
+            );
+            continue;
+        }
+
+        let canonical_id = canonical_id.expect("verified Some via canonical_present above");
+        for run_id in &members {
+            if *run_id == canonical_id {
+                continue;
+            }
+            warn!(
+                canonical = %canonical_id,
+                ghost = %run_id,
+                session_name = %session_name,
+                "session_name collision: marking non-canonical entry Stopped"
+            );
+            let reason = format!(
+                "session_name '{session_name}' collision with canonical owner '{canonical_id}' — resolved by reconciler"
+            );
+            crate::daemon::heartbeat::append_event(run_id, "collision_stopped", &reason);
+            if let Err(e) = registry.update_status(
+                run_id,
+                RunStatus::Stopped,
+                None,
+                Some(reason),
+            ) {
+                warn!(run_id = %run_id, error = %e, "failed to mark collision loser");
+            } else {
+                resolved += 1;
+                // Reap the non-canonical entry's dedicated tmux session if it has one
+                // separate from the canonical's. Without this, Stopped entries leak
+                // their `gw-<ghost_id>` tmux session forever (bug: observed 2026-04-14).
+                if let Some(entry) = registry.get(run_id) {
+                    if let Some(ghost_tmux) = entry
+                        .tmux_session
+                        .as_deref()
+                        .filter(|t| *t != session_name.as_str())
+                    {
+                        if spawn::has_session(ghost_tmux) {
+                            if let Err(e) = spawn::kill_session(ghost_tmux) {
+                                warn!(run_id = %run_id, tmux = %ghost_tmux, error = %e, "failed to reap ghost tmux");
+                            } else {
+                                debug!(run_id = %run_id, tmux = %ghost_tmux, "reaped ghost tmux on collision");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    resolved
+}
+
 // ── Helper functions ────────────────────────────────────────────────
+
+/// Compare two plan path references that may use different encodings.
+/// Returns true if they resolve to the same plan file under `repo_dir`.
+fn plans_match(a: &str, b: &str, repo_dir: &Path) -> bool {
+    let norm = |s: &str| -> PathBuf {
+        let p = Path::new(s);
+        if p.is_absolute() {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        } else {
+            std::fs::canonicalize(repo_dir.join(p))
+                .unwrap_or_else(|_| repo_dir.join(p))
+        }
+    };
+    let a_n = norm(a);
+    let b_n = norm(b);
+    if a_n == b_n {
+        return true;
+    }
+    // Filename fallback: same basename is a weak match but better than
+    // rejecting on trivial prefix drift (e.g., symlink farms).
+    a_n.file_name() == b_n.file_name() && a_n.file_name().is_some()
+}
 
 /// Try to adopt an orphaned tmux session by loading its meta.json from disk.
 ///
@@ -379,6 +524,31 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
             return Some(run_id.to_string());
         }
     };
+
+    // Plan-match guard: verify the live tmux session is running the plan
+    // we're about to adopt it as. Skip if env var override is set.
+    if std::env::var("GW_DAEMON_SKIP_PLAN_MATCH").ok().as_deref() != Some("1") {
+        let loop_state_read = read_arc_loop_state(&entry.repo_dir);
+        if let Some(state) = loop_state_read.active() {
+            let live_plan = &state.plan_file;
+            let recorded_plan = entry.plan_path.to_string_lossy();
+            if !plans_match(live_plan, &recorded_plan, &entry.repo_dir) {
+                warn!(
+                    run_id = %run_id,
+                    recorded = %recorded_plan,
+                    live = %live_plan,
+                    "refusing to adopt orphan — plan mismatch between meta.json and live arc loop state"
+                );
+                crate::daemon::heartbeat::append_event(
+                    run_id,
+                    "adopt_refused_plan_mismatch",
+                    &format!("recorded={}, live={}", recorded_plan, live_plan),
+                );
+                return Some(run_id.to_string());
+            }
+        }
+        // No loop state file → proceed with adoption (pre-init window)
+    }
 
     // Update the entry to reflect reality: tmux is alive, mark as Running
     entry.tmux_session = Some(tmux_name.to_string());
@@ -554,6 +724,7 @@ mod tests {
             marked_failed: 0,
             respawned: 0,
             sessions_scanned: 5,
+            collisions_resolved: 0,
         };
         let s = format!("{report}");
         assert!(s.contains("5 scanned"));
@@ -568,5 +739,206 @@ mod tests {
         // May or may not be empty depending on test environment,
         // but should not panic
         assert!(sessions.iter().all(|s| s.starts_with("gw-")));
+    }
+
+    // Collision detection / resolution tests. These exercise the
+    // find_session_name_collisions helper and the Step 4.5 loop against
+    // an in-memory RunRegistry directly, so they don't require a tmux
+    // server or real filesystem state beyond a temp GW_HOME.
+    use crate::daemon::registry::{PendingRun, RunRegistry};
+    use chrono::Utc;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Uses the shared `daemon::state::gw_home_test_mutex` so reconciler
+    /// tests serialize against registry/server tests that also mutate
+    /// `GW_HOME`. Per-module mutexes would only serialize within one
+    /// module, leaving cross-module races.
+    fn with_temp_gw_home(f: impl FnOnce(&TempDir)) {
+        let _guard = crate::daemon::state::gw_home_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("GW_HOME", tmp.path()) };
+        crate::daemon::state::ensure_gw_home().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tmp)));
+        unsafe { std::env::remove_var("GW_HOME") };
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn find_session_name_collisions_empty_when_no_duplicates() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let _id = reg
+                .register_run(
+                    PathBuf::from("plans/unique.md"),
+                    PathBuf::from("/tmp/coll-unique"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let groups = find_session_name_collisions(&reg);
+            assert!(groups.is_empty());
+        });
+    }
+
+    #[test]
+    fn find_session_name_collisions_detects_duplicate() {
+        // Reproduces the old-bug state: an enqueued ghost entry sharing
+        // session_name with a freshly-spawned one. Both must be detected.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            // Canonical: run_id matches session_name.
+            let canonical = PendingRun {
+                run_id: "ghost01".into(),
+                plan_path: PathBuf::from("/tmp/plan.md"),
+                repo_dir: PathBuf::from("/tmp/coll-dup"),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(canonical).unwrap();
+            // Non-canonical: fresh run_id but same session_name "gw-ghost01".
+            let id2 = reg
+                .register_run(
+                    PathBuf::from("/tmp/plan.md"),
+                    PathBuf::from("/tmp/coll-dup-2"),
+                    Some("gw-ghost01".into()),
+                    None,
+                )
+                .unwrap();
+
+            let groups = find_session_name_collisions(&reg);
+            let members = groups
+                .get("gw-ghost01")
+                .expect("colliding group must be surfaced");
+            assert_eq!(members.len(), 2);
+            assert!(members.contains(&"ghost01".to_string()));
+            assert!(members.contains(&id2));
+        });
+    }
+
+    #[test]
+    fn resolve_collision_flips_non_canonical_to_stopped() {
+        // Reproduces the user-reported `gw ps` duplicate: a canonical
+        // Queued entry (run_id matches gw-{id}) and a non-canonical
+        // Running entry sharing the same session_name. After resolution,
+        // the non-canonical entry must be Stopped; the canonical must
+        // survive at its pre-resolution status.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let pending = PendingRun {
+                run_id: "ghost02".into(),
+                plan_path: PathBuf::from("/tmp/plan.md"),
+                repo_dir: PathBuf::from("/tmp/coll-res-a"),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(pending).unwrap();
+
+            let non_canonical = reg
+                .register_run(
+                    PathBuf::from("/tmp/plan.md"),
+                    PathBuf::from("/tmp/coll-res-b"),
+                    Some("gw-ghost02".into()),
+                    None,
+                )
+                .unwrap();
+            reg.update_status(&non_canonical, RunStatus::Running, None, None)
+                .unwrap();
+
+            let resolved = resolve_session_name_collisions(&mut reg);
+            assert_eq!(resolved, 1);
+
+            let canonical = reg.get("ghost02").expect("canonical entry must survive");
+            assert_eq!(canonical.status, RunStatus::Queued);
+
+            let loser = reg.get(&non_canonical).expect("loser still in registry");
+            assert_eq!(loser.status, RunStatus::Stopped);
+            assert!(
+                loser
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("collision"),
+                "error_message must explain why it was stopped"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_collision_skips_when_no_canonical_owner() {
+        // Guard: if neither entry's run_id matches the session_name
+        // (e.g., "gw-no-canonical" with run_ids "xyz" and "pqr"), the
+        // reconciler must NOT pick a winner arbitrarily. Both must
+        // survive untouched.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let a = reg
+                .register_run(
+                    PathBuf::from("/tmp/plan.md"),
+                    PathBuf::from("/tmp/no-canon-a"),
+                    Some("gw-no-canonical".into()),
+                    None,
+                )
+                .unwrap();
+            let b = reg
+                .register_run(
+                    PathBuf::from("/tmp/plan.md"),
+                    PathBuf::from("/tmp/no-canon-b"),
+                    Some("gw-no-canonical".into()),
+                    None,
+                )
+                .unwrap();
+
+            let resolved = resolve_session_name_collisions(&mut reg);
+            assert_eq!(resolved, 0);
+            assert_eq!(reg.get(&a).unwrap().status, RunStatus::Queued);
+            assert_eq!(reg.get(&b).unwrap().status, RunStatus::Queued);
+        });
+    }
+
+    #[test]
+    fn resolve_collision_ignores_terminal_states() {
+        // A collision where one entry is already Succeeded/Failed/Stopped
+        // is not a real collision — the terminal entry no longer claims
+        // a tmux session. Must not be touched or counted.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let pending = PendingRun {
+                run_id: "ghost03".into(),
+                plan_path: PathBuf::from("/tmp/plan.md"),
+                repo_dir: PathBuf::from("/tmp/coll-term-a"),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(pending).unwrap();
+            let terminal = reg
+                .register_run(
+                    PathBuf::from("/tmp/plan.md"),
+                    PathBuf::from("/tmp/coll-term-b"),
+                    Some("gw-ghost03".into()),
+                    None,
+                )
+                .unwrap();
+            reg.update_status(&terminal, RunStatus::Succeeded, None, None)
+                .unwrap();
+
+            let resolved = resolve_session_name_collisions(&mut reg);
+            assert_eq!(
+                resolved, 0,
+                "a terminal entry does not count as an active collision"
+            );
+            assert_eq!(reg.get("ghost03").unwrap().status, RunStatus::Queued);
+            assert_eq!(reg.get(&terminal).unwrap().status, RunStatus::Succeeded);
+        });
     }
 }
