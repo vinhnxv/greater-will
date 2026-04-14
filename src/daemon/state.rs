@@ -36,18 +36,13 @@ const DEFAULT_MAX_SCHEDULED_RUNS: usize = 2;
 /// Shared via `Arc<tokio::sync::RwLock<NetworkState>>` — read-heavy
 /// (every heartbeat tick + every `gw ps` query), write-rare (only
 /// probe updates). RwLock avoids reader-writer contention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkState {
     /// Network is available.
+    #[default]
     Online,
     /// Connectivity lost at this timestamp. Probing every 30s.
     WaitingForNetwork { since: DateTime<Utc> },
-}
-
-impl Default for NetworkState {
-    fn default() -> Self {
-        Self::Online
-    }
 }
 
 impl std::fmt::Display for NetworkState {

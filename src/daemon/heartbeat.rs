@@ -944,7 +944,7 @@ async fn handle_monitor_outcome(
             // multiple recovery cycles (FLAW-001 fix).
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id).map(|e| compute_run_uptime_secs(e)).unwrap_or(0)
+                reg.get(run_id).map(compute_run_uptime_secs).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 
@@ -1054,7 +1054,7 @@ async fn handle_monitor_outcome(
             // If so, reset crash counters before recording this new crash.
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id).map(|e| compute_run_uptime_secs(e)).unwrap_or(0)
+                reg.get(run_id).map(compute_run_uptime_secs).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 
@@ -1351,7 +1351,7 @@ fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
             // Extract phase name after "executing phase: "
             if let Some(phase_start) = rest.find("executing phase:") {
                 let after = &rest[phase_start + "executing phase:".len()..];
-                let phase = after.trim().split_whitespace().next()?;
+                let phase = after.split_whitespace().next()?;
                 return Some(phase.to_string());
             }
         }

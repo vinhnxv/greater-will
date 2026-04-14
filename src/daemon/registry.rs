@@ -732,7 +732,7 @@ impl RunRegistry {
         let mut entries = Vec::new();
         let mut position = 1usize;
 
-        for (_hash, queue) in &self.pending_queues {
+        for queue in self.pending_queues.values() {
             for pending in queue {
                 if let Some(filter) = repo_filter {
                     if pending.repo_dir != filter {
