@@ -43,6 +43,8 @@ pub enum ScheduleStatus {
     Completed,
     /// Terminal: the schedule encountered an unrecoverable error.
     Failed,
+    /// Terminal: path validation failed at fire time or during migration.
+    Rejected,
 }
 
 // ── Schedule entry ─────────────────────────────────────────────────
@@ -74,6 +76,9 @@ pub struct ScheduleEntry {
     pub fire_count: u32,
     /// Optional human-readable label.
     pub label: Option<String>,
+    /// Error message when status is `Rejected` (absent in legacy entries).
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 // ── Schedule registry ──────────────────────────────────────────────
@@ -490,6 +495,7 @@ mod tests {
             next_fire: Some(Utc::now() + chrono::Duration::hours(1)),
             fire_count: 0,
             label: Some("test".into()),
+            last_error: None,
         };
 
         let id = reg.add(entry).unwrap();
@@ -517,6 +523,7 @@ mod tests {
             next_fire: None,
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -551,6 +558,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -585,6 +593,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -632,6 +641,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: Some("roundtrip test".into()),
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
