@@ -125,9 +125,26 @@ pub struct DaemonRunMonitor {
     registry: Arc<Mutex<RunRegistry>>,
 
     // Timing
+    //
+    // Two distinct clocks (do not conflate):
+    //
+    // * `run_started_at` — cumulative wall-clock since the run was first
+    //   dispatched (sourced from `entry.started_at`). Persists across
+    //   recovery cycles. Use this ONLY for whole-pipeline budgets like
+    //   `check_pipeline_timeout`.
+    //
+    // * `monitor_started_at` — per-monitor clock, reset to `Instant::now()`
+    //   each time `DaemonRunMonitor::new` is called (i.e. on every recovery).
+    //   This is the daemon-side equivalent of the foreground orchestrator's
+    //   `dispatch_time` (see `single_session/monitor.rs`). Use this for
+    //   "this session age" checks — `MIN_COMPLETION_AGE` gating, bootstrap
+    //   warmup, and any "recently started" disambiguation. Using
+    //   `run_started_at` here was a bug: after recovery the cumulative age
+    //   is already huge, so age-based gates fire at the wrong threshold and
+    //   the recovery cycle inherits the previous cycle's clock. See the
+    //   `min_completion_age_uses_per_recovery_clock` regression test.
     run_started_at: Instant,
-    #[allow(dead_code)]
-    dispatch_time: Instant,
+    monitor_started_at: Instant,
     phase_started_at: Option<Instant>,
 
     // Watchdog config
@@ -136,7 +153,10 @@ pub struct DaemonRunMonitor {
     // Phase tracking
     current_phase: Option<String>,
     current_profile: PhaseProfile,
-    #[allow(dead_code)]
+    /// Per-phase timeout resolved from the current checkpoint
+    /// (`totals.phase_times.{phase}` + grace buffer) at each phase
+    /// transition. Zero means "not yet resolved" — fall back to
+    /// `current_profile.phase_timeout_secs`.
     effective_phase_timeout: u64,
 
     // Idle detection
@@ -242,7 +262,7 @@ impl DaemonRunMonitor {
             config_dir: entry.config_dir.clone(),
             registry,
             run_started_at,
-            dispatch_time: now,
+            monitor_started_at: now,
             phase_started_at: None,
             watchdog,
             current_phase: None,
@@ -635,7 +655,15 @@ impl DaemonRunMonitor {
             None => return,
         };
         let phase_elapsed = started.elapsed().as_secs();
-        let budget = self.current_profile.phase_timeout_secs;
+        // Prefer the checkpoint-resolved per-phase budget (written on
+        // phase transition in `process_loop_state`); fall back to the
+        // category-level profile default only when no transition has
+        // been observed yet (first tick / unknown phase).
+        let budget = if self.effective_phase_timeout > 0 {
+            self.effective_phase_timeout
+        } else {
+            self.current_profile.phase_timeout_secs
+        };
         if phase_elapsed >= budget && self.pending_kill.is_none() {
             let phase_name = self
                 .current_phase
@@ -668,7 +696,13 @@ impl DaemonRunMonitor {
     /// 4. No checkpoint + completion_detected_at → Completed; else Crashed
     async fn check_session_alive(&mut self) -> Option<DaemonRunOutcome> {
         if !self.has_session().await {
-            let age = self.run_started_at.elapsed().as_secs();
+            // Per-recovery clock — see field doc on `monitor_started_at`.
+            // Using `run_started_at` here would inherit the cumulative
+            // wall-clock from previous recovery cycles, defeating the
+            // `MIN_COMPLETION_AGE_SECS` "too young to have completed" gate
+            // and producing misleading "after Xs" reasons that tick across
+            // crashes (4208s -> 4508s -> 4653s in DET-7 reproducer).
+            let age = self.monitor_started_at.elapsed().as_secs();
 
             // Step 1: Too young — can't have legitimately finished yet.
             if age < MIN_COMPLETION_AGE_SECS {
@@ -800,13 +834,25 @@ impl DaemonRunMonitor {
             if let Some(ref phase_name) = new_phase {
                 self.current_profile = phase_profile::profile_for_phase(phase_name)
                     .unwrap_or_else(phase_profile::default_profile);
+                // Resolve per-phase timeout from the checkpoint at
+                // transition time. Reads `totals.phase_times.{phase}`
+                // (Rune's own budget) + grace buffer, falling back to
+                // the profile's category-level default when the
+                // checkpoint has no timing data for this phase.
+                // Parity with the foreground path
+                // (`single_session/monitor.rs:551`).
+                self.effective_phase_timeout = phase_profile::resolve_phase_timeout_full(
+                    phase_name,
+                    &checkpoint,
+                    &self.current_profile,
+                );
                 self.phase_started_at = Some(Instant::now());
                 debug!(
                     run_id = %self.run_id,
                     phase = %phase_name,
                     idle_nudge = self.current_profile.idle_nudge_secs,
                     idle_kill = self.current_profile.idle_kill_secs,
-                    phase_timeout = self.current_profile.phase_timeout_secs,
+                    phase_timeout = self.effective_phase_timeout,
                     "phase changed — profile updated"
                 );
             }
@@ -909,7 +955,9 @@ impl DaemonRunMonitor {
         // current_opt is None → either Inactive (intentional) or Missing (crash).
         if !self.loop_state_ever_seen {
             // Warmup window: the session hasn't produced a state file yet.
-            let age = self.run_started_at.elapsed().as_secs();
+            // Per-recovery clock — a freshly-recovered session deserves its
+            // own warmup window, not inherited age from prior cycles.
+            let age = self.monitor_started_at.elapsed().as_secs();
             if age >= self.watchdog.loop_state_warmup_secs {
                 // Past warmup. If the screen is idle, this is a bootstrap failure.
                 if self.last_activity.elapsed().as_secs() >= self.watchdog.idle_kill_secs {
@@ -1384,6 +1432,68 @@ mod tests {
             (28..=32).contains(&elapsed),
             "expected ~30s elapsed, got {}",
             elapsed
+        );
+    }
+
+    /// DET-7 regression: `monitor_started_at` MUST track the construction
+    /// instant (i.e. recovery boundary), not `entry.started_at` (cumulative
+    /// run age). Foreground monitor (`single_session/monitor.rs`) uses
+    /// `dispatch_time` for the equivalent age check; the daemon path used
+    /// `run_started_at` — a clock derived from `entry.started_at` that
+    /// persists across recovery cycles. The bug surfaced as accelerating
+    /// crash loops in phase `test`: each retry's "after Xs" reason ticked
+    /// upward (4208 → 4508 → 4653) instead of resetting on recovery, and
+    /// the `MIN_COMPLETION_AGE_SECS` "too young to have completed" gate
+    /// was effectively disabled for recovered sessions.
+    ///
+    /// Two clocks, two responsibilities:
+    /// - `run_started_at`     → cumulative wall-clock (pipeline budget)
+    /// - `monitor_started_at` → per-recovery (session-age gates)
+    #[test]
+    fn min_completion_age_uses_per_recovery_clock() {
+        use crate::daemon::protocol::RunStatus;
+        use tokio::sync::Mutex;
+
+        // Simulate a run dispatched 30 minutes ago that has just been
+        // recovered (i.e. monitor freshly constructed).
+        let dispatched_30m_ago = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let entry = RunEntry {
+            run_id: "test1234".to_string(),
+            plan_path: PathBuf::from("/tmp/plan.md"),
+            repo_dir: PathBuf::from("/tmp/repo"),
+            session_name: "gw-test1234".to_string(),
+            tmux_session: Some("gw-test1234".to_string()),
+            status: RunStatus::Running,
+            current_phase: Some("test".to_string()),
+            started_at: dispatched_30m_ago,
+            finished_at: None,
+            crash_restarts: 3,
+            config_dir: None,
+            error_message: None,
+            restartable: true,
+            claude_pid: None,
+            schedule_id: None,
+            last_recovery_at: Some(chrono::Utc::now()),
+        };
+        let registry = Arc::new(Mutex::new(RunRegistry::new()));
+        let monitor = DaemonRunMonitor::new(&entry, registry, WatchdogConfig::from_env());
+
+        let run_age = monitor.run_started_at.elapsed().as_secs();
+        let monitor_age = monitor.monitor_started_at.elapsed().as_secs();
+
+        // Cumulative clock reflects the 30-minute-old dispatch.
+        assert!(
+            (1790..=1810).contains(&run_age),
+            "run_started_at should reflect entry.started_at (~1800s), got {}s",
+            run_age,
+        );
+        // Per-recovery clock starts fresh — under MIN_COMPLETION_AGE_SECS.
+        assert!(
+            monitor_age < MIN_COMPLETION_AGE_SECS,
+            "monitor_started_at should be fresh on construction (<{}s), got {}s — \
+             a freshly recovered session must not inherit the prior cycle's age",
+            MIN_COMPLETION_AGE_SECS,
+            monitor_age,
         );
     }
 
