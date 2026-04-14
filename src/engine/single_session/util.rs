@@ -346,6 +346,26 @@ pub(crate) fn read_cached_checkpoint(
     None
 }
 
+/// Best-effort read of the current phase name from the checkpoint.
+///
+/// Used by the orchestrator to attribute a crash to a specific phase
+/// before calling `CrashLoopDetector::record_restart_for_phase`. Reads
+/// the active `arc-phase-loop.local.md` and returns the inferred phase
+/// (preferred) or the literal `current_phase` field. Returns `None`
+/// when no checkpoint can be resolved yet (e.g. during initial boot
+/// before Rune has written one).
+///
+/// This function does not cache — the caller creates a throwaway
+/// cache slot because record_restart call sites happen once per
+/// crash, not in a hot loop.
+pub(crate) fn current_phase_from_checkpoint(working_dir: &Path) -> Option<String> {
+    let mut cache_slot: Option<PathBuf> = None;
+    let cp = read_cached_checkpoint(working_dir, &mut cache_slot)?;
+    cp.inferred_phase_name()
+        .map(|s| s.to_string())
+        .or_else(|| cp.current_phase().map(|s| s.to_string()))
+}
+
 /// Find artifact dir using the cached checkpoint path (avoids re-scanning).
 pub(crate) fn find_artifact_dir_cached(cached_cp_path: &Option<PathBuf>, working_dir: &Path) -> Option<PathBuf> {
     let cp_path = cached_cp_path.as_ref()?;

@@ -4,7 +4,7 @@
 //! functions that manage the spawn → monitor → crash-restart lifecycle.
 
 use super::monitor::{monitor_session, run_session_attempt};
-use super::util::{build_arc_command, resolve_restart_command, RestartDecision};
+use super::util::{build_arc_command, current_phase_from_checkpoint, resolve_restart_command, RestartDecision};
 use super::{PipelineResult, SessionOutcome, SingleSessionConfig};
 use crate::cleanup::startup_cleanup;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
@@ -276,7 +276,9 @@ pub fn run_single_session(plan_path: &Path, config: &SingleSessionConfig) -> Res
                 // fires first (checked via record_restart()), then the per-class check.
                 other => {
                     is_first_run = false;
-                    match crash_detector.record_restart() {
+                    match crash_detector.record_restart_for_phase(
+                        current_phase_from_checkpoint(&config.working_dir).as_deref(),
+                    ) {
                         CrashLoopDecision::StopCrashLoop => {
                             return Ok(PipelineResult {
                                 success: false,
