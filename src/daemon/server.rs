@@ -1295,4 +1295,68 @@ mod tests {
         // Clean up GW_HOME
         unsafe { std::env::remove_var("GW_HOME") };
     }
+
+    // ── Path validator unit tests ─────────────────────────────────
+
+    #[test]
+    fn validate_config_dir_valid() {
+        let dir = TempDir::new().unwrap();
+        let result = validate_config_dir(dir.path());
+        assert!(result.is_ok());
+        // Should return a canonical (absolute) path
+        assert!(result.unwrap().is_absolute());
+    }
+
+    #[test]
+    fn validate_config_dir_nonexistent() {
+        let result = validate_config_dir(std::path::Path::new("/nonexistent/config/dir"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_config_dir_file_not_dir() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("afile.txt");
+        std::fs::write(&file, "data").unwrap();
+        let result = validate_config_dir(&file);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not a directory"),
+            "error should mention 'not a directory'"
+        );
+    }
+
+    #[test]
+    fn validate_config_dir_parent_component_rejected() {
+        let dir = TempDir::new().unwrap();
+        let traversal = dir.path().join("sub").join("..").join("escape");
+        let result = validate_config_dir(&traversal);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("'..'"),
+            "error should mention '..' component"
+        );
+    }
+
+    #[test]
+    fn validate_repo_dir_parent_component_rejected() {
+        let dir = TempDir::new().unwrap();
+        let traversal = dir.path().join("..").join("evil");
+        let result = validate_repo_dir(&traversal);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("'..'"));
+    }
+
+    #[test]
+    fn validate_plan_path_outside_root_rejected() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "# plan").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+        let result = validate_plan_path(&outside, &canon_root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside allowed root"));
+    }
 }
