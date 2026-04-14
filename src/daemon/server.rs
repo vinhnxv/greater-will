@@ -1178,12 +1178,10 @@ mod tests {
 
     #[tokio::test]
     async fn server_accepts_and_responds() {
-        // Set up GW_HOME under the serializing mutex (sync section)
+        // Set up GW_HOME under the shared cross-module mutex so this
+        // server test doesn't race against registry/reconciler tests.
         let tmp = {
-            use std::sync::{Mutex as StdMutex, OnceLock};
-            static MUTEX: OnceLock<StdMutex<()>> = OnceLock::new();
-            let _guard = MUTEX
-                .get_or_init(|| StdMutex::new(()))
+            let _guard = crate::daemon::state::gw_home_test_mutex()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let tmp = TempDir::new().unwrap();
