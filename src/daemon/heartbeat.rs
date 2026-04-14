@@ -47,7 +47,9 @@ pub(crate) struct MonitorHandle {
 /// fire only on *transitions*, not every heartbeat tick. Pruned when the
 /// run reaches a terminal state (see `prune_detection_state`).
 #[derive(Debug, Default, Clone)]
-#[allow(dead_code)] // Fields used incrementally — event emission wired in Patch 2/3
+// TODO(Patch-2): Wire event emission using detection_state fields in read_phase_via_loop_state.
+// Once wired, remove this #[allow(dead_code)] — all fields will be actively read/written.
+#[allow(dead_code)]
 struct DetectionSnapshot {
     /// Whether an Active loop state has been seen at least once for this run.
     loop_state_seen_once: bool,
@@ -406,11 +408,14 @@ impl HeartbeatMonitor {
         // (Claude writing documentation containing "arc completed", etc.).
         let cp_confirms_completion = checkpoint_phase.as_deref() == Some("complete");
 
-        // Fall back to pane heuristics only when checkpoint is unavailable
-        let phase = if let Some(cp_phase) = checkpoint_phase {
-            Some(cp_phase)
+        // Fall back to pane heuristics only when checkpoint is unavailable.
+        // Track whether the phase came from checkpoint (which already emitted
+        // the enriched phase_change event) or from heuristics (which needs a
+        // separate event).
+        let (phase, from_checkpoint) = if let Some(cp_phase) = checkpoint_phase {
+            (Some(cp_phase), true)
         } else {
-            phase_from_pane_heuristic(pane_content)
+            (phase_from_pane_heuristic(pane_content), false)
         };
 
         if let Some(phase_name) = phase {
@@ -439,7 +444,12 @@ impl HeartbeatMonitor {
                 }
 
                 drop(registry);
-                append_event(run_id, "phase_change", &phase_name);
+                // Only emit phase_change from here when the phase came from
+                // pane heuristics. Checkpoint-sourced phases already emitted
+                // the enriched phase_change event inside read_phase_via_loop_state.
+                if !from_checkpoint {
+                    append_event(run_id, "phase_change", &phase_name);
+                }
             } else {
                 drop(registry);
             }
@@ -515,6 +525,14 @@ impl HeartbeatMonitor {
     ///   AND `infer_phase_position().effective_phase()` yields a phase.
     /// - `None` when loop state is Missing, Inactive, or checkpoint path does not
     ///   exist yet (early arc bootstrap).
+    ///
+    /// Emits structured events via `append_event` on stage transitions:
+    /// - `waiting_loop_state`: once per run when loop state is Missing
+    /// - `loop_state_appeared`: once per run when Active first seen
+    /// - `loop_state_changed`: on field-level diffs (anomalous diffs use `warn!`)
+    /// - `checkpoint_missing`: throttled once per 60s when checkpoint not on disk
+    /// - `checkpoint_read_failed`: every read error (message truncated to 200 chars)
+    /// - `phase_change`: enriched with from/to/arc_id/iteration/checkpoint path
     async fn read_phase_via_loop_state(&self, run_id: &str) -> Option<String> {
         let repo_dir = {
             let registry = self.registry.lock().await;
@@ -525,7 +543,15 @@ impl HeartbeatMonitor {
 
         let state = match loop_state_read {
             LoopStateRead::Missing => {
-                debug!(run_id = %run_id, "loop state missing — no phase from checkpoint");
+                // Emit waiting_loop_state once per run
+                let mut det = self.detection_state.lock().await;
+                let snap = det.entry(run_id.to_string()).or_default();
+                if !snap.waiting_loop_state_logged {
+                    snap.waiting_loop_state_logged = true;
+                    drop(det);
+                    info!(run_id = %run_id, "loop state missing — waiting for arc to initialize");
+                    append_event(run_id, "waiting_loop_state", "arc-phase-loop.local.md not found yet");
+                }
                 return None;
             }
             LoopStateRead::Inactive => {
@@ -535,23 +561,112 @@ impl HeartbeatMonitor {
             LoopStateRead::Active(s) => s,
         };
 
+        // Emit loop_state_appeared (once per run) and loop_state_changed (on diffs)
+        {
+            let mut det = self.detection_state.lock().await;
+            let snap = det.entry(run_id.to_string()).or_default();
+
+            if !snap.loop_state_seen_once {
+                snap.loop_state_seen_once = true;
+                let msg = format!(
+                    "loop state active: iteration {}/{} plan={} branch={}",
+                    state.iteration, state.max_iterations, state.plan_file, state.branch,
+                );
+                snap.last_loop_state = Some(state.clone());
+                drop(det);
+                info!(run_id = %run_id, "{}", msg);
+                append_event(run_id, "loop_state_appeared", &msg);
+            } else if let Some(ref prev) = snap.last_loop_state {
+                let changes = prev.diff(&state);
+                if !changes.is_empty() {
+                    let has_anomaly = changes.iter().any(|c| c.anomalous);
+                    let change_desc: Vec<String> = changes
+                        .iter()
+                        .map(|c| format!("{}={} → {}", c.field, c.old_value, c.new_value))
+                        .collect();
+                    let msg = change_desc.join(", ");
+                    if has_anomaly {
+                        warn!(run_id = %run_id, "loop state changed (anomalous): {}", msg);
+                    } else {
+                        info!(run_id = %run_id, "loop state changed: {}", msg);
+                    }
+                    snap.last_loop_state = Some(state.clone());
+                    drop(det);
+                    append_event(run_id, "loop_state_changed", &msg);
+                } else {
+                    drop(det);
+                }
+            } else {
+                snap.last_loop_state = Some(state.clone());
+                drop(det);
+            }
+        }
+
         let checkpoint_path = state.resolve_checkpoint_path(&repo_dir);
         if !checkpoint_path.exists() {
-            debug!(
-                run_id = %run_id,
-                path = %checkpoint_path.display(),
-                "checkpoint file not on disk yet"
-            );
+            // Throttle checkpoint_missing: once per 60s per run
+            let mut det = self.detection_state.lock().await;
+            let snap = det.entry(run_id.to_string()).or_default();
+            let should_log = match snap.last_checkpoint_missing_log {
+                None => true,
+                Some(last) => last.elapsed() >= Duration::from_secs(60),
+            };
+            if should_log {
+                snap.last_checkpoint_missing_log = Some(std::time::Instant::now());
+                drop(det);
+                info!(
+                    run_id = %run_id,
+                    path = %checkpoint_path.display(),
+                    "checkpoint file not on disk yet"
+                );
+                append_event(
+                    run_id,
+                    "checkpoint_missing",
+                    &format!("checkpoint not found: {}", checkpoint_path.display()),
+                );
+            }
             return None;
         }
 
         match crate::checkpoint::reader::read_checkpoint(&checkpoint_path) {
             Ok(cp) => {
                 let position = cp.infer_phase_position();
-                Some(position.effective_phase()?.to_string())
+                let phase = position.effective_phase()?.to_string();
+
+                // Enriched phase_change event: emit only on transitions
+                let mut det = self.detection_state.lock().await;
+                let snap = det.entry(run_id.to_string()).or_default();
+                let prev_phase = snap.last_effective_phase.clone();
+                if prev_phase.as_deref() != Some(&phase) {
+                    snap.last_effective_phase = Some(phase.clone());
+                    snap.last_checkpoint_path = Some(checkpoint_path.clone());
+                    drop(det);
+
+                    let from = prev_phase.as_deref().unwrap_or("(none)");
+                    let arc_id = state.arc_id().unwrap_or("unknown");
+                    let msg = format!(
+                        "phase: {} → {} [arc_id={} iteration={}/{} checkpoint={}]",
+                        from, phase, arc_id,
+                        state.iteration, state.max_iterations,
+                        checkpoint_path.display(),
+                    );
+                    info!(run_id = %run_id, "{}", msg);
+                    // phase_change event name preserved for backward compat with
+                    // history.rs formatter — payload is enriched, not renamed.
+                    append_event(run_id, "phase_change", &msg);
+                }
+
+                Some(phase)
             }
             Err(e) => {
-                debug!(run_id = %run_id, error = %e, "failed to read checkpoint");
+                let err_msg = format!("{}", e);
+                let truncated = if err_msg.len() > 200 { &err_msg[..200] } else { &err_msg };
+                info!(run_id = %run_id, error = %truncated, "failed to read checkpoint");
+                append_event(
+                    run_id,
+                    "checkpoint_read_failed",
+                    &format!("error reading checkpoint: {}", truncated),
+                );
                 None
             }
         }
