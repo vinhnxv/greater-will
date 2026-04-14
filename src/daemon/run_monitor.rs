@@ -713,7 +713,14 @@ impl DaemonRunMonitor {
 
             // Step 2: Check checkpoint for definitive answer.
             if let Some(checkpoint) = self.read_checkpoint_sync().await {
-                if checkpoint.is_complete() {
+                // `is_complete()` accepts `merge.status = skipped` as
+                // completion (to support `auto_merge=false`). That's
+                // correct for an actually-finished run, but it can
+                // fire from the very first tick when Rune pre-populates
+                // `merge: skipped` — at which point a tmux vanish in
+                // forge would be mis-reported as completion. Require
+                // `is_near_completion` as a sanity cross-check.
+                if checkpoint.is_complete() && checkpoint.is_near_completion() {
                     return Some(DaemonRunOutcome::Completed);
                 }
                 // Checkpoint exists but not complete — crashed mid-phase.
@@ -785,11 +792,40 @@ impl DaemonRunMonitor {
     }
 
     fn check_pane_completion(&mut self, pane_content: &str) {
-        // If the foreground monitor detected "pipeline complete" in pane text
-        // and the session has been idle long enough, mark completion.
-        if is_pipeline_complete(pane_content) {
-            self.completion_detected_at.get_or_insert(Instant::now());
+        // Pane-text match is a soft signal. Before arming the
+        // `COMPLETION_GRACE_SECS` countdown, verify against the
+        // checkpoint that the pipeline is plausibly finishing — e.g.
+        // phase is at/past `ship`, or the terminal phase is done.
+        //
+        // Without this gate, phrases like "pipeline completed",
+        // "skipping merge", or "arc completed" that legitimately
+        // appear in agent output during forge/work phases (planning
+        // discussions, echo text, plan enrichment) trigger a
+        // false-positive completion 5 min later. Reproduced in
+        // gw logs 6ddbe6aa: run entered forge, then reported
+        // "pipeline finished" ~8m later.
+        if !is_pipeline_complete(pane_content) {
+            return;
         }
+        let near_completion = self
+            .cached_checkpoint_path
+            .as_ref()
+            .and_then(|p| crate::checkpoint::reader::read_checkpoint(p).ok())
+            .as_ref()
+            .is_some_and(crate::checkpoint::schema::Checkpoint::is_near_completion);
+        if !near_completion {
+            // Log once per run — a repeating warn would flood logs
+            // since the pane keeps matching until the phase advances.
+            if self.completion_detected_at.is_none() {
+                debug!(
+                    run_id = %self.run_id,
+                    phase = ?self.current_phase,
+                    "pane shows completion text but checkpoint not near-terminal — ignoring soft signal"
+                );
+            }
+            return;
+        }
+        self.completion_detected_at.get_or_insert(Instant::now());
     }
 
     fn check_completion_grace(&self) -> Option<DaemonRunOutcome> {
@@ -975,8 +1011,32 @@ impl DaemonRunMonitor {
         let gone_since = *self.loop_state_gone_since.get_or_insert(Instant::now());
         if file_on_disk {
             // Intentional deactivation — wait for completion grace.
+            // Verify the checkpoint before trusting the deactivation.
+            // Rune may write `active=false` transiently between phases
+            // or during initial setup; without the guard we'd declare
+            // completion at phase 1 (parity with the pane-text gate
+            // in `check_pane_completion`).
             if gone_since.elapsed().as_secs() >= COMPLETION_GRACE_SECS {
-                return Some(DaemonRunOutcome::Completed);
+                let near_completion = read_cached_checkpoint(
+                    &self.repo_dir,
+                    &mut self.cached_checkpoint_path,
+                )
+                .as_ref()
+                .is_some_and(crate::checkpoint::schema::Checkpoint::is_near_completion);
+                if near_completion {
+                    return Some(DaemonRunOutcome::Completed);
+                }
+                // Reject: loop state says inactive but checkpoint is
+                // nowhere near terminal. Reset the timer so the next
+                // observed deactivation gets its own grace window
+                // (otherwise we'd never distinguish a transient
+                // deactivation from a real one).
+                warn!(
+                    run_id = %self.run_id,
+                    phase = ?self.current_phase,
+                    "loop state inactive but checkpoint not near-terminal — ignoring deactivation"
+                );
+                self.loop_state_gone_since = None;
             }
         } else {
             // File deleted — but check checkpoint before assuming crash.
@@ -984,12 +1044,15 @@ impl DaemonRunMonitor {
             // is completed, the pipeline is done even if the file was deleted.
             if gone_since.elapsed().as_secs() >= LOOP_STATE_GONE_GRACE_SECS {
                 // Read checkpoint to distinguish "completed but file cleaned up"
-                // from genuine crash.
+                // from genuine crash. Require `is_near_completion` as a
+                // cross-check so an early `merge: skipped` entry from
+                // `auto_merge=false` doesn't masquerade as completion
+                // when we're actually at forge.
                 if let Some(checkpoint) = read_cached_checkpoint(
                     &self.repo_dir,
                     &mut self.cached_checkpoint_path,
                 ) {
-                    if checkpoint.is_complete() || checkpoint.is_terminal_phase_completed() {
+                    if checkpoint.is_near_completion() {
                         info!(
                             run_id = %self.run_id,
                             "Loop state file deleted but checkpoint shows completion — treating as completed"

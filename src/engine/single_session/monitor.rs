@@ -368,7 +368,11 @@ pub(crate) fn monitor_session(
                 if let Some(checkpoint) = read_cached_checkpoint(
                     &config.working_dir, &mut cached_checkpoint_path,
                 ) {
-                    if checkpoint.is_complete() {
+                    // Require `is_near_completion` alongside `is_complete`
+                    // so an `auto_merge=false` run that pre-populates
+                    // `merge.status = skipped` doesn't look complete
+                    // from phase 1.
+                    if checkpoint.is_complete() && checkpoint.is_near_completion() {
                         info!("Session ended, checkpoint confirms completion");
                         return Ok(SessionOutcome::Completed);
                     }
@@ -501,7 +505,11 @@ pub(crate) fn monitor_session(
             if let Some(checkpoint) = read_cached_checkpoint(
                 &config.working_dir, &mut cached_checkpoint_path,
             ) {
-                if checkpoint.is_complete() {
+                // Cross-check `is_complete` with `is_near_completion`:
+                // `is_complete` accepts a skipped terminal phase as
+                // done, which fires prematurely when Rune pre-populates
+                // `merge: skipped` for `auto_merge=false` runs.
+                if checkpoint.is_complete() && checkpoint.is_near_completion() {
                     if completion_detected_at.is_none() {
                         let elapsed = dispatch_time.elapsed();
                         info!(
@@ -747,7 +755,7 @@ pub(crate) fn monitor_session(
                     if let Some(checkpoint) = read_cached_checkpoint(
                         &config.working_dir, &mut cached_checkpoint_path,
                     ) {
-                        if checkpoint.is_complete() {
+                        if checkpoint.is_complete() && checkpoint.is_near_completion() {
                             if completion_detected_at.is_none() {
                                 info!(
                                     "Loop state gone + checkpoint complete — entering grace period ({}s to kill)",
@@ -960,11 +968,23 @@ pub(crate) fn monitor_session(
         if dispatch_time.elapsed().as_secs() >= PANE_COMPLETION_MIN_ELAPSED_SECS
             && is_pipeline_complete(&pane_content)
         {
-            if completion_detected_at.is_none() {
+            // Verify against the checkpoint before trusting pane text.
+            // Forge/work-era agents regularly discuss "merge skipped",
+            // "pipeline completed", etc. as plan content — the pane
+            // heuristic alone mistook that for real completion (see
+            // daemon gw logs 6ddbe6aa reproducer). Require
+            // `is_near_completion` so the signal only fires from
+            // ship/merge onwards (or when the terminal phase is done).
+            let near_completion = read_cached_checkpoint(
+                &config.working_dir, &mut cached_checkpoint_path,
+            )
+            .as_ref()
+            .is_some_and(crate::checkpoint::schema::Checkpoint::is_near_completion);
+            if near_completion && completion_detected_at.is_none() {
                 let elapsed = dispatch_time.elapsed();
                 info!(
                     elapsed_secs = elapsed.as_secs(),
-                    "Arc completed (pane text) — entering grace period ({}s to kill)",
+                    "Arc completed (pane text + checkpoint verified) — entering grace period ({}s to kill)",
                     COMPLETION_GRACE_SECS,
                 );
                 println!(
@@ -974,6 +994,10 @@ pub(crate) fn monitor_session(
                     COMPLETION_GRACE_SECS / 60,
                 );
                 completion_detected_at = Some(Instant::now());
+            } else if !near_completion && completion_detected_at.is_none() {
+                debug!(
+                    "Pane shows completion text but checkpoint not near-terminal — ignoring soft signal"
+                );
             }
             // Don't return — grace period handler manages the kill
         }
@@ -1169,7 +1193,7 @@ pub(crate) fn monitor_session(
             if let Some(checkpoint) = read_cached_checkpoint(
                 &config.working_dir, &mut cached_checkpoint_path,
             ) {
-                if checkpoint.is_complete() {
+                if checkpoint.is_complete() && checkpoint.is_near_completion() {
                     info!("Process died but checkpoint confirms completion");
                     return Ok(SessionOutcome::Completed);
                 }
