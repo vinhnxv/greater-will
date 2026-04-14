@@ -41,6 +41,29 @@ pub(crate) struct MonitorHandle {
     pub(crate) cancel: CancellationToken,
 }
 
+/// Per-run detection state for stage-transition logging.
+///
+/// Tracks what the daemon has already observed for each run so events
+/// fire only on *transitions*, not every heartbeat tick. Pruned when the
+/// run reaches a terminal state (see `prune_detection_state`).
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)] // Fields used incrementally — event emission wired in Patch 2/3
+struct DetectionSnapshot {
+    /// Whether an Active loop state has been seen at least once for this run.
+    loop_state_seen_once: bool,
+    /// Whether the `waiting_loop_state` event has been logged (fire-once).
+    waiting_loop_state_logged: bool,
+    /// Last observed loop state — used for `diff()`-based change detection.
+    last_loop_state: Option<crate::monitor::loop_state::ArcLoopState>,
+    /// Last resolved checkpoint path — for detecting path changes.
+    last_checkpoint_path: Option<std::path::PathBuf>,
+    /// Last effective phase name — for `phase_change` event dedup.
+    last_effective_phase: Option<String>,
+    /// Throttle for `checkpoint_missing` events (once per 60s per run).
+    /// Uses `Instant` (monotonic) to avoid issues with system clock changes.
+    last_checkpoint_missing_log: Option<std::time::Instant>,
+}
+
 /// Heartbeat monitor that watches over active runs.
 ///
 /// Spawns a background tokio task that periodically:
@@ -50,16 +73,17 @@ pub(crate) struct MonitorHandle {
 /// 4. Delegates crash recovery to [`handle_monitor_outcome`]
 /// ## Lock ordering convention (BACK-011)
 ///
-/// This module uses two `tokio::sync::Mutex`es: `registry` and `monitors`.
-/// They must **never be held simultaneously** — always acquire one, extract
-/// what you need, `drop` it, then acquire the other. The canonical order
-/// when both are needed in sequence is:
+/// This module uses three `tokio::sync::Mutex`es: `registry`, `monitors`,
+/// and `detection_state`. They must **never be held simultaneously** —
+/// always acquire one, extract what you need, `drop` it, then acquire
+/// the other. The canonical order when multiple are needed in sequence is:
 ///
 /// 1. `registry` — snapshot data, then drop
 /// 2. `monitors` — mutate monitor handles, then drop
+/// 3. `detection_state` — mutate per-run detection snapshots, then drop
 ///
 /// `executor.rs::stop_run` follows the same convention. Violating this
-/// (holding both locks at once) creates an AB/BA deadlock risk with
+/// (holding multiple locks at once) creates an AB/BA deadlock risk with
 /// concurrent stop_run calls.
 pub struct HeartbeatMonitor {
     registry: Arc<Mutex<RunRegistry>>,
@@ -72,8 +96,12 @@ pub struct HeartbeatMonitor {
     /// re-parsing env vars on every heartbeat tick (BACK-002).
     watchdog: WatchdogConfig,
     /// Shared network state for internet recovery.
-    /// Lock ordering: registry → network_state → monitors.
+    /// Lock ordering: registry → network_state → monitors → detection_state.
     network_state: Arc<RwLock<NetworkState>>,
+    /// Per-run detection state for stage-transition logging.
+    /// Map key: run_id. Value: last observed snapshot.
+    /// Lock ordering: acquire AFTER monitors (lowest priority lock).
+    detection_state: Arc<Mutex<HashMap<String, DetectionSnapshot>>>,
 }
 
 impl HeartbeatMonitor {
@@ -89,6 +117,7 @@ impl HeartbeatMonitor {
             global_cancel,
             watchdog: WatchdogConfig::from_env(),
             network_state,
+            detection_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -110,6 +139,25 @@ impl HeartbeatMonitor {
         if let Some(handle) = monitors.remove(run_id) {
             handle.cancel.cancel();
         }
+    }
+
+    /// Remove detection state entries for stopped runs and orphaned run_ids.
+    ///
+    /// Called after `monitors.retain()` on every heartbeat tick. Removes:
+    /// 1. Entries whose run_id is in the `stopped` list (normal terminal path).
+    /// 2. Entries whose run_id is not in `active_run_ids` (defensive — handles
+    ///    external removal via `gw rm` or registry mutation outside heartbeat).
+    async fn prune_detection_state(
+        &self,
+        stopped: &[String],
+        active_run_ids: &std::collections::HashSet<&String>,
+    ) {
+        let mut det = self.detection_state.lock().await;
+        for run_id in stopped {
+            det.remove(run_id);
+        }
+        // Defensive: prune orphaned entries not in active registry
+        det.retain(|id, _| active_run_ids.contains(id));
     }
 
     /// Start the heartbeat loop as a background tokio task.
@@ -264,7 +312,16 @@ impl HeartbeatMonitor {
         // Prune finished handles (outcome already processed)
         monitors.retain(|_, h| !h.join.is_finished());
 
+        // Collect active run_ids so we can prune orphaned detection state.
+        let active_run_ids: std::collections::HashSet<&String> =
+            running.iter().map(|(id, _, _)| id).collect();
+
         drop(monitors);
+
+        // Prune detection state for stopped runs and orphaned entries whose
+        // run_id has no corresponding registry entry (defensive — handles
+        // external removal via `gw rm`).
+        self.prune_detection_state(&stopped, &active_run_ids).await;
 
         // Lightweight phase tracking for `gw ps` — runs on every tick
         // independently of the per-run monitors.
@@ -449,25 +506,44 @@ impl HeartbeatMonitor {
         }
     }
 
-    /// Read the current phase directly from checkpoint.json in the repo.
+    /// Read the current phase from the authoritative checkpoint pointed to by
+    /// `.rune/arc-phase-loop.local.md`. No directory scanning — matches
+    /// `engine/single_session/util.rs::current_phase_from_checkpoint`.
     ///
-    /// This is the ground truth — it knows the exact phase name from the 41-phase
-    /// PHASE_ORDER, not just the 5 coarse buckets from pane heuristics.
-    ///
-    /// Only checkpoints belonging to *this* run are considered: the discovery
-    /// is scoped by `plan_path` and `started_at` so stale `.rune/arc/`
-    /// directories from prior arcs cannot drive phase detection.
-    async fn read_phase_from_checkpoint(&self, run_id: &str) -> Option<String> {
-        let (repo_dir, plan_path, run_started_at) = {
+    /// Returns:
+    /// - `Some(phase_name)` when loop state is Active AND checkpoint is readable
+    ///   AND `infer_phase_position().effective_phase()` yields a phase.
+    /// - `None` when loop state is Missing, Inactive, or checkpoint path does not
+    ///   exist yet (early arc bootstrap).
+    async fn read_phase_via_loop_state(&self, run_id: &str) -> Option<String> {
+        let repo_dir = {
             let registry = self.registry.lock().await;
-            registry
-                .get(run_id)
-                .map(|e| (e.repo_dir.clone(), e.plan_path.clone(), e.started_at))?
+            registry.get(run_id).map(|e| e.repo_dir.clone())?
         };
 
-        let arc_dir = repo_dir.join(".rune").join("arc");
-        let checkpoint_path =
-            find_latest_checkpoint(&arc_dir, &repo_dir, &plan_path, run_started_at)?;
+        let loop_state_read = read_arc_loop_state(&repo_dir);
+
+        let state = match loop_state_read {
+            LoopStateRead::Missing => {
+                debug!(run_id = %run_id, "loop state missing — no phase from checkpoint");
+                return None;
+            }
+            LoopStateRead::Inactive => {
+                debug!(run_id = %run_id, "loop state inactive — no phase from checkpoint");
+                return None;
+            }
+            LoopStateRead::Active(s) => s,
+        };
+
+        let checkpoint_path = state.resolve_checkpoint_path(&repo_dir);
+        if !checkpoint_path.exists() {
+            debug!(
+                run_id = %run_id,
+                path = %checkpoint_path.display(),
+                "checkpoint file not on disk yet"
+            );
+            return None;
+        }
 
         match crate::checkpoint::reader::read_checkpoint(&checkpoint_path) {
             Ok(cp) => {
@@ -1176,75 +1252,6 @@ fn phase_from_pane_heuristic(pane_content: &str) -> Option<String> {
     }
 }
 
-/// Find the most recently modified checkpoint.json under `.rune/arc/*/`
-/// that belongs to the given run.
-///
-/// `.rune/arc/` accumulates a directory per arc invocation. Picking by mtime
-/// alone is unsafe — a fresh run that hasn't yet emitted its first checkpoint
-/// would inherit the phase of the previous arc (e.g. `deploy_verify` from a
-/// completed run leaks into a brand-new `forge`-stage run).
-///
-/// Filters applied, in order:
-/// 1. `checkpoint.plan_file` (relative) joined to `repo_dir` must equal
-///    `plan_path` — different plans are not the same run.
-/// 2. `checkpoint.is_complete()` must be false — a finished arc must not
-///    drive phase for a still-running run.
-/// 3. `checkpoint.started_at` must be `>= run_started_at - 60s` — guards
-///    against a leftover in-progress checkpoint from a stale prior run on
-///    the same plan. The 60s tolerance absorbs the small delta between
-///    Rune writing `started_at` (inside the agent) and the daemon's
-///    `RunEntry.started_at` (recorded at submit time).
-///
-/// Returns `None` while no qualifying checkpoint exists yet (e.g. during
-/// arc pre-flight before Rune emits the first checkpoint). The caller
-/// then falls back to pane heuristics, which is the desired behaviour.
-fn find_latest_checkpoint(
-    arc_dir: &std::path::Path,
-    repo_dir: &std::path::Path,
-    plan_path: &std::path::Path,
-    run_started_at: chrono::DateTime<chrono::Utc>,
-) -> Option<std::path::PathBuf> {
-    if !arc_dir.is_dir() {
-        return None;
-    }
-
-    let earliest_allowed = run_started_at - chrono::Duration::seconds(60);
-
-    std::fs::read_dir(arc_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let cp_path = e.path().join("checkpoint.json");
-            if !cp_path.exists() {
-                return None;
-            }
-
-            let cp = crate::checkpoint::reader::read_checkpoint(&cp_path).ok()?;
-
-            // (1) plan match: cp.plan_file is repo-relative.
-            if repo_dir.join(&cp.plan_file) != plan_path {
-                return None;
-            }
-
-            // (2) reject finished arcs.
-            if cp.is_complete() {
-                return None;
-            }
-
-            // (3) reject checkpoints that started before this run.
-            let cp_started = chrono::DateTime::parse_from_rfc3339(&cp.started_at)
-                .ok()?
-                .with_timezone(&chrono::Utc);
-            if cp_started < earliest_allowed {
-                return None;
-            }
-
-            let mtime = std::fs::metadata(&cp_path).ok()?.modified().ok()?;
-            Some((cp_path, mtime))
-        })
-        .max_by_key(|(_, mtime)| *mtime)
-        .map(|(path, _)| path)
-}
 
 // BACK-006: Legacy diagnose_session_death and diagnose_tmux_server_death
 // removed (~180 lines of dead code). DaemonRunMonitor performs its own
@@ -1561,171 +1568,4 @@ mod tests {
         assert_eq!(phase_from_pane_heuristic(""), None);
     }
 
-    // ── find_latest_checkpoint scoping tests ──
-
-    fn write_checkpoint_dir(
-        arc_dir: &std::path::Path,
-        arc_id: &str,
-        plan_file: &str,
-        started_at: &str,
-        phase_status: &[(&str, &str)],
-        completed_at: Option<&str>,
-    ) -> std::path::PathBuf {
-        let dir = arc_dir.join(arc_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cp_path = dir.join("checkpoint.json");
-        let phases: serde_json::Map<String, serde_json::Value> = phase_status
-            .iter()
-            .map(|(name, status)| {
-                (
-                    (*name).to_string(),
-                    serde_json::json!({ "status": status }),
-                )
-            })
-            .collect();
-        let mut body = serde_json::json!({
-            "id": arc_id,
-            "schema_version": 28,
-            "plan_file": plan_file,
-            "phases": phases,
-            "started_at": started_at,
-        });
-        if let Some(ts) = completed_at {
-            body["completed_at"] = serde_json::Value::String(ts.into());
-        }
-        std::fs::write(&cp_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
-        cp_path
-    }
-
-    #[test]
-    fn find_latest_checkpoint_ignores_stale_prior_arc() {
-        // Repro of the deploy_verify ghost bug: a previous arc for the SAME
-        // plan completed and left a checkpoint behind. A brand-new run that
-        // hasn't emitted its own checkpoint must not inherit phase data
-        // from the stale one.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path();
-        let arc = repo.join(".rune").join("arc");
-        let plan_path = repo.join("plans").join("p.md");
-        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
-        std::fs::write(&plan_path, "# plan").unwrap();
-
-        write_checkpoint_dir(
-            &arc,
-            "arc-prior",
-            "plans/p.md",
-            "2026-01-01T00:00:00Z",
-            &[
-                ("forge", "completed"),
-                ("merge", "completed"),
-            ],
-            Some("2026-01-01T01:00:00Z"),
-        );
-
-        let run_started =
-            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-
-        assert!(
-            find_latest_checkpoint(&arc, repo, &plan_path, run_started).is_none(),
-            "stale completed checkpoint must not be selected for a fresh run"
-        );
-    }
-
-    #[test]
-    fn find_latest_checkpoint_rejects_unrelated_plan() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path();
-        let arc = repo.join(".rune").join("arc");
-        let plan_path = repo.join("plans").join("ours.md");
-        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
-
-        write_checkpoint_dir(
-            &arc,
-            "arc-other",
-            "plans/theirs.md",
-            "2026-04-14T12:00:00Z",
-            &[("forge", "in_progress")],
-            None,
-        );
-
-        let run_started =
-            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-
-        assert!(
-            find_latest_checkpoint(&arc, repo, &plan_path, run_started).is_none(),
-            "checkpoint for a different plan must be ignored"
-        );
-    }
-
-    #[test]
-    fn find_latest_checkpoint_picks_matching_in_progress() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path();
-        let arc = repo.join(".rune").join("arc");
-        let plan_path = repo.join("plans").join("p.md");
-        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
-
-        // Stale prior arc — must be rejected.
-        write_checkpoint_dir(
-            &arc,
-            "arc-prior",
-            "plans/p.md",
-            "2026-01-01T00:00:00Z",
-            &[("forge", "completed"), ("merge", "completed")],
-            Some("2026-01-01T01:00:00Z"),
-        );
-        // Fresh arc for our run — must be picked.
-        let fresh = write_checkpoint_dir(
-            &arc,
-            "arc-fresh",
-            "plans/p.md",
-            "2026-04-14T11:50:30Z",
-            &[("forge", "in_progress")],
-            None,
-        );
-
-        let run_started =
-            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-
-        assert_eq!(
-            find_latest_checkpoint(&arc, repo, &plan_path, run_started),
-            Some(fresh)
-        );
-    }
-
-    #[test]
-    fn find_latest_checkpoint_tolerates_60s_clock_skew() {
-        // Rune may stamp checkpoint.started_at slightly before the daemon
-        // records RunEntry.started_at. Anything within 60s should still match.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path();
-        let arc = repo.join(".rune").join("arc");
-        let plan_path = repo.join("plans").join("p.md");
-        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
-
-        let fresh = write_checkpoint_dir(
-            &arc,
-            "arc-fresh",
-            "plans/p.md",
-            "2026-04-14T11:49:30Z", // 30s before run_started
-            &[("forge", "in_progress")],
-            None,
-        );
-
-        let run_started =
-            chrono::DateTime::parse_from_rfc3339("2026-04-14T11:50:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-
-        assert_eq!(
-            find_latest_checkpoint(&arc, repo, &plan_path, run_started),
-            Some(fresh)
-        );
-    }
 }
