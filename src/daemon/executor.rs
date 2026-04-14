@@ -36,7 +36,7 @@ pub(crate) const SPAWN_INIT_WAIT_SECS: u64 = 12;
 ///
 /// 1. Validate that the plan file exists and the repo is clean
 /// 2. Register the run in the registry (acquires per-repo lock)
-/// 3. Pre-flight: `cleanup::pre_phase_cleanup` + `elden::clear_signals`
+/// 3. Pre-flight: `cleanup::pre_phase_cleanup` + `elden::clear_signals_from`
 ///    (parity with foreground `monitor::run_session_attempt` — plan GAP A3)
 /// 4. Spawn a tmux session via `SpawnConfig`
 /// 5. Write `session_owner.json` for adopt-orphaned-session recovery
@@ -214,7 +214,7 @@ async fn spawn_after_register(
         );
         return Err(e);
     }
-    crate::commands::elden::clear_signals();
+    crate::commands::elden::clear_signals_from(&repo_dir);
 
     // ── Spawn tmux session ──────────────────────────────────────────
     // Always derive the tmux name from `run_id`. Previously the drain
