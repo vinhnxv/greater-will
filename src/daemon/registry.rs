@@ -362,20 +362,32 @@ impl RunRegistry {
         Ok(run_id)
     }
 
-    /// Update the status of a run (atomic write).
-    pub fn update_status(
+    /// Stage a status change in memory without flushing to disk.
+    /// INV-19: callers drop the mutex guard after this returns, then call `flush_status`.
+    /// INV-6: rejects backward transitions (Running→Queued) and terminal→non-terminal.
+    pub fn stage_status_locked(
         &mut self,
         run_id: &str,
         status: RunStatus,
         phase: Option<String>,
         error: Option<String>,
-    ) -> Result<()> {
+    ) -> std::result::Result<StagedStatus, UpdateStatusError> {
         let entry = self
             .runs
             .get_mut(run_id)
-            .ok_or_else(|| color_eyre::eyre::eyre!("run not found: {run_id}"))?;
+            .ok_or_else(|| UpdateStatusError::NotFound(run_id.to_string()))?;
+
+        // INV-6: prior-state guard — reject invalid transitions
+        let from = entry.status;
+        if from.is_terminal() && !status.is_terminal() {
+            return Err(UpdateStatusError::InvalidTransition { from, to: status });
+        }
+        if from == RunStatus::Running && status == RunStatus::Queued {
+            return Err(UpdateStatusError::InvalidTransition { from, to: status });
+        }
 
         entry.status = status;
+        entry.write_epoch += 1;
         if let Some(p) = phase {
             entry.current_phase = Some(p);
         }
@@ -384,21 +396,42 @@ impl RunRegistry {
         }
 
         // Mark finished time for terminal states
-        if matches!(
-            status,
-            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Stopped
-        ) {
+        if status.is_terminal() {
             entry.finished_at = Some(Utc::now());
             // Release repo lock on completion
-            let repo_hash = Self::repo_hash(&entry.repo_dir);
-            self.repo_locks.remove(&repo_hash);
+            let rh = repo_hash(&entry.repo_dir);
+            self.repo_locks.remove(&rh);
         }
 
-        let entry_clone = entry.clone();
-        self.write_meta(&entry_clone)?;
+        let staged = StagedStatus {
+            entry: entry.clone(),
+            epoch: entry.write_epoch,
+        };
 
-        tracing::debug!(run_id = %run_id, status = ?status, "updated run status");
-        Ok(())
+        tracing::debug!(run_id = %run_id, status = ?status, epoch = staged.epoch, "staged status update");
+        Ok(staged)
+    }
+
+    /// Flush a staged status change to disk. Runs fsync via write_meta.
+    /// INV-19: call this AFTER releasing the registry mutex.
+    /// Epoch-guarded: skips write if on-disk epoch is newer (idempotent under retry).
+    pub fn flush_status(&self, staged: &StagedStatus) -> Result<()> {
+        self.write_meta(&staged.entry)
+    }
+
+    /// Update the status of a run (stage + flush in one call).
+    /// Convenience wrapper — use stage_status_locked + flush_status when you need
+    /// to release the mutex between mutation and fsync.
+    pub fn update_status(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        phase: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let staged = self.stage_status_locked(run_id, status, phase, error)
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        self.flush_status(&staged)
     }
 
     /// Remove a run from registry and disk.
