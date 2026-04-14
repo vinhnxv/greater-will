@@ -531,8 +531,15 @@ impl Checkpoint {
     /// from the start would otherwise look "complete" at phase 1).
     ///
     /// Returns true only when at least one of:
-    /// - The terminal phase is completed or skipped
-    ///   ([`Self::is_terminal_phase_completed`]).
+    /// - `completed_at` is set (Rune's explicit done-marker).
+    /// - The terminal phase is explicitly `"completed"` (NOT `"skipped"`,
+    ///   which `auto_merge=false` pre-populates at run creation and
+    ///   therefore cannot distinguish forge-phase false-completions from
+    ///   genuine end-of-pipeline).
+    /// - Every phase has reached a terminal state (`completed`, `skipped`,
+    ///   or `cancelled`). `cancelled` is accepted because Rune marks
+    ///   phases that way when the loop iteration advances past them
+    ///   without executing — a legitimate terminal outcome.
     /// - The inferred current phase is at or past `ship` — the last
     ///   four phases (ship, bot_review_wait, pr_comment_resolution,
     ///   merge) are where completion signals can race ahead of
@@ -550,23 +557,49 @@ impl Checkpoint {
     /// re-reads both and converges. It never *prevents* a real
     /// completion from being detected eventually.
     pub fn is_near_completion(&self) -> bool {
-        use crate::checkpoint::phase_order::phase_index;
+        use crate::checkpoint::phase_order::{PHASE_COUNT, phase_at, phase_index};
 
         // Strong signal 1: Rune wrote an explicit completion timestamp.
         if self.completed_at.is_some() {
             return true;
         }
 
-        // Strong signal 2: every known phase has reached a terminal
-        // status. This is materially stronger than
-        // `is_terminal_phase_completed` — the latter accepts a
-        // pre-populated `merge: skipped` even when earlier phases are
-        // still "pending" (the exact gap that masked the forge-phase
-        // false-completion bug on auto_merge=false runs).
+        // Strong signal 2: the terminal phase (`merge`) is explicitly
+        // `"completed"` (NOT `"skipped"`). `auto_merge=false` pre-populates
+        // `merge: skipped` at run creation, so a skipped-merge is NOT a
+        // trustworthy done-signal. But `merge.status = "completed"` cannot
+        // be faked this way — it is only written when the merge phase
+        // actually ran to completion. This catches the case where Rune
+        // finishes the pipeline but never writes the top-level
+        // `completed_at` field, AND leaves mid-pipeline phases in
+        // non-terminal states like `"cancelled"` (which then defeats
+        // signal 3 below).
+        if let Some(terminal) = phase_at(PHASE_COUNT.saturating_sub(1)) {
+            if self
+                .phases
+                .get(terminal)
+                .is_some_and(|p| p.status == "completed")
+            {
+                return true;
+            }
+        }
+
+        // Strong signal 3: every known phase has reached a terminal
+        // status. Accepts `completed`, `skipped`, AND `cancelled` —
+        // Rune marks phases as `cancelled` when the loop iteration
+        // advances past them without executing (a legitimate terminal
+        // outcome within the pipeline lifecycle).
+        //
+        // This is materially stronger than `is_terminal_phase_completed`
+        // — the latter accepts a pre-populated `merge: skipped` even
+        // when earlier phases are still "pending" (the exact gap that
+        // masked the forge-phase false-completion bug on auto_merge=false
+        // runs).
         if !self.phases.is_empty()
-            && self.phases.values().all(|p| {
-                p.status == "completed" || p.status == "skipped"
-            })
+            && self
+                .phases
+                .values()
+                .all(|p| matches!(p.status.as_str(), "completed" | "skipped" | "cancelled"))
         {
             return true;
         }
@@ -1474,17 +1507,105 @@ mod tests {
     }
 
     #[test]
+    fn test_is_near_completion_accepts_merge_completed_with_cancelled_phases() {
+        // Bug reproduction: gw run a9d0bb79 — arc actually completed
+        // (`merge.status = "completed"`, `ship.status = "completed"`, PR
+        // merged on GitHub), but `completed_at` was never written AND
+        // two mid-pipeline phases (`work`, `code_review`) were left
+        // `cancelled`. Pre-fix, is_near_completion rejected this because:
+        //   - completed_at: None
+        //   - not every phase completed/skipped (cancelled blocks it)
+        //   - inferred_phase_name: None (AllDone → no index)
+        // Post-fix: signal 2 catches `merge.status = "completed"` directly.
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("work".to_string(), PhaseStatus {
+            status: "cancelled".to_string(),
+            started_at: Some("2026-04-14T14:05:42Z".to_string()),
+            ..Default::default()
+        });
+        cp.phases.insert("code_review".to_string(), PhaseStatus {
+            status: "cancelled".to_string(),
+            started_at: Some("2026-04-14T14:17:17Z".to_string()),
+            ..Default::default()
+        });
+        cp.phases.insert("ship".to_string(), PhaseStatus {
+            status: "completed".to_string(),
+            completed_at: Some("2026-04-14T14:26:08Z".to_string()),
+            ..Default::default()
+        });
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "completed".to_string(),
+            completed_at: Some("2026-04-14T14:26:52Z".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            cp.is_near_completion(),
+            "merge.status=\"completed\" is a strong done-signal — must not be defeated \
+             by cancelled mid-pipeline phases"
+        );
+    }
+
+    #[test]
+    fn test_is_near_completion_accepts_all_terminal_incl_cancelled() {
+        // Signal 3 must accept `cancelled` alongside `completed`/`skipped`.
+        use crate::checkpoint::phase_order::PHASE_ORDER;
+        let mut cp = Checkpoint::default();
+        for (i, &phase) in PHASE_ORDER.iter().enumerate() {
+            let s = match i % 3 {
+                0 => "completed",
+                1 => "skipped",
+                _ => "cancelled",
+            };
+            cp.phases.insert(phase.to_string(), PhaseStatus {
+                status: s.to_string(),
+                ..Default::default()
+            });
+        }
+        assert!(cp.is_near_completion());
+    }
+
+    #[test]
+    fn test_is_near_completion_rejects_merge_skipped_without_completed_at() {
+        // Guard against regression: pre-populated `merge: skipped` (from
+        // `auto_merge=false`) with earlier phases still pending MUST NOT
+        // count as near-completion. Signal 2 only accepts merge="completed".
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".to_string(), PhaseStatus {
+            status: "in_progress".to_string(),
+            ..Default::default()
+        });
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "skipped".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            !cp.is_near_completion(),
+            "merge=skipped with forge in_progress must not qualify — \
+             only merge=completed is a strong done-signal"
+        );
+    }
+
+    #[test]
     fn test_is_near_completion_rejects_terminal_skipped_with_pending_earlier() {
         // The exact auto_merge=false + pre-populated `merge: skipped`
         // gap. Even though is_terminal_phase_completed() == true, we
         // have pending phases BEFORE the terminal one → not done.
-        let cp = checkpoint_merge_done_but_pending_earlier();
+        // Signal 2 only accepts merge="completed" (not "skipped"), so
+        // this pre-populated-skip case must still be rejected.
+        let mut cp = Checkpoint::default();
+        cp.phases.insert("forge".to_string(), PhaseStatus {
+            status: "in_progress".to_string(),
+            started_at: Some("2026-04-14T21:35:25Z".to_string()),
+            ..Default::default()
+        });
+        cp.phases.insert("merge".to_string(), PhaseStatus {
+            status: "skipped".to_string(),
+            ..Default::default()
+        });
         assert!(
             cp.is_terminal_phase_completed(),
-            "sanity: helper produces a checkpoint where terminal is skipped/completed"
+            "sanity: merge=skipped counts as terminal-phase-completed"
         );
-        // But the inferred phase lands on a pending earlier phase, and
-        // not every phase is completed → is_near_completion rejects.
         assert!(
             !cp.is_near_completion(),
             "pre-populated terminal skip with pending earlier phases must not count as near-completion"
