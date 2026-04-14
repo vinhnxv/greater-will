@@ -23,6 +23,13 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Poll interval when waiting for graceful stop.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Wait time for Claude Code TUI to initialize before dispatching `/rune:arc`.
+///
+/// Matches the foreground behavior at `src/engine/single_session/monitor.rs:79-81`.
+/// If `/rune:arc` dispatches before stdin is hooked, the command is silently dropped
+/// and the session stalls in `starting` state until bootstrap timeout.
+pub(crate) const SPAWN_INIT_WAIT_SECS: u64 = 12;
+
 /// Spawn a new arc run in a tmux session.
 ///
 /// # Steps
@@ -40,17 +47,13 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// Returns the run ID on success.
 ///
-/// # Open question (plan Task 4)
+/// # Spawn-init wait (C-5)
 ///
 /// The foreground path sleeps 12 s after spawn to let Claude Code finish
-/// initializing before dispatching the command (`monitor.rs:81`). The
-/// daemon currently dispatches immediately after `spawn_claude_session`
-/// returns. Whether the daemon needs the same 12 s wait is an empirical
-/// question (run three daemon spawns with `verbose=2`, look for
-/// `send_keys` failures or dropped commands in the first 12 s). Tracked
-/// in `plans/2026-04-14-refactor-daemon-foreground-shared-primitives-plan.md`
-/// Task 4 — deferred because resolving it requires live-process
-/// observation, not a code change.
+/// initializing before dispatching the command (`monitor.rs:79-81`).
+/// The daemon now matches this behavior via [`SPAWN_INIT_WAIT_SECS`]
+/// using `tokio::time::sleep` so the reactor remains free for heartbeat
+/// and IPC progress during the wait.
 pub async fn spawn_run(
     registry: Arc<Mutex<RunRegistry>>,
     plan_path: &Path,
@@ -60,6 +63,74 @@ pub async fn spawn_run(
     verbose: u8,
 ) -> Result<String> {
     // ── Pre-flight checks ───────────────────────────────────────────
+    preflight_checks(plan_path, repo_dir).await?;
+
+    // ── Register run ────────────────────────────────────────────────
+    let run_id = {
+        let mut reg = registry.lock().await;
+        reg.register_run(
+            plan_path.to_path_buf(),
+            repo_dir.to_path_buf(),
+            session_name,
+            config_dir.clone(),
+        )?
+    };
+
+    spawn_after_register(
+        registry,
+        run_id,
+        plan_path.to_path_buf(),
+        repo_dir.to_path_buf(),
+        config_dir,
+        verbose,
+    )
+    .await
+}
+
+/// Spawn a run that was previously enqueued, reusing its registered `run_id`.
+///
+/// Paired with `RunRegistry::promote_queued`. The drain path calls this
+/// instead of `spawn_run` so the Queued→Running transition happens on the
+/// existing RunEntry — no second entry with a fresh id, no ghost row in
+/// `gw ps`, and `gw logs <id>` / `gw stop <id>` keep working across the
+/// queue→run boundary.
+pub async fn spawn_queued_run(
+    registry: Arc<Mutex<RunRegistry>>,
+    pending: crate::daemon::registry::PendingRun,
+    verbose: u8,
+) -> Result<String> {
+    // Pre-flight uses the same gates as fresh runs. Running them BEFORE
+    // `promote_queued` avoids acquiring the repo lock only to release it
+    // on a disk-space or network failure.
+    preflight_checks(&pending.plan_path, &pending.repo_dir).await?;
+
+    // Promote the existing Queued RunEntry: acquires repo lock, resets
+    // `started_at` for correct uptime, flips `restartable` to true.
+    // Status stays Queued until the tmux send below flips it to Running —
+    // matching the fresh-run state machine.
+    {
+        let mut reg = registry.lock().await;
+        reg.promote_queued(&pending.run_id)?;
+    }
+
+    spawn_after_register(
+        registry,
+        pending.run_id,
+        pending.plan_path,
+        pending.repo_dir,
+        pending.config_dir,
+        verbose,
+    )
+    .await
+}
+
+/// Shared pre-flight I/O checks used by both fresh and queued spawn paths.
+///
+/// Extracted so `spawn_run` and `spawn_queued_run` run an identical gate
+/// sequence. Keep this set stable — reconciler, heartbeat, and circuit
+/// breaker assume a run that reaches registry mutation has already passed
+/// these checks.
+async fn preflight_checks(plan_path: &Path, repo_dir: &Path) -> Result<()> {
     if !plan_path.exists() {
         return Err(eyre!(
             "Plan file not found: {}\nProvide a valid plan path.",
@@ -95,17 +166,24 @@ pub async fn spawn_run(
         return Err(eyre!("network unavailable"));
     }
 
-    // ── Register run ────────────────────────────────────────────────
-    let run_id = {
-        let mut reg = registry.lock().await;
-        reg.register_run(
-            plan_path.to_path_buf(),
-            repo_dir.to_path_buf(),
-            session_name,
-            config_dir.clone(),
-        )?
-    };
+    Ok(())
+}
 
+/// Post-registration spawn: pre_phase_cleanup, tmux spawn, arc command
+/// dispatch, and status flip to Running.
+///
+/// The caller must have already produced a RunEntry keyed by `run_id` in
+/// the registry (via `register_run` or `promote_queued`) and acquired the
+/// repo lock. Any error path here marks the entry Failed so the repo lock
+/// is released by `update_status`'s terminal-state handler.
+async fn spawn_after_register(
+    registry: Arc<Mutex<RunRegistry>>,
+    run_id: String,
+    plan_path: PathBuf,
+    repo_dir: PathBuf,
+    config_dir: Option<PathBuf>,
+    verbose: u8,
+) -> Result<String> {
     let level_label = match verbose {
         0 => "warn",
         1 => "info",
@@ -139,27 +217,30 @@ pub async fn spawn_run(
     crate::commands::elden::clear_signals();
 
     // ── Spawn tmux session ──────────────────────────────────────────
+    // Always derive the tmux name from `run_id`. Previously the drain
+    // path could thread a stale `pending.session_name` through — that
+    // path is gone now that queued runs reuse their registered id.
     let tmux_session = format!("gw-{}", run_id);
 
     let config = SpawnConfig {
         session_id: tmux_session.clone(),
-        working_dir: repo_dir.to_path_buf(),
+        working_dir: repo_dir.clone(),
         config_dir,
         claude_path: "claude".to_string(),
         mock: false,
     };
 
-    let plan_str = plan_path.to_string_lossy();
+    let plan_str = plan_path.to_string_lossy().to_string();
 
     match spawn::spawn_claude_session(&config) {
         Ok(pid) => {
-            debug!(run_id = %run_id, pid = pid, tmux = %tmux_session, "tmux session spawned");
+            info!(run_id = %run_id, pid = pid, tmux = %tmux_session, "tmux session spawned");
 
             // Write session_owner.json so a subsequent `gw run` (foreground)
             // can adopt this daemon-spawned session if the daemon crashes.
             // Parity with monitor.rs:73-77 (plan GAP A3).
             if let Err(e) = crate::monitor::session_owner::write_session_owner(
-                repo_dir,
+                &repo_dir,
                 &tmux_session,
                 &plan_str,
                 pid,
@@ -180,6 +261,16 @@ pub async fn spawn_run(
                 entry.last_recovery_at = Some(chrono::Utc::now());
             }
             drop(reg);
+
+            // ── Spawn-init wait (C-5) ──────────────────────────────────
+            // Match foreground monitor.rs:79-81: wait for Claude TUI to
+            // finish initializing before dispatching /rune:arc.
+            crate::daemon::heartbeat::append_event(
+                &run_id,
+                "spawn_wait_init",
+                &format!("pid={} — waiting 12s for Claude TUI", pid),
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(SPAWN_INIT_WAIT_SECS)).await;
         }
         Err(e) => {
             // Spawn failed — clean up registry entry
@@ -203,12 +294,14 @@ pub async fn spawn_run(
     // flag-aware variant used on foreground restarts.
     let arc_cmd = crate::engine::single_session::util::build_arc_command_plain(&plan_str);
 
+    crate::daemon::heartbeat::append_event(&run_id, "spawn_dispatch", &format!("sending: {}", arc_cmd));
+
     if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &arc_cmd) {
         warn!(error = %e, "failed to send arc command — killing session");
         let reason = format!("failed to send arc command: {e}");
         // Persist pane capture before kill so post-mortem debugging works —
         // parity with monitor.rs:88 (plan GAP A3).
-        crate::session::detect::save_crash_dump(&tmux_session, repo_dir, &reason);
+        crate::session::detect::save_crash_dump(&tmux_session, &repo_dir, &reason);
         crate::daemon::heartbeat::append_event(&run_id, "kill_session", &format!(
             "gw killed session '{}' — reason: {} (killed by: executor/send_keys_failed)",
             tmux_session, reason,

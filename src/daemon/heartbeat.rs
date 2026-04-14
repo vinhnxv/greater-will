@@ -8,7 +8,7 @@
 
 use crate::config::watchdog::WatchdogConfig;
 use crate::daemon::protocol::RunStatus;
-use crate::daemon::registry::RunRegistry;
+use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
@@ -673,6 +673,22 @@ impl HeartbeatMonitor {
     }
 }
 
+// ── Uptime helpers ───────────────────────────────────────────────
+
+/// Compute uptime for the current session cycle.
+///
+/// Uses `last_recovery_at` if set (from a previous error recovery),
+/// otherwise falls back to `started_at` for the initial session.
+/// This ensures the crash-loop detector's budget resets correctly
+/// per recovery cycle, not across the lifetime of all crashes.
+fn compute_run_uptime_secs(entry: &RunEntry) -> u64 {
+    let session_start = entry.last_recovery_at.unwrap_or(entry.started_at);
+    chrono::Utc::now()
+        .signed_duration_since(session_start)
+        .num_seconds()
+        .max(0) as u64
+}
+
 // ── Structured event logging ───────────────────────────────────────
 
 /// Append a structured event to the run's event log (events.jsonl).
@@ -928,12 +944,7 @@ async fn handle_monitor_outcome(
             // multiple recovery cycles (FLAW-001 fix).
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id)
-                    .map(|e| {
-                        let session_start = e.last_recovery_at.unwrap_or(e.started_at);
-                        chrono::Utc::now().signed_duration_since(session_start).num_seconds().max(0) as u64
-                    })
-                    .unwrap_or(0)
+                reg.get(run_id).map(|e| compute_run_uptime_secs(e)).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 
@@ -1043,9 +1054,7 @@ async fn handle_monitor_outcome(
             // If so, reset crash counters before recording this new crash.
             let run_uptime = {
                 let reg = registry.lock().await;
-                reg.get(run_id)
-                    .map(|e| chrono::Utc::now().signed_duration_since(e.started_at).num_seconds().max(0) as u64)
-                    .unwrap_or(0)
+                reg.get(run_id).map(|e| compute_run_uptime_secs(e)).unwrap_or(0)
             };
             detector.record_healthy_runtime(run_uptime);
 

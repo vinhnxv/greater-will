@@ -545,6 +545,59 @@ impl RunRegistry {
         Some(pending)
     }
 
+    /// Promote a queued run to the running spawn path.
+    ///
+    /// Invariant fix: before this method existed, the drain path called
+    /// `register_run` which minted a fresh `run_id` and inserted a *second*
+    /// RunEntry while the original Queued entry lingered in `self.runs`
+    /// forever — producing a ghost row in `gw ps` (one Queued, one Running,
+    /// same TMUX name). This method keeps the original `run_id` so the
+    /// lifecycle is Queued → Running on a single entry.
+    ///
+    /// Steps:
+    /// 1. Validate the entry exists and is still `Queued`.
+    /// 2. Acquire the per-repo lock — `enqueue_run` intentionally does not
+    ///    hold one, so acquisition happens here at promotion time.
+    /// 3. Reset `started_at` to now so `uptime_secs` reflects spawn time
+    ///    rather than time-spent-in-queue (matches the fresh-run path).
+    /// 4. Set `restartable = true` so heartbeat crash recovery treats
+    ///    drained-then-running entries like fresh registrations
+    ///    (`enqueue_run` sets it `false` because a never-spawned run has
+    ///    nothing to recover to).
+    ///
+    /// Status stays `Queued` on success — the subsequent tmux spawn in the
+    /// executor flips it to `Running` via `update_status`, preserving the
+    /// same two-step state machine used by `register_run` + `update_status`.
+    pub fn promote_queued(&mut self, run_id: &str) -> Result<()> {
+        let repo_dir = {
+            let entry = self
+                .runs
+                .get(run_id)
+                .ok_or_else(|| color_eyre::eyre::eyre!("run not found: {run_id}"))?;
+            if entry.status != RunStatus::Queued {
+                return Err(color_eyre::eyre::eyre!(
+                    "run {run_id} is not queued (status: {:?})",
+                    entry.status
+                ));
+            }
+            entry.repo_dir.clone()
+        };
+
+        self.acquire_repo_lock(&repo_dir)?;
+
+        let entry = self
+            .runs
+            .get_mut(run_id)
+            .expect("entry existence validated above under the same &mut self borrow");
+        entry.started_at = Utc::now();
+        entry.restartable = true;
+        let entry_clone = entry.clone();
+        self.write_meta(&entry_clone)?;
+
+        tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
+        Ok(())
+    }
+
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
     pub fn drain_next(&mut self, repo_dir: &Path) -> Option<PendingRun> {
         let hash = repo_hash(repo_dir);
@@ -895,12 +948,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn with_temp_gw_home(f: impl FnOnce(&TempDir)) {
-        use std::sync::{Mutex, OnceLock};
-        static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        // Recover from poison: a panicking test already fails; propagating
-        // lock poison would cascade failures to unrelated tests.
-        let _guard = MUTEX
-            .get_or_init(|| Mutex::new(()))
+        // Shared across `daemon::*` test modules — see
+        // `daemon::state::gw_home_test_mutex` for why a common lock is
+        // required. Recover from poison: a panicking test already fails;
+        // propagating lock poison would cascade to unrelated tests.
+        let _guard = crate::daemon::state::gw_home_test_mutex()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let tmp = TempDir::new().unwrap();
@@ -1136,6 +1188,94 @@ mod tests {
             let d2 = reg.drain_next(&repo).unwrap();
             assert_eq!(d2.run_id, "q2");
             assert!(reg.drain_next(&repo).is_none());
+        });
+    }
+
+    #[test]
+    fn promote_queued_flips_to_running_without_ghost() {
+        // Regression test for `gw ps` ghost rows: before `promote_queued`
+        // existed, the drain path minted a fresh run_id and left the
+        // queued RunEntry orphaned. This test asserts the invariant:
+        // after promotion + status update, there is EXACTLY ONE entry
+        // for the run_id — not two.
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo-promote");
+            let run_id = "prom1".to_string();
+            let pending = PendingRun {
+                run_id: run_id.clone(),
+                plan_path: PathBuf::from("plan.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            reg.enqueue_run(pending).unwrap();
+
+            // Before promotion: one Queued entry, not holding the repo lock.
+            assert_eq!(reg.list_runs(true).len(), 1);
+            assert!(!reg.has_repo_lock(&repo));
+
+            // Simulate the drain path: pop from pending_queues then promote.
+            let popped = reg.drain_next(&repo).unwrap();
+            assert_eq!(popped.run_id, run_id);
+
+            reg.promote_queued(&run_id).unwrap();
+
+            // Entry count must remain 1 — no ghost from a second register_run.
+            let all = reg.list_runs(true);
+            assert_eq!(all.len(), 1, "promote must not create a second entry");
+            assert_eq!(all[0].run_id, run_id);
+            assert_eq!(all[0].status, RunStatus::Queued);
+
+            // Lock must now be held (enqueue_run deliberately does not hold one).
+            assert!(reg.has_repo_lock(&repo));
+
+            // restartable must flip to true (enqueue sets false) so heartbeat
+            // crash recovery treats this like a fresh-registered run.
+            assert!(reg.get(&run_id).unwrap().restartable);
+
+            // The subsequent status update is what actually flips to Running —
+            // this mirrors what `spawn_after_register` does on the real path.
+            reg.update_status(&run_id, RunStatus::Running, Some("starting".into()), None)
+                .unwrap();
+            assert_eq!(reg.get(&run_id).unwrap().status, RunStatus::Running);
+            // Still exactly one entry.
+            assert_eq!(reg.list_runs(true).len(), 1);
+        });
+    }
+
+    #[test]
+    fn promote_queued_rejects_non_queued_status() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            // A freshly registered run is Queued, then flipped to Running.
+            let id = reg
+                .register_run(
+                    PathBuf::from("plans/p.md"),
+                    PathBuf::from("/tmp/promote-non-queued"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            reg.update_status(&id, RunStatus::Running, None, None)
+                .unwrap();
+
+            let err = reg.promote_queued(&id).unwrap_err();
+            assert!(
+                err.to_string().contains("not queued"),
+                "expected 'not queued' in error, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn promote_queued_rejects_unknown_run() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let err = reg.promote_queued("does-not-exist").unwrap_err();
+            assert!(err.to_string().contains("run not found"));
         });
     }
 

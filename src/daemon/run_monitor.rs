@@ -50,6 +50,7 @@ use crate::engine::single_session::util::{
 use crate::monitor::loop_state::{read_arc_loop_state, ArcLoopState};
 use crate::monitor::phase_nav;
 use crate::monitor::prompt_accept::PromptAcceptor;
+use crate::session::spawn;
 
 // Constants are now sourced from `crate::engine::monitor_constants` — see the
 // module docstring there for divergence rationale (DAEMON vs FOREGROUND
@@ -604,17 +605,26 @@ impl DaemonRunMonitor {
             }
         }
 
-        // StopFailure signal (API errors) → route to kill gate
-        if let Some(_signal) =
+        // StopFailure signal (API errors) → classify via pane output, route to kill gate.
+        // Event format: stop_failure_classified → "stop-failure signal [{ErrorClass}]: {summary}"
+        if let Some(signal) =
             crate::commands::elden::read_stop_failure_signal_from(&self.repo_dir)
         {
             crate::commands::elden::clear_signals_from(&self.repo_dir);
             if self.pending_kill.is_none() {
-                // Shard 4/follow-up: classify the signal and inject ErrorClass.
-                // For now, route a generic error to pending_kill.
+                let pane = spawn::capture_pane(&self.tmux_session).unwrap_or_default();
+                let class = ErrorClass::from_pane_output(&pane, false).unwrap_or(ErrorClass::Crash);
+
+                let summary = signal.get("error").and_then(|v| v.as_str())
+                    .or_else(|| signal.get("reason").and_then(|v| v.as_str()))
+                    .unwrap_or("stop-failure signal (no detail)");
+                let reason = format!("stop-failure signal [{:?}]: {}", class, summary);
+
+                crate::daemon::heartbeat::append_event(&self.run_id, "stop_failure_classified", &reason);
+
                 self.pending_kill = Some(PendingKillRequest {
-                    reason: "stop-failure signal received".to_string(),
-                    outcome: KillOutcomeKind::ErrorDetected(ErrorClass::Crash),
+                    reason,
+                    outcome: KillOutcomeKind::ErrorDetected(class),
                     started_at: Instant::now(),
                     nudge_sent: false,
                 });
