@@ -721,31 +721,39 @@ impl RunRegistry {
     }
 
     /// Record a queue spawn failure for the circuit breaker.
-    pub fn record_queue_failure(&mut self, repo_dir: &Path) {
+    /// Returns staged statuses that the caller should flush after releasing the mutex.
+    /// INV-19 / BACK-007: avoids N sequential fsyncs while holding the registry lock.
+    pub fn record_queue_failure(&mut self, repo_dir: &Path) -> Vec<StagedStatus> {
         let hash = repo_hash(repo_dir);
         let count = self.consecutive_failures.entry(hash.clone()).or_insert(0);
         *count += 1;
+        let mut staged_batch = Vec::new();
         if *count >= MAX_CONSECUTIVE_FAILURES {
             tracing::warn!(repo_hash = %hash, "circuit breaker tripped — draining remaining queue");
-            // Collect run IDs first to avoid borrowing self while iterating
             let run_ids: Vec<String> = self
                 .pending_queues
                 .get_mut(&hash)
                 .map(|queue| queue.drain(..).map(|p| p.run_id).collect())
                 .unwrap_or_default();
             for run_id in &run_ids {
-                let _ = self.update_status(
+                match self.stage_status_locked(
                     run_id,
                     RunStatus::Stopped,
                     None,
                     Some("circuit breaker tripped".into()),
-                );
+                ) {
+                    Ok(staged) => staged_batch.push(staged),
+                    Err(e) => {
+                        tracing::error!(run_id = %run_id, error = %e, "stage_status_locked failed: circuit breaker drain");
+                    }
+                }
             }
             self.consecutive_failures.remove(&hash);
         }
         if let Err(e) = self.save_queue() {
             tracing::warn!(error = %e, "failed to persist queue after record_queue_failure");
         }
+        staged_batch
     }
 
     /// Record a successful queue spawn, resetting the circuit breaker.
@@ -1828,7 +1836,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("abc".to_string(), tempfile::tempfile().unwrap());
         let guard = RepoLockGuard::new("abc".to_string());
-        guard.commit();
+        let _ = guard.commit();
         // guard consumed, map untouched
         assert!(map.contains_key("abc"));
     }

@@ -1163,14 +1163,22 @@ pub(crate) async fn drain_if_available(
 ) {
     let next = {
         let mut reg = registry.lock().await;
-        if failed {
-            reg.record_queue_failure(repo_dir);
+        let staged_batch = if failed {
+            reg.record_queue_failure(repo_dir)
         } else {
             reg.record_queue_success(repo_dir);
-        }
+            Vec::new()
+        };
         // Try the completing repo's queue first, then any other queue
         // with available capacity (handles runs queued by A6 global cap).
-        reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready())
+        let next = reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready());
+        // Flush staged statuses after releasing the lock (INV-19)
+        for staged in &staged_batch {
+            if let Err(e) = reg.flush_status(staged) {
+                tracing::error!(run_id = %staged.entry.run_id, error = %e, "flush_status failed: circuit breaker drain");
+            }
+        }
+        next
     };
 
     if let Some(pending) = next {
@@ -1202,14 +1210,21 @@ pub(crate) async fn drain_if_available(
                     //      releases the lock via its Failed branch.
                     // Without this, `drain_next` already popped the PendingRun
                     // so the entry would ghost as "queued" forever.
-                    let _ = reg.update_status(
+                    if let Err(ue) = reg.update_status(
                         &pending_run_id,
                         RunStatus::Failed,
                         None,
                         Some(format!("drain spawn failed: {e}")),
-                    );
-                    reg.record_queue_failure(&repo_dir);
+                    ) {
+                        tracing::error!(run_id = %pending_run_id, error = %ue, "update_status failed: marking failed after drain spawn error");
+                    }
+                    let staged_batch = reg.record_queue_failure(&repo_dir);
                     let next = reg.drain_next(&repo_dir);
+                    for staged in &staged_batch {
+                        if let Err(fe) = reg.flush_status(staged) {
+                            tracing::error!(run_id = %staged.entry.run_id, error = %fe, "flush_status failed: circuit breaker drain");
+                        }
+                    }
                     drop(reg);
                     if let Some(retry) = next {
                         tracing::info!("retrying with next queued run after spawn failure");
