@@ -73,7 +73,13 @@ fn main() -> Result<()> {
         commands::Commands::Daemon { action } => commands::daemon::execute(action),
         commands::Commands::Ps { all, json, running, failed } => commands::ps::execute(all, json, running, failed),
         commands::Commands::Logs { run_id, follow, tail, pane } => commands::logs::execute(run_id, follow, tail, pane),
-        commands::Commands::Stop { run_id, force, detach } => commands::stop::execute(run_id, force, detach),
+        commands::Commands::Stop { run_id, force, detach, all } => {
+            if all {
+                commands::stop::execute_all(force, detach)
+            } else {
+                commands::stop::execute(run_id.expect("clap enforces run_id when --all is absent"), force, detach)
+            }
+        }
         commands::Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "gw", &mut std::io::stdout());

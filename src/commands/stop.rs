@@ -8,7 +8,7 @@
 //! - `--detach`: stops GW tracking but keeps the tmux session alive
 
 use crate::client::socket::DaemonClient;
-use crate::daemon::protocol::{Request, Response};
+use crate::daemon::protocol::{Request, Response, RunStatus};
 use crate::output::tags::tag;
 use color_eyre::Result;
 use std::io::{self, Write};
@@ -119,6 +119,117 @@ pub fn execute(run_id: String, force: bool, detach: bool) -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+/// Execute `gw stop --all`.
+///
+/// Lists every run tracked by the daemon, filters to Running/Queued, prompts
+/// once for confirmation, then dispatches `StopRun` (default) or `DetachRun`
+/// (`--detach`) for each. Per-run failures are reported but do not abort
+/// the batch — a single failing run should not strand the others.
+pub fn execute_all(force: bool, detach: bool) -> Result<()> {
+    if !DaemonClient::is_daemon_running() {
+        println!("{} Daemon is not running.", tag("WARN"));
+        println!("  Nothing tracked to stop. Orphaned tmux sessions: `gw clean`.");
+        return Ok(());
+    }
+
+    let client = DaemonClient::new()?;
+    let runs = match client.send(Request::ListRuns { all: false })? {
+        Response::RunList { runs } => runs,
+        Response::Error { message, .. } => {
+            println!("{} {}", tag("FAIL"), message);
+            return Ok(());
+        }
+        _ => {
+            println!("{} Unexpected response from daemon", tag("WARN"));
+            return Ok(());
+        }
+    };
+
+    let targets: Vec<_> = runs
+        .into_iter()
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Queued))
+        .collect();
+
+    if targets.is_empty() {
+        println!("{} No active runs to stop.", tag("OK"));
+        return Ok(());
+    }
+
+    if !force {
+        if detach {
+            println!(
+                "{} This will stop tracking {} run(s) but keep their tmux sessions alive:",
+                tag("WARN"),
+                targets.len(),
+            );
+        } else {
+            println!(
+                "{} This will stop {} run(s) and kill their tmux sessions:",
+                tag("WARN"),
+                targets.len(),
+            );
+        }
+        for r in &targets {
+            println!("  - {} ({})", crate::commands::util::short_id(&r.run_id), r.session_name);
+        }
+        if !detach {
+            println!("  Any in-progress work that hasn't been committed will be lost.");
+            println!("  Use --detach to keep the tmux sessions alive instead.");
+        }
+
+        print!("Continue? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let mut stopped = 0usize;
+    let mut failed = 0usize;
+    for run in &targets {
+        let short = crate::commands::util::short_id(&run.run_id);
+        let request = if detach {
+            Request::DetachRun { run_id: run.run_id.clone() }
+        } else {
+            Request::StopRun { run_id: run.run_id.clone() }
+        };
+
+        match client.send(request) {
+            Ok(Response::Ok { message }) => {
+                println!("{} [{}] {}", tag("OK"), short, message);
+                stopped += 1;
+            }
+            Ok(Response::Error { code, message }) => {
+                println!("{} [{}] {}", tag("FAIL"), short, message);
+                println!("  {}", code.suggestion(&run.run_id));
+                failed += 1;
+            }
+            Ok(_) => {
+                println!("{} [{}] unexpected response", tag("WARN"), short);
+                failed += 1;
+            }
+            Err(err) => {
+                println!("{} [{}] {}", tag("FAIL"), short, err);
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "{} {} stopped, {} failed.",
+        if failed == 0 { tag("OK") } else { tag("WARN") },
+        stopped,
+        failed,
+    );
 
     Ok(())
 }

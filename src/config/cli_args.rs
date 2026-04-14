@@ -213,9 +213,11 @@ pub enum Commands {
     /// By default, prompts for confirmation and kills the tmux session.
     /// Use `--force` to skip confirmation.
     /// Use `--detach` to stop tracking but keep the tmux session alive.
+    /// Use `--all` to stop every running and queued run.
     Stop {
-        /// The run ID to stop.
-        run_id: String,
+        /// The run ID to stop. Omit when using `--all`.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        run_id: Option<String>,
         /// Skip confirmation prompt.
         #[arg(long, short)]
         force: bool,
@@ -223,6 +225,9 @@ pub enum Commands {
         /// The session can be re-adopted on next daemon restart.
         #[arg(long, short)]
         detach: bool,
+        /// Stop every running and queued run.
+        #[arg(long, short = 'A')]
+        all: bool,
     },
 
     /// Generate shell completions.
