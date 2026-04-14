@@ -204,6 +204,12 @@ pub struct DaemonRunMonitor {
     claude_pid: Option<u32>,
     last_process_gone_at: Option<Instant>,
 
+    // Swarm activity
+    /// Cached swarm activity state (refreshed every 15s).
+    cached_swarm_active: bool,
+    /// Last time swarm activity was checked.
+    last_swarm_check: Instant,
+
     // Prompt handling
     prompt_acceptor: PromptAcceptor,
 
@@ -293,6 +299,8 @@ impl DaemonRunMonitor {
             failed_nudge_count: 0,
             claude_pid: entry.claude_pid,
             last_process_gone_at: None,
+            cached_swarm_active: false,
+            last_swarm_check: now,
             prompt_acceptor,
             last_status_log: now,
             poll_count: 0,
@@ -359,7 +367,7 @@ impl DaemonRunMonitor {
                         self.check_pane_completion(content);
 
                         // 11. Error evidence detection
-                        self.evaluate_error_evidence(content);
+                        self.evaluate_error_evidence(content).await;
                     }
 
                     // Steps below run regardless of pane capture success.
@@ -579,6 +587,23 @@ impl DaemonRunMonitor {
         tokio::task::spawn_blocking(move || check_swarm_activity(pid).is_some())
             .await
             .unwrap_or(false)
+    }
+
+    /// Refresh cached swarm activity state (15-second poll interval).
+    async fn refresh_swarm_activity(&mut self) {
+        if self.last_swarm_check.elapsed() < std::time::Duration::from_secs(15) {
+            return; // honor cached value
+        }
+        self.last_swarm_check = Instant::now();
+        let prev = self.cached_swarm_active;
+        self.cached_swarm_active = self.check_swarm_active().await;
+        if prev != self.cached_swarm_active {
+            crate::daemon::heartbeat::append_event(
+                &self.run_id,
+                "swarm_state",
+                &format!("active={}", self.cached_swarm_active),
+            );
+        }
     }
 }
 
@@ -1194,7 +1219,8 @@ impl DaemonRunMonitor {
     /// deferred to Shard 4 — current implementation uses a fixed 0.9 stand-in
     /// confidence. The structural pieces (timer, class-change reset, threshold
     /// floor, kill gate routing) are in place.
-    fn evaluate_error_evidence(&mut self, pane_content: &str) {
+    async fn evaluate_error_evidence(&mut self, pane_content: &str) {
+        self.refresh_swarm_activity().await;
         let screen_stall = self.last_activity.elapsed().as_secs();
 
         // Only scan keywords when screen is NOT changing (reduces false positives).
@@ -1212,8 +1238,7 @@ impl DaemonRunMonitor {
                 .claude_pid
                 .is_none_or(crate::cleanup::process::is_pid_alive),
             artifacts_active: self.last_artifact_activity.elapsed().as_secs() < 60,
-            // Swarm activity is updated by an external task; default false for now.
-            swarm_active: false,
+            swarm_active: self.cached_swarm_active,
         };
 
         match evidence.classify() {
