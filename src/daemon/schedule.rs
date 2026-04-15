@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::daemon::server::{validate_repo_dir, validate_plan_path};
+
 // ── Schedule kind ──────────────────────────────────────────────────
 
 /// The type of schedule trigger.
@@ -43,6 +45,8 @@ pub enum ScheduleStatus {
     Completed,
     /// Terminal: the schedule encountered an unrecoverable error.
     Failed,
+    /// Terminal: path validation failed at fire time or during migration.
+    Rejected,
 }
 
 // ── Schedule entry ─────────────────────────────────────────────────
@@ -74,6 +78,9 @@ pub struct ScheduleEntry {
     pub fire_count: u32,
     /// Optional human-readable label.
     pub label: Option<String>,
+    /// Error message when status is `Rejected` (absent in legacy entries).
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 // ── Schedule registry ──────────────────────────────────────────────
@@ -201,6 +208,11 @@ impl ScheduleRegistry {
         }
     }
 
+    /// Get a mutable reference to an entry by ID.
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut ScheduleEntry> {
+        self.entries.get_mut(id)
+    }
+
     /// Count entries with `Active` status.
     pub fn count_active(&self) -> usize {
         self.entries
@@ -224,7 +236,7 @@ impl ScheduleRegistry {
         let bytes = std::fs::read(path)
             .wrap_err_with(|| format!("failed to read schedule registry at {}", path.display()))?;
 
-        let entries: HashMap<String, ScheduleEntry> = serde_json::from_slice(&bytes)
+        let mut entries: HashMap<String, ScheduleEntry> = serde_json::from_slice(&bytes)
             .wrap_err_with(|| {
                 format!(
                     "failed to parse schedule registry at {}",
@@ -232,10 +244,48 @@ impl ScheduleRegistry {
                 )
             })?;
 
-        Ok(Self {
+        // Post-load migration: validate paths for Active entries.
+        // Valid entries get rebind to canonical paths; invalid ones are Rejected.
+        let mut dirty = false;
+        for entry in entries.values_mut() {
+            if entry.status != ScheduleStatus::Active {
+                continue;
+            }
+            match validate_repo_dir(&entry.repo_dir)
+                .and_then(|repo| validate_plan_path(&entry.plan_path, &repo).map(|plan| (repo, plan)))
+            {
+                Ok((canonical_repo, canonical_plan)) => {
+                    if entry.repo_dir != canonical_repo || entry.plan_path != canonical_plan {
+                        entry.repo_dir = canonical_repo;
+                        entry.plan_path = canonical_plan;
+                        dirty = true;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        schedule_id = %entry.id,
+                        error = %e,
+                        "schedule rejected during load migration"
+                    );
+                    entry.status = ScheduleStatus::Rejected;
+                    entry.last_error = Some(format!("load migration validation failed: {e}"));
+                    dirty = true;
+                }
+            }
+        }
+
+        let registry = Self {
             entries,
             path: path.to_path_buf(),
-        })
+        };
+
+        if dirty {
+            if let Err(e) = registry.save() {
+                tracing::warn!(error = %e, "failed to persist schedule migration");
+            }
+        }
+
+        Ok(registry)
     }
 
     /// Persist the registry to disk using atomic write.
@@ -301,6 +351,35 @@ pub async fn run_schedule_loop(
                     sched.get_ready_schedules()
                 };
                 for entry in ready {
+                    // Defense-in-depth: re-validate paths at fire time (TOCTOU mitigation)
+                    let canonical_repo = match validate_repo_dir(&entry.repo_dir) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(schedule_id = %entry.id, error = %e, "schedule rejected: repo_dir validation failed at fire time");
+                            let mut sched = schedule_registry.lock().await;
+                            if let Some(ent) = sched.get_mut(&entry.id) {
+                                ent.status = ScheduleStatus::Rejected;
+                                ent.last_error = Some(format!("fire-time validation failed: {e}"));
+                            }
+                            if let Err(save_err) = sched.save() {
+                                tracing::warn!(error = %save_err, "failed to persist schedule rejection");
+                            }
+                            continue;
+                        }
+                    };
+                    if let Err(e) = validate_plan_path(&entry.plan_path, &canonical_repo) {
+                        tracing::warn!(schedule_id = %entry.id, error = %e, "schedule rejected: plan_path validation failed at fire time");
+                        let mut sched = schedule_registry.lock().await;
+                        if let Some(ent) = sched.get_mut(&entry.id) {
+                            ent.status = ScheduleStatus::Rejected;
+                            ent.last_error = Some(format!("fire-time validation failed: {e}"));
+                        }
+                        if let Err(save_err) = sched.save() {
+                            tracing::warn!(error = %save_err, "failed to persist schedule rejection");
+                        }
+                        continue;
+                    }
+
                     let result = crate::daemon::executor::spawn_run(
                         Arc::clone(&run_registry),
                         &entry.plan_path,
@@ -490,6 +569,7 @@ mod tests {
             next_fire: Some(Utc::now() + chrono::Duration::hours(1)),
             fire_count: 0,
             label: Some("test".into()),
+            last_error: None,
         };
 
         let id = reg.add(entry).unwrap();
@@ -517,6 +597,7 @@ mod tests {
             next_fire: None,
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -551,6 +632,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -585,6 +667,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -632,6 +715,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: Some("roundtrip test".into()),
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -663,6 +747,7 @@ mod tests {
             next_fire: Some(Utc::now() - chrono::Duration::hours(1)),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         // Entry with next_fire in the future — should NOT be ready.
@@ -681,6 +766,7 @@ mod tests {
             next_fire: Some(Utc::now() + chrono::Duration::hours(1)),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(past_entry).unwrap();
@@ -712,6 +798,7 @@ mod tests {
             next_fire: Some(Utc::now()),
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(entry).unwrap();
@@ -745,6 +832,7 @@ mod tests {
             next_fire: None,
             fire_count: 0,
             label: None,
+            last_error: None,
         };
 
         reg.add(make_entry("aabb1122")).unwrap();
@@ -799,5 +887,29 @@ mod tests {
     fn compute_next_fire_delayed_returns_none() {
         let kind = ScheduleKind::Delayed { delay_secs: 60 };
         assert!(compute_next_fire(&kind, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn serde_backward_compat_no_last_error() {
+        // Simulate a legacy JSON entry that lacks the `last_error` field.
+        // With `#[serde(default)]` on the field, this should deserialize
+        // successfully with `last_error` defaulting to `None`.
+        let json = r#"{
+            "id": "legacy01",
+            "plan_path": "plans/test.md",
+            "repo_dir": "/tmp/repo",
+            "config_dir": null,
+            "verbose": 0,
+            "kind": { "Delayed": { "delay_secs": 60 } },
+            "status": "Active",
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_fired": null,
+            "next_fire": null,
+            "fire_count": 0,
+            "label": null
+        }"#;
+        let entry: ScheduleEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.id, "legacy01");
+        assert!(entry.last_error.is_none());
     }
 }

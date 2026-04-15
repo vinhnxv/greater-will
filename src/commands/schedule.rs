@@ -210,6 +210,7 @@ fn format_schedule_status(status: &ScheduleStatus) -> String {
         ScheduleStatus::Paused => ("paused", Style::new().yellow()),
         ScheduleStatus::Completed => ("completed", Style::new().dim()),
         ScheduleStatus::Failed => ("failed", Style::new().red().bold()),
+        ScheduleStatus::Rejected => ("rejected", Style::new().red()),
     };
     style.apply_to(label).to_string()
 }

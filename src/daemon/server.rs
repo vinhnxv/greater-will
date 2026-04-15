@@ -748,13 +748,40 @@ async fn dispatch_request(
             verbose,
             label,
         } => {
-            // Validate plan_path exists
-            if !plan_path.exists() {
-                return Response::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: format!("plan file not found: {}", plan_path.display()),
-                };
-            }
+            // INV-13/INV-14, DECREE-002/DECREE-007: Validate repo_dir,
+            // plan_path, and config_dir with the same security boundary
+            // enforcement used by SubmitRun (SEC-008).
+            let canonical_repo = match validate_repo_dir(&repo_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid repo_dir: {e}"),
+                    };
+                }
+            };
+            let canonical_plan = match validate_plan_path(&plan_path, &canonical_repo) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid plan_path: {e}"),
+                    };
+                }
+            };
+            let canonical_config = match config_dir
+                .as_ref()
+                .map(|p| validate_config_dir(p))
+                .transpose()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid config_dir: {e}"),
+                    };
+                }
+            };
 
             // Validate cron expression if applicable
             if let crate::daemon::schedule::ScheduleKind::Cron { ref expression } = kind {
@@ -776,9 +803,9 @@ async fn dispatch_request(
 
             let entry = crate::daemon::schedule::ScheduleEntry {
                 id: crate::daemon::registry::RunRegistry::generate_id(),
-                plan_path,
-                repo_dir,
-                config_dir,
+                plan_path: canonical_plan,
+                repo_dir: canonical_repo,
+                config_dir: canonical_config,
                 verbose,
                 kind,
                 status: crate::daemon::schedule::ScheduleStatus::Active,
@@ -787,6 +814,7 @@ async fn dispatch_request(
                 next_fire,
                 fire_count: 0,
                 label,
+                last_error: None,
             };
 
             let mut sched = schedule_registry.lock().await;
@@ -998,7 +1026,7 @@ pub(crate) fn read_log_tail(path: &Path, tail: Option<usize>) -> String {
 /// SEC-008: Rejects any `..` components in the *raw* input (defense-in-depth,
 /// even if canonicalization would resolve them) and then canonicalizes,
 /// which implicitly enforces that the directory exists and is accessible.
-fn validate_repo_dir(repo_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn validate_repo_dir(repo_dir: &Path) -> Result<PathBuf> {
     for component in repo_dir.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(color_eyre::eyre::eyre!(
@@ -1017,7 +1045,7 @@ fn validate_repo_dir(repo_dir: &Path) -> Result<PathBuf> {
 /// canonical-path prefix check, which is the real security boundary. A
 /// plan_path that canonicalizes outside the repo root (e.g., via a symlink)
 /// will be rejected here.
-fn validate_plan_path(plan_path: &Path, allowed_root: &Path) -> Result<PathBuf> {
+pub(crate) fn validate_plan_path(plan_path: &Path, allowed_root: &Path) -> Result<PathBuf> {
     for component in plan_path.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(color_eyre::eyre::eyre!(
@@ -1038,6 +1066,32 @@ fn validate_plan_path(plan_path: &Path, allowed_root: &Path) -> Result<PathBuf> 
         ));
     }
 
+    Ok(canonical)
+}
+
+/// Validate a config directory path supplied by an IPC client.
+///
+/// INV-13: Rejects any `..` components (directory-traversal defense-in-depth)
+/// and then canonicalizes, which implicitly enforces that the directory exists.
+/// Unlike `validate_repo_dir`, no `starts_with` root check is applied because
+/// config directories are not constrained to live inside the repository.
+pub(crate) fn validate_config_dir(config_dir: &Path) -> Result<PathBuf> {
+    for component in config_dir.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(color_eyre::eyre::eyre!(
+                "config_dir contains '..' component"
+            ));
+        }
+    }
+    let canonical = config_dir
+        .canonicalize()
+        .wrap_err_with(|| format!("config_dir does not exist: {}", config_dir.display()))?;
+    if !canonical.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "config_dir is not a directory: {}",
+            canonical.display()
+        ));
+    }
     Ok(canonical)
 }
 
@@ -1240,5 +1294,69 @@ mod tests {
 
         // Clean up GW_HOME
         unsafe { std::env::remove_var("GW_HOME") };
+    }
+
+    // ── Path validator unit tests ─────────────────────────────────
+
+    #[test]
+    fn validate_config_dir_valid() {
+        let dir = TempDir::new().unwrap();
+        let result = validate_config_dir(dir.path());
+        assert!(result.is_ok());
+        // Should return a canonical (absolute) path
+        assert!(result.unwrap().is_absolute());
+    }
+
+    #[test]
+    fn validate_config_dir_nonexistent() {
+        let result = validate_config_dir(std::path::Path::new("/nonexistent/config/dir"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_config_dir_file_not_dir() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("afile.txt");
+        std::fs::write(&file, "data").unwrap();
+        let result = validate_config_dir(&file);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not a directory"),
+            "error should mention 'not a directory'"
+        );
+    }
+
+    #[test]
+    fn validate_config_dir_parent_component_rejected() {
+        let dir = TempDir::new().unwrap();
+        let traversal = dir.path().join("sub").join("..").join("escape");
+        let result = validate_config_dir(&traversal);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("'..'"),
+            "error should mention '..' component"
+        );
+    }
+
+    #[test]
+    fn validate_repo_dir_parent_component_rejected() {
+        let dir = TempDir::new().unwrap();
+        let traversal = dir.path().join("..").join("evil");
+        let result = validate_repo_dir(&traversal);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("'..'"));
+    }
+
+    #[test]
+    fn validate_plan_path_outside_root_rejected() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "# plan").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+        let result = validate_plan_path(&outside, &canon_root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside allowed root"));
     }
 }
