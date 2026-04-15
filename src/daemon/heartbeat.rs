@@ -399,9 +399,9 @@ impl HeartbeatMonitor {
     fn append_pane_log(&self, run_id: &str, content: &str) {
         let run_id = run_id.to_owned();
         let content = content.to_owned();
-        let _ = tokio::task::spawn_blocking(move || {
+        drop(tokio::task::spawn_blocking(move || {
             append_pane_log_sync(&run_id, &content);
-        });
+        }));
     }
 
     /// Update the run's current phase from checkpoint.json (ground truth),

@@ -29,9 +29,12 @@ pub fn append_event(run_id: &str, event: &str, message: &str) {
         let run_id = run_id.to_string();
         let event = event.to_string();
         let message = message.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
+        // Fire-and-forget: spawn_blocking tasks run to completion even
+        // when the JoinHandle is dropped; explicit drop silences
+        // clippy::let_underscore_future.
+        drop(tokio::task::spawn_blocking(move || {
             append_event_sync(&run_id, &event, &message);
-        });
+        }));
     } else {
         append_event_sync(run_id, event, message);
     }

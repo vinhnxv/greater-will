@@ -378,10 +378,10 @@ impl DaemonRunMonitor {
                     }
 
                     // 7. Checkpoint polling + phase tracking
-                    self.poll_checkpoint();
+                    self.poll_checkpoint().await;
 
                     // 8. Loop state tracking
-                    if let Some(outcome) = self.poll_loop_state() {
+                    if let Some(outcome) = self.poll_loop_state().await {
                         return outcome;
                     }
 
@@ -882,20 +882,31 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
-    fn poll_checkpoint(&mut self) {
-        let checkpoint = match read_cached_checkpoint(
-            &self.repo_dir,
-            &mut self.cached_checkpoint_path,
-        ) {
-            Some(c) => c,
-            None => return,
+    // INV-19: poll_checkpoint hoisted off tokio reactor via spawn_blocking.
+    // The blocking read_cached_checkpoint call is wrapped in a spawn_blocking
+    // closure that takes owned copies of repo_dir and cached_path, returning
+    // both the checkpoint and the (possibly updated) cached path.
+    async fn poll_checkpoint(&mut self) {
+        let repo_dir = self.repo_dir.clone();
+        let mut cached_path = self.cached_checkpoint_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let cp = read_cached_checkpoint(&repo_dir, &mut cached_path);
+            if cp.is_some() && cached_path.is_none() {
+                cached_path = find_artifact_dir_cached(&cached_path, &repo_dir);
+            }
+            (cp, cached_path)
+        })
+        .await
+        .ok();
+
+        let (checkpoint, updated_cache) = match result {
+            Some((Some(cp), cache)) => (cp, cache),
+            Some((None, _)) => return,
+            None => return, // spawn_blocking panicked
         };
 
-        // Update cached path if find_artifact_dir_cached returned a new location.
-        if self.cached_checkpoint_path.is_none() {
-            self.cached_checkpoint_path =
-                find_artifact_dir_cached(&self.cached_checkpoint_path, &self.repo_dir);
-        }
+        // Write back the (possibly updated) cached path.
+        self.cached_checkpoint_path = updated_cache;
 
         // Checkpoint heartbeat — any read that succeeded means progress exists.
         self.last_checkpoint_activity = Instant::now();
@@ -1017,8 +1028,15 @@ impl DaemonRunMonitor {
     /// function tolerates absence as long as the screen is changing. Once the
     /// warmup window expires AND the screen is idle, it returns
     /// [`DaemonRunOutcome::Failed`] with a bootstrap-error reason.
-    fn poll_loop_state(&mut self) -> Option<DaemonRunOutcome> {
-        let read = read_arc_loop_state(&self.repo_dir);
+    // INV-19: poll_loop_state hoisted off tokio reactor via spawn_blocking.
+    // read_arc_loop_state does std::fs::read_to_string — blocking I/O.
+    async fn poll_loop_state(&mut self) -> Option<DaemonRunOutcome> {
+        let repo_dir = self.repo_dir.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_arc_loop_state(&repo_dir)
+        })
+        .await
+        .unwrap_or(crate::monitor::loop_state::LoopStateRead::Missing);
         let file_on_disk = !matches!(
             read,
             crate::monitor::loop_state::LoopStateRead::Missing
