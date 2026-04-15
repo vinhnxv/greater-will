@@ -195,8 +195,9 @@ impl HeartbeatMonitor {
     ///
     /// Spawns a [`DaemonRunMonitor`] for each new Running entry that doesn't
     /// already have a monitor, cancels monitors for stopped/finished runs,
-    /// and prunes finished handles. Lightweight phase tracking via
-    /// `handle_alive_session` continues for `gw ps` display.
+    /// and prunes finished handles. Lightweight pane captures for `gw ps`
+    /// display are fanned out across `spawn_blocking` tasks at the end of
+    /// the tick (see PERF-001).
     async fn check_all_runs(&self) {
         // BACK-007: Single list_runs(true) call, partitioned into running/stopped.
         // BACK-014: Pre-clone RunEntry snapshots in the initial lock scope to
@@ -340,23 +341,38 @@ impl HeartbeatMonitor {
 
         // Lightweight phase tracking for `gw ps` — runs on every tick
         // independently of the per-run monitors.
+        //
+        // PERF-001: `spawn::capture_pane` is a blocking `std::process::Command`
+        // call that historically took 20–100 ms per run. Running it serially on
+        // the tokio worker meant a heartbeat tick with N active sessions
+        // stalled all IPC for N × capture_time. Fan out captures via
+        // `spawn_blocking` so the tokio runtime stays responsive, and process
+        // results sequentially afterwards — `append_pane_log` and
+        // `update_phase_from_pane` both touch shared state through `&self`,
+        // so parallelizing them too would require finer-grained locking.
+        let mut capture_set = tokio::task::JoinSet::new();
         for (run_id, tmux_session, _) in &running {
             if let Some(session) = tmux_session {
-                self.handle_alive_session(run_id, session).await;
+                let session_owned = session.clone();
+                let run_id_owned = run_id.clone();
+                capture_set.spawn_blocking(move || {
+                    let capture = spawn::capture_pane(&session_owned);
+                    (run_id_owned, capture)
+                });
             }
         }
-    }
-
-    /// Handle a healthy (alive) tmux session: capture logs and update phase.
-    async fn handle_alive_session(&self, run_id: &str, tmux_session: &str) {
-        // Capture pane output for log archival
-        match spawn::capture_pane(tmux_session) {
-            Ok(content) => {
-                self.append_pane_log(run_id, &content);
-                self.update_phase_from_pane(run_id, &content).await;
-            }
-            Err(e) => {
-                debug!(run_id = %run_id, error = %e, "failed to capture pane");
+        while let Some(join_res) = capture_set.join_next().await {
+            match join_res {
+                Ok((run_id, Ok(content))) => {
+                    self.append_pane_log(&run_id, &content);
+                    self.update_phase_from_pane(&run_id, &content).await;
+                }
+                Ok((run_id, Err(e))) => {
+                    debug!(run_id = %run_id, error = %e, "failed to capture pane");
+                }
+                Err(e) => {
+                    debug!(error = %e, "pane capture task panicked");
+                }
             }
         }
     }
