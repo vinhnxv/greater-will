@@ -177,7 +177,6 @@ impl RepoLockGuard {
 
     /// Consume the guard, marking the lock as intentionally held.
     /// Must be called on the success path after write_meta succeeds.
-    #[must_use = "RepoLockGuard::commit consumes self — assign to _ if intentional"]
     pub fn commit(mut self) {
         self.committed = true;
     }
@@ -362,7 +361,7 @@ impl RunRegistry {
         // permanently blocked on ENOSPC/serde errors.
         match Self::write_meta(&entry) {
             Ok(()) => {
-                let _ = guard.commit();
+                guard.commit();
             }
             Err(e) => {
                 guard.release_from(&mut self.repo_locks);
@@ -734,7 +733,7 @@ impl RunRegistry {
 
         match Self::write_meta(&entry_clone) {
             Ok(()) => {
-                let _ = guard.commit();
+                guard.commit();
                 tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
                 Ok(())
             }
