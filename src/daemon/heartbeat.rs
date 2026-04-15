@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -31,6 +31,9 @@ use crate::monitor::loop_state::{read_arc_loop_state, LoopStateRead};
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent tmux `capture_pane` calls.
+const TMUX_CAPTURE_PARALLELISM: usize = 4;
 
 /// Handle for a spawned per-run monitor task.
 ///
@@ -351,12 +354,16 @@ impl HeartbeatMonitor {
         // results sequentially afterwards — `append_pane_log` and
         // `update_phase_from_pane` both touch shared state through `&self`,
         // so parallelizing them too would require finer-grained locking.
+        // EMB-005: Bounded tmux capture parallelism (max 4 concurrent)
+        let sem = Arc::new(Semaphore::new(TMUX_CAPTURE_PARALLELISM));
         let mut capture_set = tokio::task::JoinSet::new();
         for (run_id, tmux_session, _) in &running {
             if let Some(session) = tmux_session {
                 let session_owned = session.clone();
                 let run_id_owned = run_id.clone();
+                let permit = sem.clone().acquire_owned().await.unwrap();
                 capture_set.spawn_blocking(move || {
+                    let _permit = permit;
                     let capture = spawn::capture_pane(&session_owned);
                     (run_id_owned, capture)
                 });
@@ -387,44 +394,14 @@ impl HeartbeatMonitor {
     /// Rotates the log file to `pane.log.1` when it exceeds `PANE_LOG_ROTATE_BYTES`
     /// to bound disk usage — without rotation, a 12h run accumulates ~21 MB of
     /// pane captures, and `diagnose_session_death` would try to read all of it.
+    ///
+    /// INV-19: Blocking I/O hoisted off tokio reactor via spawn_blocking (fire-and-forget)
     fn append_pane_log(&self, run_id: &str, content: &str) {
-        /// Rotate pane.log when it grows past this size (10 MiB).
-        const PANE_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
-
-        let log_dir = gw_home().join("runs").join(run_id).join("logs");
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            debug!(error = %e, "failed to create log directory");
-            return;
-        }
-
-        let log_path = log_dir.join("pane.log");
-
-        // Rotate if the current log has grown past the threshold. Best-effort:
-        // metadata/rename failures degrade to "no rotation this tick" rather
-        // than aborting the append.
-        if let Ok(meta) = std::fs::metadata(&log_path) {
-            if meta.len() > PANE_LOG_ROTATE_BYTES {
-                let rotated = log_path.with_extension("log.1");
-                if let Err(e) = std::fs::rename(&log_path, &rotated) {
-                    debug!(error = %e, "failed to rotate pane.log");
-                }
-            }
-        }
-
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            Ok(mut f) => {
-                let _ = writeln!(f, "--- heartbeat capture ---");
-                let _ = write!(f, "{content}");
-            }
-            Err(e) => {
-                debug!(error = %e, "failed to append to pane log");
-            }
-        }
+        let run_id = run_id.to_owned();
+        let content = content.to_owned();
+        drop(tokio::task::spawn_blocking(move || {
+            append_pane_log_sync(&run_id, &content);
+        }));
     }
 
     /// Update the run's current phase from checkpoint.json (ground truth),
@@ -724,6 +701,52 @@ impl HeartbeatMonitor {
     }
 }
 
+// ── Pane log I/O (blocking) ─────────────────────────────────────
+
+/// Synchronous pane log append (runs on blocking thread pool).
+///
+/// Extracted from `HeartbeatMonitor::append_pane_log` so it can be
+/// called from `spawn_blocking` without requiring `&self`.
+fn append_pane_log_sync(run_id: &str, content: &str) {
+    /// Rotate pane.log when it grows past this size (10 MiB).
+    const PANE_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
+    let log_dir = gw_home().join("runs").join(run_id).join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        debug!(error = %e, "failed to create log directory");
+        return;
+    }
+
+    let log_path = log_dir.join("pane.log");
+
+    // Rotate if the current log has grown past the threshold. Best-effort:
+    // metadata/rename failures degrade to "no rotation this tick" rather
+    // than aborting the append.
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > PANE_LOG_ROTATE_BYTES {
+            let rotated = log_path.with_extension("log.1");
+            if let Err(e) = std::fs::rename(&log_path, &rotated) {
+                debug!(error = %e, "failed to rotate pane.log");
+            }
+        }
+    }
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "--- heartbeat capture ---");
+            let _ = write!(f, "{content}");
+        }
+        Err(e) => {
+            debug!(error = %e, "failed to append to pane log");
+        }
+    }
+}
+
 // ── Uptime helpers ───────────────────────────────────────────────
 
 /// Compute uptime for the current session cycle.
@@ -1002,32 +1025,21 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
-            let crash_count = {
-                let reg = registry.lock().await;
-                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
-            };
-            if crash_count >= error_class.max_retries() {
-                let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!(
-                        "Max retries ({}) for {:?}: {}",
-                        error_class.max_retries(), error_class, reason
-                    )),
-                ) {
-                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
-                }
-                drop(reg);
-                append_event(run_id, "max_retries", &format!("{:?}: {}", error_class, reason));
-                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
-                return;
-            }
+            // Backoff attempt index: use the CrashLoopDetector's
+            // per-phase count (just updated above by
+            // `record_restart_for_phase`) rather than the global
+            // `crash_restarts` registry field, so each phase gets a
+            // fresh backoff curve on entry. Matters for `ApiOverload`
+            // exponential ladder (15→30→60→120 min) — a phase that
+            // encounters its first ApiOverload should back off 15 min,
+            // not be penalised by earlier phases' overload history.
+            let phase_attempt = current_phase
+                .as_deref()
+                .map(|p| detector.crashes_for_phase(p).saturating_sub(1))
+                .unwrap_or(0);
 
             // Per-error-class exponential backoff (P1: cancellation-aware)
-            let backoff = error_class.backoff_for_attempt(crash_count);
+            let backoff = error_class.backoff_for_attempt(phase_attempt);
             append_event(run_id, "backoff", &format!(
                 "{:?}: {}s before retry",
                 error_class, backoff.as_secs()
@@ -1050,8 +1062,9 @@ async fn handle_monitor_outcome(
             // implicit ErrorClass for per-class retry/backoff policy (GAP 1, 5).
             //
             // Note: Foreground treats Timeout as terminal (no retry).
-            // Daemon retries because headless runs benefit from automatic recovery.
-            // Per-class max_retries (3) still limits total attempts.
+            // Daemon retries because headless runs benefit from automatic
+            // recovery. CrashLoopDetector enforces phase-aware ceilings
+            // (per-phase budget + global window + total_restarts cap).
             let (implicit_class, outcome_kind, reason) = match outcome {
                 DaemonRunOutcome::Crashed { reason } => (ErrorClass::Crash, "crashed", reason),
                 DaemonRunOutcome::Stuck { reason } => (ErrorClass::Stuck, "stuck", reason),
@@ -1116,32 +1129,21 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
-            let crash_count = {
-                let reg = registry.lock().await;
-                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
-            };
-            if crash_count >= implicit_class.max_retries() {
-                let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!(
-                        "Max retries ({}) for {:?}: {}",
-                        implicit_class.max_retries(), implicit_class, reason
-                    )),
-                ) {
-                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
-                }
-                drop(reg);
-                append_event(run_id, "max_retries", &format!("{:?}: {}", implicit_class, reason));
-                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
-                return;
-            }
+            // Backoff attempt index: use the CrashLoopDetector's
+            // per-phase count (just updated above by
+            // `record_restart_for_phase`) rather than the global
+            // `crash_restarts` registry field, so each phase gets a
+            // fresh backoff curve on entry. Matters for `ApiOverload`
+            // exponential ladder (15→30→60→120 min) — a phase that
+            // encounters its first ApiOverload should back off 15 min,
+            // not be penalised by earlier phases' overload history.
+            let phase_attempt = current_phase
+                .as_deref()
+                .map(|p| detector.crashes_for_phase(p).saturating_sub(1))
+                .unwrap_or(0);
 
             // GAP 5: Per-class backoff instead of flat cooldown (parity with foreground)
-            let backoff = implicit_class.backoff_for_attempt(crash_count);
+            let backoff = implicit_class.backoff_for_attempt(phase_attempt);
             append_event(run_id, "backoff", &format!(
                 "{:?}: {}s before retry",
                 implicit_class, backoff.as_secs()
@@ -1214,6 +1216,39 @@ async fn attempt_recovery(
     // Matches the escaping in executor.rs::build_arc_command.
     let escaped = plan_str.replace('\'', "'\\''");
     let arc_command = format!("/rune:arc '{}'", escaped);
+
+    // Plan-mismatch guard: if `arc-phase-loop.local.md` on disk points at a
+    // different plan (e.g., stale state from a prior run that escaped cleanup),
+    // `resolve_restart_command` would issue a `--resume` against the wrong
+    // arc checkpoint. Foreground orchestrator has an equivalent guard at
+    // orchestrator.rs:104-132; reconciler's adopt path uses `plans_match` at
+    // reconciler.rs:543. Daemon recovery had no check — close that gap by
+    // removing the stale file before restart resolution so it falls through
+    // to `Fresh`.
+    if let crate::monitor::loop_state::LoopStateRead::Active(state) =
+        crate::monitor::loop_state::read_arc_loop_state(repo_dir)
+    {
+        if !crate::daemon::reconciler::plans_match(&state.plan_file, &plan_str, repo_dir) {
+            let loop_file = repo_dir.join(".rune").join("arc-phase-loop.local.md");
+            warn!(
+                run_id = %run_id,
+                expected_plan = %plan_str,
+                on_disk_plan = %state.plan_file,
+                "Recovery: stale loop state for different plan — removing before Fresh start",
+            );
+            append_event(
+                run_id,
+                "plan_mismatch",
+                &format!(
+                    "stale loop state plan={} expected={} — forcing Fresh",
+                    state.plan_file, plan_str
+                ),
+            );
+            if let Err(e) = std::fs::remove_file(&loop_file) {
+                warn!(error = %e, "Failed to remove stale loop state file (non-fatal)");
+            }
+        }
+    }
 
     let crash_count = {
         let reg = registry.lock().await;

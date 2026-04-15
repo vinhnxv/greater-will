@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::daemon::protocol::{RunInfo, RunStatus};
+use crate::daemon::reconciler::plans_match;
 use crate::daemon::state::gw_home;
 
 /// Maximum pending runs across all repos.
@@ -176,7 +177,6 @@ impl RepoLockGuard {
 
     /// Consume the guard, marking the lock as intentionally held.
     /// Must be called on the success path after write_meta succeeds.
-    #[must_use = "RepoLockGuard::commit consumes self — assign to _ if intentional"]
     pub fn commit(mut self) {
         self.committed = true;
     }
@@ -361,7 +361,7 @@ impl RunRegistry {
         // permanently blocked on ENOSPC/serde errors.
         match Self::write_meta(&entry) {
             Ok(()) => {
-                let _ = guard.commit();
+                guard.commit();
             }
             Err(e) => {
                 guard.release_from(&mut self.repo_locks);
@@ -575,16 +575,43 @@ impl RunRegistry {
             return Err(color_eyre::eyre::eyre!("queue full: {total} pending runs"));
         }
         let hash = repo_hash(&pending.repo_dir);
+        let pending_plan_str = pending.plan_path.to_string_lossy().into_owned();
 
-        // Duplicate detection (borrow pending_queues, then release)
-        {
-            let queue = self.pending_queues.entry(hash.clone()).or_default();
-            if queue.iter().any(|p| p.plan_path == pending.plan_path) {
-                return Err(color_eyre::eyre::eyre!(
-                    "plan already queued: {}",
-                    pending.plan_path.display()
-                ));
-            }
+        // Duplicate detection.
+        //
+        // Scans `self.runs` for any non-terminal entry on the same repo whose
+        // plan resolves to the same file (via `plans_match`, which
+        // canonicalizes relative vs. absolute forms and falls back to
+        // basename comparison on symlink farms).
+        //
+        // Scanning `self.runs` — not `pending_queues` — is load-bearing:
+        // `drain_next` pops a plan out of `pending_queues` when it promotes
+        // to Running, but the `RunEntry` stays in `self.runs` with
+        // `status=Running`. The old queue-only check silently accepted a
+        // re-submit of an already-running plan, producing twin `gw ps` rows
+        // (one Running, one Queued) for the same plan file.
+        //
+        // Queued entries also live in `self.runs` (insert happens below at
+        // queue-push time), so this single scan covers Queued + Running
+        // without a second loop over `pending_queues`.
+        if let Some(existing) = self.runs.values().find(|e| {
+            !e.status.is_terminal()
+                && repo_hash(&e.repo_dir) == hash
+                && plans_match(
+                    &e.plan_path.to_string_lossy(),
+                    &pending_plan_str,
+                    &pending.repo_dir,
+                )
+        }) {
+            let verb = match existing.status {
+                RunStatus::Queued => "queued",
+                RunStatus::Running => "running",
+                _ => "active",
+            };
+            return Err(color_eyre::eyre::eyre!(
+                "plan already {verb} on this repo: {}",
+                pending.plan_path.display()
+            ));
         }
 
         // Create a RunEntry for gw ps visibility
@@ -706,7 +733,7 @@ impl RunRegistry {
 
         match Self::write_meta(&entry_clone) {
             Ok(()) => {
-                let _ = guard.commit();
+                guard.commit();
                 tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
                 Ok(())
             }
@@ -1504,7 +1531,130 @@ mod tests {
                 queued_at: Utc::now(),
             };
             assert!(reg.enqueue_run(p1).is_ok());
-            assert!(reg.enqueue_run(p2).is_err()); // duplicate
+            let err = reg.enqueue_run(p2).unwrap_err().to_string();
+            assert!(
+                err.contains("plan already queued"),
+                "expected queued-duplicate error, got: {err}"
+            );
+        });
+    }
+
+    /// Regression for the `gw ps` twin-entry bug: when a plan has already
+    /// been drained into `Running` status and is no longer present in
+    /// `pending_queues`, a second submit via the enqueue path used to be
+    /// accepted (the old duplicate check only scanned `pending_queues`).
+    /// The scan in `enqueue_run` must consult `self.runs` so Running plans
+    /// are rejected too.
+    #[test]
+    fn running_plan_rejected_on_enqueue() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo-running-dup");
+            let plan = PathBuf::from("plan-running.md");
+
+            // Simulate the `gw run` (foreground) / `spawn_run` (daemon)
+            // path: register_run inserts with Queued + holds repo_lock,
+            // then executor flips to Running.
+            let run_id = reg
+                .register_run(plan.clone(), repo.clone(), None, None)
+                .expect("first register should succeed");
+            reg.update_status(&run_id, RunStatus::Running, None, None)
+                .expect("flip to Running");
+            assert_eq!(reg.get(&run_id).unwrap().status, RunStatus::Running);
+
+            // Re-submit the same plan via the enqueue path (what the
+            // server does when has_repo_lock=true).
+            let dup = PendingRun {
+                run_id: "dup01".into(),
+                plan_path: plan.clone(),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            let err = reg
+                .enqueue_run(dup)
+                .expect_err("enqueue of a running plan must be rejected");
+            assert!(
+                err.to_string().contains("plan already running"),
+                "error must surface the Running status, got: {err}"
+            );
+            // And the running entry's repo must have no phantom Queued
+            // sibling in self.runs (no ghost row in `gw ps`).
+            let queued_count = reg
+                .list_runs(true)
+                .iter()
+                .filter(|e| e.status == RunStatus::Queued)
+                .count();
+            assert_eq!(queued_count, 0, "no ghost Queued row may be created");
+        });
+    }
+
+    /// Duplicate detection must canonicalize plan paths. Submitting the
+    /// same plan as a relative path and then as an absolute path used to
+    /// slip past the old byte-equality check.
+    #[test]
+    fn duplicate_detected_across_path_variants() {
+        with_temp_gw_home(|tmp| {
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(repo.join("plans")).unwrap();
+            let abs_plan = repo.join("plans/x.md");
+            std::fs::write(&abs_plan, "dummy").unwrap();
+
+            let mut reg = RunRegistry::new();
+            // First register with an absolute path.
+            let _run_id = reg
+                .register_run(abs_plan.clone(), repo.clone(), None, None)
+                .expect("first register");
+
+            // Second submit with a relative path under the same repo —
+            // `plans_match` must normalize them to the same canonical file.
+            let rel = PendingRun {
+                run_id: "relpath".into(),
+                plan_path: PathBuf::from("plans/x.md"),
+                repo_dir: repo.clone(),
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            assert!(
+                reg.enqueue_run(rel).is_err(),
+                "relative path must be recognized as duplicate of the already-registered absolute path"
+            );
+        });
+    }
+
+    /// Terminal entries (Succeeded/Failed/Stopped) must NOT block a fresh
+    /// enqueue of the same plan — the user may legitimately re-run a
+    /// completed plan.
+    #[test]
+    fn terminal_entry_does_not_block_enqueue() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/test-repo-terminal-dup");
+            let plan = PathBuf::from("finished.md");
+
+            let run_id = reg
+                .register_run(plan.clone(), repo.clone(), None, None)
+                .expect("register");
+            reg.update_status(&run_id, RunStatus::Succeeded, None, None)
+                .expect("flip to Succeeded");
+
+            let fresh = PendingRun {
+                run_id: "fresh01".into(),
+                plan_path: plan,
+                repo_dir: repo,
+                session_name: None,
+                config_dir: None,
+                verbose: 0,
+                queued_at: Utc::now(),
+            };
+            assert!(
+                reg.enqueue_run(fresh).is_ok(),
+                "a completed (terminal) entry must not block re-running the plan"
+            );
         });
     }
 

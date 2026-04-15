@@ -335,7 +335,7 @@ impl DaemonRunMonitor {
                     self.poll_count += 1;
 
                     // 1. Signal file checks
-                    if let Some(outcome) = self.check_signals() {
+                    if let Some(outcome) = self.check_signals().await {
                         return outcome;
                     }
 
@@ -378,15 +378,15 @@ impl DaemonRunMonitor {
                     }
 
                     // 7. Checkpoint polling + phase tracking
-                    self.poll_checkpoint();
+                    self.poll_checkpoint().await;
 
                     // 8. Loop state tracking
-                    if let Some(outcome) = self.poll_loop_state() {
+                    if let Some(outcome) = self.poll_loop_state().await {
                         return outcome;
                     }
 
                     // 9. Artifact dir scan
-                    self.scan_artifacts();
+                    self.scan_artifacts().await;
 
                     // 12. Process liveness
                     if let Some(outcome) = self.check_process_liveness() {
@@ -614,7 +614,7 @@ impl DaemonRunMonitor {
 impl DaemonRunMonitor {
     /// Poll stop/completion/permission signal files from `repo_dir/.gw/signals/`.
     /// Uses the Shard 2 `*_from` helpers which accept a base directory.
-    fn check_signals(&mut self) -> Option<DaemonRunOutcome> {
+    async fn check_signals(&mut self) -> Option<DaemonRunOutcome> {
         // Stop signal (hook-based completion)
         if let Some(signal) =
             crate::commands::elden::read_stop_signal_from(&self.repo_dir).or_else(|| {
@@ -637,7 +637,11 @@ impl DaemonRunMonitor {
         {
             crate::commands::elden::clear_signals_from(&self.repo_dir);
             if self.pending_kill.is_none() {
-                let pane = spawn::capture_pane(&self.tmux_session).unwrap_or_default();
+                // INV-19: Hoist blocking tmux capture_pane off tokio reactor
+                let session_clone = self.tmux_session.clone();
+                let pane = tokio::task::spawn_blocking(move || {
+                    spawn::capture_pane(&session_clone).unwrap_or_default()
+                }).await.unwrap_or_default();
                 let class = ErrorClass::from_pane_output(&pane, false).unwrap_or(ErrorClass::Crash);
 
                 let summary = signal.get("error").and_then(|v| v.as_str())
@@ -878,20 +882,31 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
-    fn poll_checkpoint(&mut self) {
-        let checkpoint = match read_cached_checkpoint(
-            &self.repo_dir,
-            &mut self.cached_checkpoint_path,
-        ) {
-            Some(c) => c,
-            None => return,
+    // INV-19: poll_checkpoint hoisted off tokio reactor via spawn_blocking.
+    // The blocking read_cached_checkpoint call is wrapped in a spawn_blocking
+    // closure that takes owned copies of repo_dir and cached_path, returning
+    // both the checkpoint and the (possibly updated) cached path.
+    async fn poll_checkpoint(&mut self) {
+        let repo_dir = self.repo_dir.clone();
+        let mut cached_path = self.cached_checkpoint_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let cp = read_cached_checkpoint(&repo_dir, &mut cached_path);
+            if cp.is_some() && cached_path.is_none() {
+                cached_path = find_artifact_dir_cached(&cached_path, &repo_dir);
+            }
+            (cp, cached_path)
+        })
+        .await
+        .ok();
+
+        let (checkpoint, updated_cache) = match result {
+            Some((Some(cp), cache)) => (cp, cache),
+            Some((None, _)) => return,
+            None => return, // spawn_blocking panicked
         };
 
-        // Update cached path if find_artifact_dir_cached returned a new location.
-        if self.cached_checkpoint_path.is_none() {
-            self.cached_checkpoint_path =
-                find_artifact_dir_cached(&self.cached_checkpoint_path, &self.repo_dir);
-        }
+        // Write back the (possibly updated) cached path.
+        self.cached_checkpoint_path = updated_cache;
 
         // Checkpoint heartbeat — any read that succeeded means progress exists.
         self.last_checkpoint_activity = Instant::now();
@@ -955,6 +970,14 @@ impl DaemonRunMonitor {
                 );
                 append_event(&self.run_id, "phase_profile_applied", &event_msg);
             }
+            // Reset idle nudge budget on phase transition. `nudge_count`
+            // otherwise only resets on pane-content change (see line ~821),
+            // so a rapid agent-team handoff with no visible pane update
+            // could let phase N inherit phase N-1's burnt budget.
+            // Transition_/failed_nudge counts are already reset by the
+            // gap-state branches below — this line closes the gap for
+            // the normal idle-nudge counter.
+            self.nudge_count = 0;
             self.current_phase = new_phase;
         }
 
@@ -1013,8 +1036,15 @@ impl DaemonRunMonitor {
     /// function tolerates absence as long as the screen is changing. Once the
     /// warmup window expires AND the screen is idle, it returns
     /// [`DaemonRunOutcome::Failed`] with a bootstrap-error reason.
-    fn poll_loop_state(&mut self) -> Option<DaemonRunOutcome> {
-        let read = read_arc_loop_state(&self.repo_dir);
+    // INV-19: poll_loop_state hoisted off tokio reactor via spawn_blocking.
+    // read_arc_loop_state does std::fs::read_to_string — blocking I/O.
+    async fn poll_loop_state(&mut self) -> Option<DaemonRunOutcome> {
+        let repo_dir = self.repo_dir.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_arc_loop_state(&repo_dir)
+        })
+        .await
+        .unwrap_or(crate::monitor::loop_state::LoopStateRead::Missing);
         let file_on_disk = !matches!(
             read,
             crate::monitor::loop_state::LoopStateRead::Missing
@@ -1060,15 +1090,12 @@ impl DaemonRunMonitor {
             let warmup = self.watchdog.loop_state_warmup_secs;
             let screen_idle = self.last_activity.elapsed().as_secs();
 
-            // Re-read the loop state to distinguish Inactive (stale file from
-            // a prior run) vs Missing (never written). The outer match above
-            // consumed `current_opt` into `None`, but we need the categorical
-            // status to apply the 2× hard limit only to the Inactive case.
-            let loop_state_read = read_arc_loop_state(&self.repo_dir);
-            let stale_file_present = matches!(
-                loop_state_read,
-                crate::monitor::loop_state::LoopStateRead::Inactive,
-            );
+            // EMB-001 FIX: Derive stale status from the initial read at line 1021
+            // instead of re-reading. When current_opt is None (we're in this
+            // branch) and file_on_disk is true, the state is Inactive (stale
+            // file from a prior run). This eliminates one blocking fs read
+            // per warmup tick.
+            let stale_file_present = file_on_disk;
 
             // Path B (stale hard-limit — foreground parity with
             // monitor.rs:884-910): stale file (active=false from a previous
@@ -1175,7 +1202,8 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
-    fn scan_artifacts(&mut self) {
+    // INV-19: scan_artifact_dir is a blocking directory walker — hoist off reactor.
+    async fn scan_artifacts(&mut self) {
         let interval_secs = self.watchdog.artifact_scan_interval_secs;
         if self.last_artifact_scan.elapsed().as_secs() < interval_secs {
             return;
@@ -1186,7 +1214,11 @@ impl DaemonRunMonitor {
             Some(d) => d.to_path_buf(),
             None => return,
         };
-        if let Some(snapshot) = scan_artifact_dir(&scan_dir) {
+        let snapshot = tokio::task::spawn_blocking(move || scan_artifact_dir(&scan_dir))
+            .await
+            .ok()
+            .flatten();
+        if let Some(snapshot) = snapshot {
             let changed = match self.last_artifact_snapshot {
                 None => true,
                 Some(ref prev) => prev != &snapshot,

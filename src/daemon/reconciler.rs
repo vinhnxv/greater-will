@@ -453,7 +453,7 @@ fn resolve_session_name_collisions(registry: &mut RunRegistry) -> u32 {
 
 /// Compare two plan path references that may use different encodings.
 /// Returns true if they resolve to the same plan file under `repo_dir`.
-fn plans_match(a: &str, b: &str, repo_dir: &Path) -> bool {
+pub(crate) fn plans_match(a: &str, b: &str, repo_dir: &Path) -> bool {
     let norm = |s: &str| -> PathBuf {
         let p = Path::new(s);
         if p.is_absolute() {

@@ -17,7 +17,31 @@ use tracing::debug;
 ///
 /// Each line is a JSON object with timestamp, event type, and message.
 /// This is the primary data source for `gw logs <id>`.
+///
+/// INV-19: Blocking I/O hoisted off tokio reactor via spawn_blocking
+/// (fire-and-forget). The write is best-effort — errors are logged but
+/// do not propagate to callers, matching the original contract.
 pub fn append_event(run_id: &str, event: &str, message: &str) {
+    // When a tokio runtime is available (daemon hot path), fire-and-forget
+    // on the blocking pool.  When no runtime exists (unit tests, CLI
+    // one-shots), fall back to synchronous inline execution.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let run_id = run_id.to_string();
+        let event = event.to_string();
+        let message = message.to_string();
+        // Fire-and-forget: spawn_blocking tasks run to completion even
+        // when the JoinHandle is dropped; explicit drop silences
+        // clippy::let_underscore_future.
+        drop(tokio::task::spawn_blocking(move || {
+            append_event_sync(&run_id, &event, &message);
+        }));
+    } else {
+        append_event_sync(run_id, event, message);
+    }
+}
+
+/// Synchronous implementation of event append (runs on blocking thread pool).
+fn append_event_sync(run_id: &str, event: &str, message: &str) {
     let log_dir = gw_home().join("runs").join(run_id).join("logs");
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         debug!(error = %e, "failed to create log directory for events");
