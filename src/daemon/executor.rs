@@ -206,12 +206,14 @@ async fn spawn_after_register(
         let reason = format!("pre_phase_cleanup failed: {e}");
         crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(
+        if let Err(ue) = reg.update_status(
             &run_id,
             RunStatus::Failed,
             None,
             Some(reason),
-        );
+        ) {
+            tracing::error!(run_id = %run_id, error = %ue, "update_status failed: marking failed after pre_phase_cleanup error");
+        }
         return Err(e);
     }
     crate::commands::elden::clear_signals_from(&repo_dir);
@@ -300,12 +302,14 @@ async fn spawn_after_register(
             let reason = format!("tmux spawn failed: {e}");
             crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
             let mut reg = registry.lock().await;
-            let _ = reg.update_status(
+            if let Err(ue) = reg.update_status(
                 &run_id,
                 RunStatus::Failed,
                 None,
                 Some(reason),
-            );
+            ) {
+                tracing::error!(run_id = %run_id, error = %ue, "update_status failed: marking failed after tmux spawn error");
+            }
             return Err(e);
         }
     }
@@ -330,12 +334,14 @@ async fn spawn_after_register(
         ));
         let _ = spawn::kill_session(&tmux_session);
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(
+        if let Err(ue) = reg.update_status(
             &run_id,
             RunStatus::Failed,
             None,
             Some(reason),
-        );
+        ) {
+            tracing::error!(run_id = %run_id, error = %ue, "update_status failed: marking failed after send_keys error");
+        }
         return Err(e);
     }
 

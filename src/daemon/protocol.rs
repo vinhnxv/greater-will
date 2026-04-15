@@ -146,6 +146,13 @@ pub enum RunStatus {
     Stopped,
 }
 
+impl RunStatus {
+    /// Returns true for terminal states (Succeeded, Failed, Stopped).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Stopped)
+    }
+}
+
 /// Structured error codes for programmatic handling.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ErrorCode {

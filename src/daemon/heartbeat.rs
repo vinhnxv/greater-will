@@ -285,14 +285,27 @@ impl HeartbeatMonitor {
                             run_id = %outcome_run_id,
                             "DaemonRunMonitor panicked: {:?}", e
                         );
-                        let mut reg = outcome_registry.lock().await;
-                        let _ = reg.update_status(
-                            &outcome_run_id,
-                            RunStatus::Failed,
-                            None,
-                            Some("Monitor panicked — marking failed".to_string()),
-                        );
-                        drop(reg);
+                        // INV-19: stage under the lock, release, fsync outside.
+                        let staged = {
+                            let mut reg = outcome_registry.lock().await;
+                            reg.stage_status_locked(
+                                &outcome_run_id,
+                                RunStatus::Failed,
+                                None,
+                                Some("Monitor panicked — marking failed".to_string()),
+                            )
+                            .map_err(|se| color_eyre::eyre::eyre!("{se}"))
+                        }; // reg dropped — mutex released before fsync
+                        match staged {
+                            Ok(s) => {
+                                if let Err(fe) = RunRegistry::flush_status(&s) {
+                                    tracing::error!(run_id = %outcome_run_id, error = %fe, "flush_status failed: marking failed after monitor panic");
+                                }
+                            }
+                            Err(se) => {
+                                tracing::error!(run_id = %outcome_run_id, error = %se, "stage_status failed: marking failed after monitor panic");
+                            }
+                        }
                         append_event(
                             &outcome_run_id,
                             "monitor_panic",
@@ -505,12 +518,14 @@ impl HeartbeatMonitor {
                 );
                 return;
             }
-            let _ = registry.update_status(
+            if let Err(e) = registry.update_status(
                 run_id,
                 RunStatus::Succeeded,
                 Some("complete".to_string()),
                 None,
-            );
+            ) {
+                tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking succeeded");
+            }
             drop(registry);
             append_event(run_id, "completed", "pipeline finished successfully");
         }
@@ -775,12 +790,14 @@ async fn handle_monitor_outcome(
                 let entry = reg.get(run_id);
                 let dir = entry.map(|e| e.repo_dir.clone());
                 let tmux = entry.and_then(|e| e.tmux_session.clone());
-                let _ = reg.update_status(
+                if let Err(e) = reg.update_status(
                     run_id,
                     RunStatus::Succeeded,
                     Some("complete".to_string()),
                     None,
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking succeeded");
+                }
                 (dir, tmux)
             };
             if let Some(ref dir) = repo_dir {
@@ -825,11 +842,27 @@ async fn handle_monitor_outcome(
         }
 
         DaemonRunOutcome::Failed { reason } => {
-            let mut reg = registry.lock().await;
-            let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone()));
-            // Extract repo_dir before dropping lock to avoid re-acquisition race
-            let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
-            drop(reg);
+            // INV-19: stage under the lock, release, fsync outside.
+            let (staged, repo_dir) = {
+                let mut reg = registry.lock().await;
+                let staged = reg
+                    .stage_status_locked(run_id, RunStatus::Failed, None, Some(reason.clone()))
+                    .map_err(|se| color_eyre::eyre::eyre!("{se}"));
+                // Extract repo_dir before dropping lock to avoid re-acquisition race
+                let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
+                (staged, repo_dir)
+            }; // reg dropped — mutex released before fsync
+
+            match staged {
+                Ok(s) => {
+                    if let Err(fe) = RunRegistry::flush_status(&s) {
+                        tracing::error!(run_id = %run_id, error = %fe, "flush_status failed: marking failed");
+                    }
+                }
+                Err(se) => {
+                    tracing::error!(run_id = %run_id, error = %se, "stage_status failed: marking failed");
+                }
+            }
             append_event(run_id, "failed", &reason);
             // Drain next queued run for this repo (failure increments circuit breaker)
             if let Some(dir) = repo_dir {
@@ -846,12 +879,14 @@ async fn handle_monitor_outcome(
             // Fatal errors: no retry
             if error_class.skips_plan() {
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
+                if let Err(e) = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
                     Some(format!("Fatal {:?}: {}", error_class, reason)),
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after fatal error");
+                }
                 drop(reg);
                 append_event(run_id, "fatal_error", &reason);
                 // Drain next queued run (fatal error counts as failure)
@@ -909,12 +944,14 @@ async fn handle_monitor_outcome(
                 } else {
                     // Cancelled or timed out after 30 min
                     let mut reg = registry.lock().await;
-                    let _ = reg.update_status(
+                    if let Err(e) = reg.update_status(
                         run_id,
                         RunStatus::Failed,
                         None,
                         Some("Network unavailable for 30 minutes — giving up".to_string()),
-                    );
+                    ) {
+                        tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after network timeout");
+                    }
                     drop(reg);
                     append_event(run_id, "network_timeout", "30min connectivity timeout exceeded");
                 }
@@ -953,12 +990,14 @@ async fn handle_monitor_outcome(
             match detector.record_restart_for_phase(current_phase.as_deref()) {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
-                    let _ = reg.update_status(
+                    if let Err(e) = reg.update_status(
                         run_id,
                         RunStatus::Failed,
                         None,
                         Some(format!("Crash loop ({:?}): {}", error_class, reason)),
-                    );
+                    ) {
+                        tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after crash loop");
+                    }
                     drop(reg);
                     CrashLoopDetector::clear_history(&repo_dir);
                     append_event(run_id, "crash_loop", &format!("{:?}: {}", error_class, reason));
@@ -980,7 +1019,7 @@ async fn handle_monitor_outcome(
             };
             if crash_count >= error_class.max_retries() {
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
+                if let Err(e) = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
@@ -988,7 +1027,9 @@ async fn handle_monitor_outcome(
                         "Max retries ({}) for {:?}: {}",
                         error_class.max_retries(), error_class, reason
                     )),
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
+                }
                 drop(reg);
                 append_event(run_id, "max_retries", &format!("{:?}: {}", error_class, reason));
                 drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
@@ -1063,12 +1104,14 @@ async fn handle_monitor_outcome(
             match detector.record_restart_for_phase(current_phase.as_deref()) {
                 CrashLoopDecision::StopCrashLoop => {
                     let mut reg = registry.lock().await;
-                    let _ = reg.update_status(
+                    if let Err(e) = reg.update_status(
                         run_id,
                         RunStatus::Failed,
                         None,
                         Some(format!("Crash loop ({:?}): {}", implicit_class, reason)),
-                    );
+                    ) {
+                        tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after crash loop");
+                    }
                     drop(reg);
                     CrashLoopDetector::clear_history(&repo_dir);
                     append_event(run_id, "crash_loop", &format!("{:?}: {}", implicit_class, reason));
@@ -1090,7 +1133,7 @@ async fn handle_monitor_outcome(
             };
             if crash_count >= implicit_class.max_retries() {
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
+                if let Err(e) = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
@@ -1098,7 +1141,9 @@ async fn handle_monitor_outcome(
                         "Max retries ({}) for {:?}: {}",
                         implicit_class.max_retries(), implicit_class, reason
                     )),
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
+                }
                 drop(reg);
                 append_event(run_id, "max_retries", &format!("{:?}: {}", implicit_class, reason));
                 drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
@@ -1193,12 +1238,14 @@ async fn attempt_recovery(
         RestartDecision::AlreadyDone => {
             info!(run_id = %run_id, "Pipeline already complete — skipping recovery");
             let mut reg = registry.lock().await;
-            let _ = reg.update_status(
+            if let Err(e) = reg.update_status(
                 run_id,
                 RunStatus::Succeeded,
                 Some("complete".to_string()),
                 None,
-            );
+            ) {
+                tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking succeeded during recovery skip");
+            }
             drop(reg);
             append_event(run_id, "already_done", "pipeline complete on recovery check");
         }
@@ -1207,22 +1254,28 @@ async fn attempt_recovery(
             // not cwd — matches spawn_recovery_with_command pattern)
             if let Err(e) = crate::cleanup::health::check_disk_space_at(repo_dir) {
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
+                if let Err(e2) = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
                     Some(format!("Recovery aborted (repo disk): {}", e)),
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after repo disk check");
+                }
+                drop(reg);
                 return;
             }
             if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(
+                if let Err(e2) = reg.update_status(
                     run_id,
                     RunStatus::Failed,
                     None,
                     Some(format!("Recovery aborted (GW_HOME disk): {}", e)),
-                );
+                ) {
+                    tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after GW_HOME disk check");
+                }
+                drop(reg);
                 return;
             }
 
@@ -1262,7 +1315,9 @@ async fn spawn_recovery_with_command(
             if let Some(entry) = reg.get_mut(run_id) {
                 entry.current_phase = Some("running".to_string());
             }
-            let _ = reg.update_status(run_id, RunStatus::Running, Some("running".to_string()), None);
+            if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("running".to_string()), None) {
+                tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking running");
+            }
             return;
         }
         append_event(run_id, "kill_session", &format!(
@@ -1276,14 +1331,18 @@ async fn spawn_recovery_with_command(
         warn!(run_id = %run_id, error = %e, "aborting recovery: repo disk too low");
         append_event(run_id, "recovery_failed", &format!("disk full (repo): {e}"));
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}")));
+        if let Err(e2) = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}"))) {
+            tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after repo disk check");
+        }
         return;
     }
     if let Err(e) = crate::cleanup::health::check_disk_space_at(&gw_home()) {
         warn!(run_id = %run_id, error = %e, "aborting recovery: GW_HOME disk too low");
         append_event(run_id, "recovery_failed", &format!("disk full (GW_HOME): {e}"));
         let mut reg = registry.lock().await;
-        let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}")));
+        if let Err(e2) = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery aborted: {e}"))) {
+            tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after GW_HOME disk check");
+        }
         return;
     }
 
@@ -1302,7 +1361,9 @@ async fn spawn_recovery_with_command(
             if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, cmd) {
                 warn!(error = %e, "failed to send resume command");
                 let mut reg = registry.lock().await;
-                let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery failed: {e}")));
+                if let Err(e2) = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery failed: {e}"))) {
+                    tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after crash recovery");
+                }
                 return;
             }
 
@@ -1326,7 +1387,9 @@ async fn spawn_recovery_with_command(
         Err(e) => {
             warn!(run_id = %run_id, error = %e, "failed to spawn recovery session");
             let mut reg = registry.lock().await;
-            let _ = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery spawn failed: {e}")));
+            if let Err(e2) = reg.update_status(run_id, RunStatus::Failed, None, Some(format!("crash recovery spawn failed: {e}"))) {
+                tracing::error!(run_id = %run_id, error = %e2, "update_status failed: marking failed after recovery spawn failure");
+            }
             drop(reg);
             append_event(run_id, "recovery_failed", &e.to_string());
         }

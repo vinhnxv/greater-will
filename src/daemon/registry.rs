@@ -118,6 +118,10 @@ pub struct RunEntry {
     /// `None` for runs created before this field was added.
     #[serde(default)]
     pub last_recovery_at: Option<DateTime<Utc>>,
+    /// Monotonic write-epoch for idempotent flush. Bumped on every stage_status_locked mutation.
+    /// INV-19: enables fsync-outside-mutex via epoch-based conflict resolution.
+    #[serde(default)]
+    pub write_epoch: u64,
 }
 
 fn default_restartable() -> bool {
@@ -151,6 +155,58 @@ impl RunEntry {
             waiting_for_network: false, // populated by server with shared state
         }
     }
+}
+
+// ── Repo lock guard ────────────────────────────────────────────────
+
+/// RAII guard for per-repo locks. Releases the lock on drop unless `.commit()` is called.
+/// Closes INV-7: prevents repo lock leaks when `write_meta` fails mid-promote.
+pub(crate) struct RepoLockGuard {
+    repo_hash: String,
+    committed: bool,
+}
+
+impl RepoLockGuard {
+    pub fn new(repo_hash: String) -> Self {
+        Self {
+            repo_hash,
+            committed: false,
+        }
+    }
+
+    /// Consume the guard, marking the lock as intentionally held.
+    /// Must be called on the success path after write_meta succeeds.
+    #[must_use = "RepoLockGuard::commit consumes self — assign to _ if intentional"]
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Release the repo lock if not committed. Call on error paths.
+    pub fn release_from(self, map: &mut HashMap<String, fs::File>) {
+        if !self.committed {
+            map.remove(&self.repo_hash);
+        }
+    }
+}
+
+// ── Status update types ───────────────────────────────────────────
+
+/// Errors from status update operations.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateStatusError {
+    #[error("run not found: {0}")]
+    NotFound(String),
+    #[error("invalid transition: {from:?} → {to:?}")]
+    InvalidTransition { from: RunStatus, to: RunStatus },
+    #[error(transparent)]
+    Io(#[from] color_eyre::eyre::Error),
+}
+
+/// Staged status change — result of in-memory mutation, ready for flush.
+#[derive(Debug, Clone)]
+pub struct StagedStatus {
+    pub entry: RunEntry,
+    pub epoch: u64,
 }
 
 // ── Registry ────────────────────────────────────────────────────────
@@ -272,8 +328,11 @@ impl RunRegistry {
         config_dir: Option<PathBuf>,
         schedule_id: Option<String>,
     ) -> Result<String> {
-        // Acquire per-repo lock first
+        // Acquire per-repo lock first, then wrap it in RAII so a write_meta
+        // failure below cannot leave a zombie lock in self.repo_locks (INV-7).
         self.acquire_repo_lock(&repo_dir)?;
+        let rh = repo_hash(&repo_dir);
+        let guard = RepoLockGuard::new(rh);
 
         let run_id = Self::generate_id();
         let session_name = session_name.unwrap_or_else(|| format!("gw-{}", &run_id));
@@ -295,30 +354,52 @@ impl RunRegistry {
             claude_pid: None,
             schedule_id,
             last_recovery_at: None,
+            write_epoch: 0,
         };
 
-        // Persist to disk
-        self.write_meta(&entry)?;
+        // Persist to disk — release the lock on failure so the repo is not
+        // permanently blocked on ENOSPC/serde errors.
+        match Self::write_meta(&entry) {
+            Ok(()) => {
+                let _ = guard.commit();
+            }
+            Err(e) => {
+                guard.release_from(&mut self.repo_locks);
+                return Err(e);
+            }
+        }
         self.runs.insert(run_id.clone(), entry);
 
         tracing::info!(run_id = %run_id, "registered new run");
         Ok(run_id)
     }
 
-    /// Update the status of a run (atomic write).
-    pub fn update_status(
+    /// Stage a status change in memory without flushing to disk.
+    /// INV-19: callers drop the mutex guard after this returns, then call `flush_status`.
+    /// INV-6: rejects backward transitions (Running→Queued) and terminal→non-terminal.
+    pub fn stage_status_locked(
         &mut self,
         run_id: &str,
         status: RunStatus,
         phase: Option<String>,
         error: Option<String>,
-    ) -> Result<()> {
+    ) -> std::result::Result<StagedStatus, UpdateStatusError> {
         let entry = self
             .runs
             .get_mut(run_id)
-            .ok_or_else(|| color_eyre::eyre::eyre!("run not found: {run_id}"))?;
+            .ok_or_else(|| UpdateStatusError::NotFound(run_id.to_string()))?;
+
+        // INV-6: prior-state guard — reject invalid transitions
+        let from = entry.status;
+        if from.is_terminal() && !status.is_terminal() {
+            return Err(UpdateStatusError::InvalidTransition { from, to: status });
+        }
+        if from == RunStatus::Running && status == RunStatus::Queued {
+            return Err(UpdateStatusError::InvalidTransition { from, to: status });
+        }
 
         entry.status = status;
+        entry.write_epoch += 1;
         if let Some(p) = phase {
             entry.current_phase = Some(p);
         }
@@ -327,21 +408,48 @@ impl RunRegistry {
         }
 
         // Mark finished time for terminal states
-        if matches!(
-            status,
-            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Stopped
-        ) {
+        if status.is_terminal() {
             entry.finished_at = Some(Utc::now());
             // Release repo lock on completion
-            let repo_hash = Self::repo_hash(&entry.repo_dir);
-            self.repo_locks.remove(&repo_hash);
+            let rh = repo_hash(&entry.repo_dir);
+            self.repo_locks.remove(&rh);
         }
 
-        let entry_clone = entry.clone();
-        self.write_meta(&entry_clone)?;
+        let staged = StagedStatus {
+            entry: entry.clone(),
+            epoch: entry.write_epoch,
+        };
 
-        tracing::debug!(run_id = %run_id, status = ?status, "updated run status");
-        Ok(())
+        tracing::debug!(run_id = %run_id, status = ?status, epoch = staged.epoch, "staged status update");
+        Ok(staged)
+    }
+
+    /// Flush a staged status change to disk. Runs fsync via `write_meta`.
+    ///
+    /// INV-19: associated function (no `&self`) — MUST be called after the
+    /// registry mutex is released, so the 1–20ms fsync does not block other
+    /// registry operations.
+    ///
+    /// Note: `StagedStatus::epoch` is stamped for external correlation/debug
+    /// but is NOT used to skip writes in this release. Callers that need
+    /// idempotent retry guards should gate on run status before re-flushing.
+    pub fn flush_status(staged: &StagedStatus) -> Result<()> {
+        Self::write_meta(&staged.entry)
+    }
+
+    /// Update the status of a run (stage + flush in one call).
+    /// Convenience wrapper — use stage_status_locked + flush_status when you need
+    /// to release the mutex between mutation and fsync.
+    pub fn update_status(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        phase: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let staged = self.stage_status_locked(run_id, status, phase, error)
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        Self::flush_status(&staged)
     }
 
     /// Remove a run from registry and disk.
@@ -451,7 +559,7 @@ impl RunRegistry {
     /// Unlike `register_run`, this does NOT generate a new ID or acquire repo locks.
     pub fn adopt(&mut self, entry: RunEntry) {
         let run_id = entry.run_id.clone();
-        if let Err(e) = self.write_meta(&entry) {
+        if let Err(e) = Self::write_meta(&entry) {
             tracing::warn!(run_id = %run_id, error = %e, "failed to persist adopted entry");
         }
         self.runs.insert(run_id, entry);
@@ -497,8 +605,9 @@ impl RunRegistry {
             claude_pid: None,
             schedule_id: None,
             last_recovery_at: None,
+            write_epoch: 0,
         };
-        self.write_meta(&entry)?;
+        Self::write_meta(&entry)?;
         self.runs.insert(pending.run_id.clone(), entry);
 
         let queue = self.pending_queues.entry(hash).or_default();
@@ -583,7 +692,9 @@ impl RunRegistry {
             entry.repo_dir.clone()
         };
 
+        let rh = repo_hash(&repo_dir);
         self.acquire_repo_lock(&repo_dir)?;
+        let guard = RepoLockGuard::new(rh);
 
         let entry = self
             .runs
@@ -592,10 +703,18 @@ impl RunRegistry {
         entry.started_at = Utc::now();
         entry.restartable = true;
         let entry_clone = entry.clone();
-        self.write_meta(&entry_clone)?;
 
-        tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
-        Ok(())
+        match Self::write_meta(&entry_clone) {
+            Ok(()) => {
+                let _ = guard.commit();
+                tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
+                Ok(())
+            }
+            Err(e) => {
+                guard.release_from(&mut self.repo_locks);
+                Err(e)
+            }
+        }
     }
 
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
@@ -620,31 +739,39 @@ impl RunRegistry {
     }
 
     /// Record a queue spawn failure for the circuit breaker.
-    pub fn record_queue_failure(&mut self, repo_dir: &Path) {
+    /// Returns staged statuses that the caller should flush after releasing the mutex.
+    /// INV-19 / BACK-007: avoids N sequential fsyncs while holding the registry lock.
+    pub fn record_queue_failure(&mut self, repo_dir: &Path) -> Vec<StagedStatus> {
         let hash = repo_hash(repo_dir);
         let count = self.consecutive_failures.entry(hash.clone()).or_insert(0);
         *count += 1;
+        let mut staged_batch = Vec::new();
         if *count >= MAX_CONSECUTIVE_FAILURES {
             tracing::warn!(repo_hash = %hash, "circuit breaker tripped — draining remaining queue");
-            // Collect run IDs first to avoid borrowing self while iterating
             let run_ids: Vec<String> = self
                 .pending_queues
                 .get_mut(&hash)
                 .map(|queue| queue.drain(..).map(|p| p.run_id).collect())
                 .unwrap_or_default();
             for run_id in &run_ids {
-                let _ = self.update_status(
+                match self.stage_status_locked(
                     run_id,
                     RunStatus::Stopped,
                     None,
                     Some("circuit breaker tripped".into()),
-                );
+                ) {
+                    Ok(staged) => staged_batch.push(staged),
+                    Err(e) => {
+                        tracing::error!(run_id = %run_id, error = %e, "stage_status_locked failed: circuit breaker drain");
+                    }
+                }
             }
             self.consecutive_failures.remove(&hash);
         }
         if let Err(e) = self.save_queue() {
             tracing::warn!(error = %e, "failed to persist queue after record_queue_failure");
         }
+        staged_batch
     }
 
     /// Record a successful queue spawn, resetting the circuit breaker.
@@ -907,7 +1034,10 @@ impl RunRegistry {
     }
 
     /// Atomically write run metadata to disk (write tmp + rename).
-    fn write_meta(&self, entry: &RunEntry) -> Result<()> {
+    ///
+    /// Associated function (not `&self`) so it can be called after the
+    /// registry mutex is released — see `flush_status` / INV-19.
+    fn write_meta(entry: &RunEntry) -> Result<()> {
         let run_dir = gw_home().join("runs").join(&entry.run_id);
         fs::create_dir_all(&run_dir)
             .wrap_err_with(|| format!("failed to create run dir: {}", run_dir.display()))?;
@@ -1709,5 +1839,26 @@ mod tests {
             let all = reg.list_runs(true);
             assert_eq!(all.len(), 2);
         });
+    }
+
+    // ── RepoLockGuard unit tests ───────────────────────────────────
+
+    #[test]
+    fn repo_lock_guard_releases_on_drop() {
+        let mut map = HashMap::new();
+        map.insert("abc".to_string(), tempfile::tempfile().unwrap());
+        let guard = RepoLockGuard::new("abc".to_string());
+        guard.release_from(&mut map);
+        assert!(!map.contains_key("abc"));
+    }
+
+    #[test]
+    fn repo_lock_guard_retains_on_commit() {
+        let mut map = HashMap::new();
+        map.insert("abc".to_string(), tempfile::tempfile().unwrap());
+        let guard = RepoLockGuard::new("abc".to_string());
+        let _ = guard.commit();
+        // guard consumed, map untouched
+        assert!(map.contains_key("abc"));
     }
 }

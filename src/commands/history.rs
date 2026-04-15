@@ -732,6 +732,7 @@ mod tests {
             claude_pid: None,
             schedule_id: None,
             last_recovery_at: None,
+            write_epoch: 0,
         }
     }
 
