@@ -53,9 +53,6 @@ const SEND_DELAY_MS: u64 = 300;
 /// Short delay after Escape for Ink processing.
 const ESCAPE_DELAY_MS: u64 = 100;
 
-/// Default wait time for Claude Code initialization (12 seconds).
-const CLAUDE_INIT_SECS: u64 = 12;
-
 /// Configuration for spawning a Claude Code session.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -331,9 +328,15 @@ fn start_claude(
     // For starting Claude itself, plain send-keys + Enter works.
     send_simple_command(session_id, &cmd)?;
 
-    // Wait for initialization
-    info!("Waiting {}s for Claude Code initialization...", CLAUDE_INIT_SECS);
-    std::thread::sleep(Duration::from_secs(CLAUDE_INIT_SECS));
+    // PERF-005: the post-spawn TUI-init wait is the caller's responsibility.
+    // Every caller already waits independently:
+    //   * daemon/executor.rs spawn_after_register    → tokio::time::sleep(SPAWN_INIT_WAIT_SECS)
+    //   * daemon/heartbeat.rs spawn_recovery_*       → tokio::time::sleep(SPAWN_INIT_WAIT_SECS)
+    //   * engine/single_session/monitor.rs run_*     → std::thread::sleep(12s)
+    //   * engine/phase_executor.rs spawn_for_group   → wait_for_prompt (pane polling)
+    // Keeping a 12 s std::thread::sleep here would block a tokio worker on
+    // every daemon-initiated spawn, duplicating the async wait and stalling
+    // unrelated heartbeat/IPC work for the full 12 s.
 
     Ok(())
 }

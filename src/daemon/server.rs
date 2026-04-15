@@ -483,6 +483,25 @@ async fn dispatch_request(
                     };
                 }
             };
+            // SEC-004: validate config_dir on SubmitRun (parity with AddSchedule
+            // at server.rs:772). Without this, a client-supplied config_dir
+            // containing `..` components or non-existent paths reaches
+            // session::spawn::start_claude and is shell-interpolated into the
+            // tmux command line — shell_escape is the only defense, which is
+            // insufficient for path-traversal-style abuse.
+            let canonical_config = match config_dir
+                .as_ref()
+                .map(|p| validate_config_dir(p))
+                .transpose()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid config_dir: {e}"),
+                    };
+                }
+            };
 
             // Check if repo already has an active run OR global capacity is
             // exhausted — enqueue if so (A6: max_concurrent_runs enforcement).
@@ -498,7 +517,7 @@ async fn dispatch_request(
                         plan_path: canonical_plan.clone(),
                         repo_dir: canonical_repo.clone(),
                         session_name: session_name.clone(),
-                        config_dir: config_dir.clone(),
+                        config_dir: canonical_config.clone(),
                         verbose,
                         queued_at: chrono::Utc::now(),
                     };
@@ -528,7 +547,7 @@ async fn dispatch_request(
                 &canonical_plan,
                 &canonical_repo,
                 session_name,
-                config_dir,
+                canonical_config,
                 verbose,
             )
             .await
@@ -674,23 +693,37 @@ async fn dispatch_request(
             crate::daemon::drain::drain_single_session(Arc::clone(registry), &actual_id).await;
 
             // Step 4: Mark as Stopped but do NOT kill tmux
-            crate::daemon::heartbeat::append_event(&actual_id, "detached", &format!(
+            crate::daemon::events::append_event(&actual_id, "detached", &format!(
                 "detached by user — tmux session '{}' kept alive (gw no longer tracking)",
                 tmux.as_deref().unwrap_or("unknown"),
             ));
-            {
+            // PERF-002: stage under the lock, release, then fsync (INV-19).
+            // Holding the registry mutex across `flush_status` would serialise
+            // concurrent IPC for the full 1–20 ms fsync duration.
+            let staged = {
                 let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
+                reg.stage_status_locked(
                     &actual_id,
                     RunStatus::Stopped,
                     Some("detached".to_string()),
                     Some("detached by user — tmux session kept alive".to_string()),
-                ) {
+                )
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            };
+            let staged = match staged {
+                Ok(s) => s,
+                Err(e) => {
                     return Response::Error {
                         code: ErrorCode::InternalError,
                         message: e.to_string(),
                     };
                 }
+            };
+            if let Err(e) = RunRegistry::flush_status(&staged) {
+                return Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                };
             }
 
             tracing::info!(
@@ -918,6 +951,22 @@ async fn dispatch_request(
             match reg.find_pending_by_prefix(&run_id) {
                 Some((full_id, _repo_hash)) => {
                     reg.remove_pending(&full_id);
+                    // FLAW-001: mirror dequeue_run — without this, the RunEntry
+                    // created by enqueue_run lingers with status=Queued in
+                    // self.runs (and meta.json on disk) and is reloaded as a
+                    // ghost entry on daemon restart. See registry.rs:dequeue_run.
+                    if let Err(e) = reg.update_status(
+                        &full_id,
+                        RunStatus::Stopped,
+                        None,
+                        Some("removed from queue by user".into()),
+                    ) {
+                        tracing::warn!(
+                            run_id = %full_id,
+                            error = %e,
+                            "failed to update RunEntry to Stopped after RemoveQueued",
+                        );
+                    }
                     if let Err(e) = reg.save_queue() {
                         tracing::warn!(error = %e, "failed to persist queue after remove");
                     }
@@ -1149,111 +1198,6 @@ fn classify_spawn_error(e: &color_eyre::Report) -> ErrorCode {
         ErrorCode::InvalidRequest
     } else {
         ErrorCode::InternalError
-    }
-}
-
-/// Drain the next queued run for a repo after a run completes.
-///
-/// CRITICAL: Must be called AFTER releasing the registry lock.
-/// Uses `tokio::spawn` to avoid deadlock — `spawn_run` re-acquires the lock.
-pub(crate) async fn drain_if_available(
-    registry: Arc<Mutex<RunRegistry>>,
-    repo_dir: &Path,
-    failed: bool,
-) {
-    // INV-19: stage all mutations inside the mutex scope, then release before
-    // fsync'ing. Holding `reg` across `flush_status` would serialise up to 50
-    // fsyncs under the registry lock on circuit-breaker trip.
-    let (staged_batch, next) = {
-        let mut reg = registry.lock().await;
-        let staged_batch = if failed {
-            reg.record_queue_failure(repo_dir)
-        } else {
-            reg.record_queue_success(repo_dir);
-            Vec::new()
-        };
-        // Try the completing repo's queue first, then any other queue
-        // with available capacity (handles runs queued by A6 global cap).
-        let next = reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready());
-        (staged_batch, next)
-    }; // `reg` dropped — mutex released before fsync loop below
-
-    for staged in &staged_batch {
-        if let Err(e) = RunRegistry::flush_status(staged) {
-            tracing::error!(run_id = %staged.entry.run_id, error = %e, "flush_status failed: circuit breaker drain");
-        }
-    }
-
-    if let Some(pending) = next {
-        let registry = Arc::clone(&registry);
-        // Preserve values needed in the error branch BEFORE moving `pending`
-        // into `spawn_queued_run`. The run_id is needed to mark the ghost
-        // RunEntry Failed so it doesn't linger as a Queued row in `gw ps`.
-        let pending_run_id = pending.run_id.clone();
-        let repo_dir = pending.repo_dir.clone();
-        let verbose = pending.verbose;
-
-        tokio::spawn(async move {
-            match crate::daemon::executor::spawn_queued_run(
-                Arc::clone(&registry), pending, verbose,
-            )
-            .await
-            {
-                Ok(run_id) => {
-                    tracing::info!(run_id = %run_id, "drained queued run — now running");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to spawn drained run — recording failure");
-                    // INV-19: stage everything under the lock, then release
-                    // the guard before fsync'ing the circuit-breaker batch.
-                    // Ensure the still-Queued RunEntry is cleared. Two cases:
-                    //   1. Pre-flight failed → entry stays Queued, lock never
-                    //      acquired. update_status(Failed) marks it terminal.
-                    //   2. promote_queued or later step failed → entry may
-                    //      still be Queued with lock held. update_status
-                    //      releases the lock via its Failed branch.
-                    // Without this, `drain_next` already popped the PendingRun
-                    // so the entry would ghost as "queued" forever.
-                    let (failed_staged, staged_batch, next) = {
-                        let mut reg = registry.lock().await;
-                        let failed_staged = reg
-                            .stage_status_locked(
-                                &pending_run_id,
-                                RunStatus::Failed,
-                                None,
-                                Some(format!("drain spawn failed: {e}")),
-                            )
-                            .map_err(|se| color_eyre::eyre::eyre!("{se}"));
-                        let staged_batch = reg.record_queue_failure(&repo_dir);
-                        let next = reg.drain_next(&repo_dir);
-                        (failed_staged, staged_batch, next)
-                    }; // `reg` dropped — mutex released before fsyncs
-
-                    match failed_staged {
-                        Ok(s) => {
-                            if let Err(fe) = RunRegistry::flush_status(&s) {
-                                tracing::error!(run_id = %pending_run_id, error = %fe, "flush_status failed: marking failed after drain spawn error");
-                            }
-                        }
-                        Err(ue) => {
-                            tracing::error!(run_id = %pending_run_id, error = %ue, "stage_status failed: marking failed after drain spawn error");
-                        }
-                    }
-                    for staged in &staged_batch {
-                        if let Err(fe) = RunRegistry::flush_status(staged) {
-                            tracing::error!(run_id = %staged.entry.run_id, error = %fe, "flush_status failed: circuit breaker drain");
-                        }
-                    }
-                    if let Some(retry) = next {
-                        tracing::info!("retrying with next queued run after spawn failure");
-                        let retry_verbose = retry.verbose;
-                        let _ = crate::daemon::executor::spawn_queued_run(
-                            registry, retry, retry_verbose,
-                        ).await;
-                    }
-                }
-            }
-        });
     }
 }
 

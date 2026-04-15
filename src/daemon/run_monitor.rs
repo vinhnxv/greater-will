@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::watchdog::WatchdogConfig;
-use crate::daemon::heartbeat::append_event;
+use crate::daemon::events::append_event;
 use crate::daemon::registry::{RunEntry, RunRegistry};
 use crate::engine::monitor_constants::{
     COMPLETION_GRACE_SECS, DAEMON_MIN_COMPLETION_AGE_SECS as MIN_COMPLETION_AGE_SECS,
@@ -598,7 +598,7 @@ impl DaemonRunMonitor {
         let prev = self.cached_swarm_active;
         self.cached_swarm_active = self.check_swarm_active().await;
         if prev != self.cached_swarm_active {
-            crate::daemon::heartbeat::append_event(
+            crate::daemon::events::append_event(
                 &self.run_id,
                 "swarm_state",
                 &format!("active={}", self.cached_swarm_active),
@@ -645,7 +645,7 @@ impl DaemonRunMonitor {
                     .unwrap_or("stop-failure signal (no detail)");
                 let reason = format!("stop-failure signal [{:?}]: {}", class, summary);
 
-                crate::daemon::heartbeat::append_event(&self.run_id, "stop_failure_classified", &reason);
+                crate::daemon::events::append_event(&self.run_id, "stop_failure_classified", &reason);
 
                 self.pending_kill = Some(PendingKillRequest {
                     reason,

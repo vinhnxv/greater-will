@@ -1,4 +1,5 @@
 pub mod drain;
+pub mod events;
 pub mod executor;
 pub mod heartbeat;
 pub mod network;

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Grace period after sending /exit before force-killing.
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -124,6 +124,105 @@ pub async fn spawn_queued_run(
     .await
 }
 
+/// Drain the next queued run for a repo after a run completes.
+///
+/// CRITICAL: Must be called AFTER releasing the registry lock.
+/// Uses `tokio::spawn` to avoid deadlock — `spawn_run` re-acquires the lock.
+pub(crate) async fn drain_if_available(
+    registry: Arc<Mutex<RunRegistry>>,
+    repo_dir: &Path,
+    failed: bool,
+) {
+    // INV-19: stage all mutations inside the mutex scope, then release before
+    // fsync'ing. Holding `reg` across `flush_status` would serialise up to 50
+    // fsyncs under the registry lock on circuit-breaker trip.
+    let (staged_batch, next) = {
+        let mut reg = registry.lock().await;
+        let staged_batch = if failed {
+            reg.record_queue_failure(repo_dir)
+        } else {
+            reg.record_queue_success(repo_dir);
+            Vec::new()
+        };
+        // Try the completing repo's queue first, then any other queue
+        // with available capacity (handles runs queued by A6 global cap).
+        let next = reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready());
+        (staged_batch, next)
+    }; // `reg` dropped — mutex released before fsync loop below
+
+    for staged in &staged_batch {
+        if let Err(e) = RunRegistry::flush_status(staged) {
+            error!(run_id = %staged.entry.run_id, error = %e, "flush_status failed: circuit breaker drain");
+        }
+    }
+
+    if let Some(pending) = next {
+        let registry = Arc::clone(&registry);
+        // Preserve values needed in the error branch BEFORE moving `pending`
+        // into `spawn_queued_run`. The run_id is needed to mark the ghost
+        // RunEntry Failed so it doesn't linger as a Queued row in `gw ps`.
+        let pending_run_id = pending.run_id.clone();
+        let repo_dir = pending.repo_dir.clone();
+        let verbose = pending.verbose;
+
+        tokio::spawn(async move {
+            match spawn_queued_run(Arc::clone(&registry), pending, verbose).await {
+                Ok(run_id) => {
+                    info!(run_id = %run_id, "drained queued run — now running");
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to spawn drained run — recording failure");
+                    // INV-19: stage everything under the lock, then release
+                    // the guard before fsync'ing the circuit-breaker batch.
+                    // Ensure the still-Queued RunEntry is cleared. Two cases:
+                    //   1. Pre-flight failed → entry stays Queued, lock never
+                    //      acquired. update_status(Failed) marks it terminal.
+                    //   2. promote_queued or later step failed → entry may
+                    //      still be Queued with lock held. update_status
+                    //      releases the lock via its Failed branch.
+                    // Without this, `drain_next` already popped the PendingRun
+                    // so the entry would ghost as "queued" forever.
+                    let (failed_staged, staged_batch, next) = {
+                        let mut reg = registry.lock().await;
+                        let failed_staged = reg
+                            .stage_status_locked(
+                                &pending_run_id,
+                                RunStatus::Failed,
+                                None,
+                                Some(format!("drain spawn failed: {e}")),
+                            )
+                            .map_err(|se| color_eyre::eyre::eyre!("{se}"));
+                        let staged_batch = reg.record_queue_failure(&repo_dir);
+                        let next = reg.drain_next(&repo_dir);
+                        (failed_staged, staged_batch, next)
+                    }; // `reg` dropped — mutex released before fsyncs
+
+                    match failed_staged {
+                        Ok(s) => {
+                            if let Err(fe) = RunRegistry::flush_status(&s) {
+                                error!(run_id = %pending_run_id, error = %fe, "flush_status failed: marking failed after drain spawn error");
+                            }
+                        }
+                        Err(ue) => {
+                            error!(run_id = %pending_run_id, error = %ue, "stage_status failed: marking failed after drain spawn error");
+                        }
+                    }
+                    for staged in &staged_batch {
+                        if let Err(fe) = RunRegistry::flush_status(staged) {
+                            error!(run_id = %staged.entry.run_id, error = %fe, "flush_status failed: circuit breaker drain");
+                        }
+                    }
+                    if let Some(retry) = next {
+                        info!("retrying with next queued run after spawn failure");
+                        let retry_verbose = retry.verbose;
+                        let _ = spawn_queued_run(registry, retry, retry_verbose).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Shared pre-flight I/O checks used by both fresh and queued spawn paths.
 ///
 /// Extracted so `spawn_run` and `spawn_queued_run` run an identical gate
@@ -204,7 +303,7 @@ async fn spawn_after_register(
         // the tmux-spawn-failure path below — addresses BACK-002).
         warn!(run_id = %run_id, error = %e, "pre_phase_cleanup failed");
         let reason = format!("pre_phase_cleanup failed: {e}");
-        crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
+        crate::daemon::events::append_event(&run_id, "spawn_failed", &reason);
         let mut reg = registry.lock().await;
         if let Err(ue) = reg.update_status(
             &run_id,
@@ -267,7 +366,7 @@ async fn spawn_after_register(
             // ── Spawn-init wait (C-5) ──────────────────────────────────
             // Match foreground monitor.rs:79-81: wait for Claude TUI to
             // finish initializing before dispatching /rune:arc.
-            crate::daemon::heartbeat::append_event(
+            crate::daemon::events::append_event(
                 &run_id,
                 "spawn_wait_init",
                 &format!("pid={} — waiting 12s for Claude TUI", pid),
@@ -300,7 +399,7 @@ async fn spawn_after_register(
             // Spawn failed — clean up registry entry
             warn!(run_id = %run_id, error = %e, "failed to spawn tmux session");
             let reason = format!("tmux spawn failed: {e}");
-            crate::daemon::heartbeat::append_event(&run_id, "spawn_failed", &reason);
+            crate::daemon::events::append_event(&run_id, "spawn_failed", &reason);
             let mut reg = registry.lock().await;
             if let Err(ue) = reg.update_status(
                 &run_id,
@@ -320,7 +419,7 @@ async fn spawn_after_register(
     // flag-aware variant used on foreground restarts.
     let arc_cmd = crate::engine::single_session::util::build_arc_command_plain(&plan_str);
 
-    crate::daemon::heartbeat::append_event(&run_id, "spawn_dispatch", &format!("sending: {}", arc_cmd));
+    crate::daemon::events::append_event(&run_id, "spawn_dispatch", &format!("sending: {}", arc_cmd));
 
     if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, &arc_cmd) {
         warn!(error = %e, "failed to send arc command — killing session");
@@ -328,7 +427,7 @@ async fn spawn_after_register(
         // Persist pane capture before kill so post-mortem debugging works —
         // parity with monitor.rs:88 (plan GAP A3).
         crate::session::detect::save_crash_dump(&tmux_session, &repo_dir, &reason);
-        crate::daemon::heartbeat::append_event(&run_id, "kill_session", &format!(
+        crate::daemon::events::append_event(&run_id, "kill_session", &format!(
             "gw killed session '{}' — reason: {} (killed by: executor/send_keys_failed)",
             tmux_session, reason,
         ));
@@ -346,18 +445,23 @@ async fn spawn_after_register(
     }
 
     // ── Update registry ─────────────────────────────────────────────
-    {
+    // PERF-002: stage under the lock, release, then fsync (INV-19). Holding
+    // the registry mutex across the flush would block all concurrent IPC
+    // (ListRuns, StopRun, other SubmitRuns) for 1–20 ms on every spawn.
+    let staged = {
         let mut reg = registry.lock().await;
         if let Some(entry) = reg.get_mut(&run_id) {
             entry.tmux_session = Some(tmux_session.clone());
         }
-        reg.update_status(
+        reg.stage_status_locked(
             &run_id,
             RunStatus::Running,
             Some("starting".to_string()),
             None,
-        )?;
-    }
+        )
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?
+    }; // mutex released before fsync
+    RunRegistry::flush_status(&staged)?;
 
     info!(
         run_id = %run_id,
@@ -366,7 +470,7 @@ async fn spawn_after_register(
     );
 
     // Log structured event for `gw logs`
-    crate::daemon::heartbeat::log_run_started(&run_id, &plan_str);
+    crate::daemon::events::log_run_started(&run_id, &plan_str);
 
     Ok(run_id)
 }
@@ -417,7 +521,7 @@ pub async fn stop_run(
         Some(s) => s,
         None => {
             // No tmux session — just mark as stopped
-            crate::daemon::heartbeat::append_event(run_id, "stopped", "stopped by user (no tmux session to kill)");
+            crate::daemon::events::append_event(run_id, "stopped", "stopped by user (no tmux session to kill)");
             {
                 let mut reg = registry.lock().await;
                 reg.update_status(
@@ -430,7 +534,7 @@ pub async fn stop_run(
             // Drain next queued run for this repo — parity with heartbeat.rs
             // completion paths. Without this, the queue stalls until the next
             // completion event (which may never arrive if no run is active).
-            crate::daemon::server::drain_if_available(
+            drain_if_available(
                 Arc::clone(&registry),
                 &repo_dir,
                 false,
@@ -456,7 +560,7 @@ pub async fn stop_run(
     // Step 3: Force-kill if still alive
     if !stopped && spawn::has_session(&tmux_session) {
         warn!(tmux = %tmux_session, "session still alive after grace period — force killing");
-        crate::daemon::heartbeat::append_event(run_id, "kill_session", &format!(
+        crate::daemon::events::append_event(run_id, "kill_session", &format!(
             "gw force-killed session '{}' — reason: user requested stop, session did not exit within {}s grace (killed by: executor/stop_run)",
             tmux_session, GRACEFUL_STOP_TIMEOUT.as_secs(),
         ));
@@ -464,7 +568,7 @@ pub async fn stop_run(
             warn!(error = %e, "failed to force-kill tmux session");
         }
     } else {
-        crate::daemon::heartbeat::append_event(run_id, "stopped", &format!(
+        crate::daemon::events::append_event(run_id, "stopped", &format!(
             "stopped by user — session '{}' exited gracefully after /exit",
             tmux_session,
         ));
@@ -482,13 +586,13 @@ pub async fn stop_run(
     }
 
     info!(run_id = %run_id, "run stopped");
-    crate::daemon::heartbeat::log_run_stopped(run_id);
+    crate::daemon::events::log_run_stopped(run_id);
 
     // Drain next queued run for this repo — parity with heartbeat.rs
     // completion paths (GAP-6). Without this, stopping the last Running run
     // leaves the queue stalled indefinitely because drain_if_available is
     // only invoked on completion events.
-    crate::daemon::server::drain_if_available(Arc::clone(&registry), &repo_dir, false).await;
+    drain_if_available(Arc::clone(&registry), &repo_dir, false).await;
 
     Ok(())
 }

@@ -154,8 +154,15 @@ impl Tmux {
     /// # Arguments
     ///
     /// * `cmd` - Command to send (Enter key is appended automatically)
+    ///
+    /// SEC-009: The command body is sent with `-l` (literal) so that any
+    /// embedded strings that happen to match tmux key names (e.g. `C-c`,
+    /// `Enter`, `PageUp`) are delivered as text rather than interpreted as
+    /// keybindings. The Enter keystroke is sent as a separate, non-literal
+    /// invocation to actually execute the command.
     pub fn send_command(&self, cmd: &str) -> Result<()> {
-        Self::run_tmux_cmd(&["send-keys", "-t", &self.name, cmd, "Enter"])?;
+        Self::run_tmux_cmd(&["send-keys", "-t", &self.name, "-l", cmd])?;
+        Self::run_tmux_cmd(&["send-keys", "-t", &self.name, "Enter"])?;
 
         Ok(())
     }
