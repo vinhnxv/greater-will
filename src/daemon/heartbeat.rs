@@ -1025,18 +1025,21 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // Attempt counter used only for per-class backoff curve
-            // (e.g. ApiOverload exponential 15→30→60→120 min). The
-            // retry ceiling itself is owned by CrashLoopDetector
-            // above — per-phase budget resets on phase advance, and
-            // global ceilings (window + total_restarts) still apply.
-            let crash_count = {
-                let reg = registry.lock().await;
-                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
-            };
+            // Backoff attempt index: use the CrashLoopDetector's
+            // per-phase count (just updated above by
+            // `record_restart_for_phase`) rather than the global
+            // `crash_restarts` registry field, so each phase gets a
+            // fresh backoff curve on entry. Matters for `ApiOverload`
+            // exponential ladder (15→30→60→120 min) — a phase that
+            // encounters its first ApiOverload should back off 15 min,
+            // not be penalised by earlier phases' overload history.
+            let phase_attempt = current_phase
+                .as_deref()
+                .map(|p| detector.crashes_for_phase(p).saturating_sub(1))
+                .unwrap_or(0);
 
             // Per-error-class exponential backoff (P1: cancellation-aware)
-            let backoff = error_class.backoff_for_attempt(crash_count);
+            let backoff = error_class.backoff_for_attempt(phase_attempt);
             append_event(run_id, "backoff", &format!(
                 "{:?}: {}s before retry",
                 error_class, backoff.as_secs()
@@ -1126,18 +1129,21 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // Attempt counter used only for per-class backoff curve
-            // (e.g. ApiOverload exponential 15→30→60→120 min). The
-            // retry ceiling itself is owned by CrashLoopDetector
-            // above — per-phase budget resets on phase advance, and
-            // global ceilings (window + total_restarts) still apply.
-            let crash_count = {
-                let reg = registry.lock().await;
-                reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
-            };
+            // Backoff attempt index: use the CrashLoopDetector's
+            // per-phase count (just updated above by
+            // `record_restart_for_phase`) rather than the global
+            // `crash_restarts` registry field, so each phase gets a
+            // fresh backoff curve on entry. Matters for `ApiOverload`
+            // exponential ladder (15→30→60→120 min) — a phase that
+            // encounters its first ApiOverload should back off 15 min,
+            // not be penalised by earlier phases' overload history.
+            let phase_attempt = current_phase
+                .as_deref()
+                .map(|p| detector.crashes_for_phase(p).saturating_sub(1))
+                .unwrap_or(0);
 
             // GAP 5: Per-class backoff instead of flat cooldown (parity with foreground)
-            let backoff = implicit_class.backoff_for_attempt(crash_count);
+            let backoff = implicit_class.backoff_for_attempt(phase_attempt);
             append_event(run_id, "backoff", &format!(
                 "{:?}: {}s before retry",
                 implicit_class, backoff.as_secs()
@@ -1210,6 +1216,39 @@ async fn attempt_recovery(
     // Matches the escaping in executor.rs::build_arc_command.
     let escaped = plan_str.replace('\'', "'\\''");
     let arc_command = format!("/rune:arc '{}'", escaped);
+
+    // Plan-mismatch guard: if `arc-phase-loop.local.md` on disk points at a
+    // different plan (e.g., stale state from a prior run that escaped cleanup),
+    // `resolve_restart_command` would issue a `--resume` against the wrong
+    // arc checkpoint. Foreground orchestrator has an equivalent guard at
+    // orchestrator.rs:104-132; reconciler's adopt path uses `plans_match` at
+    // reconciler.rs:543. Daemon recovery had no check — close that gap by
+    // removing the stale file before restart resolution so it falls through
+    // to `Fresh`.
+    if let crate::monitor::loop_state::LoopStateRead::Active(state) =
+        crate::monitor::loop_state::read_arc_loop_state(repo_dir)
+    {
+        if !crate::daemon::reconciler::plans_match(&state.plan_file, &plan_str, repo_dir) {
+            let loop_file = repo_dir.join(".rune").join("arc-phase-loop.local.md");
+            warn!(
+                run_id = %run_id,
+                expected_plan = %plan_str,
+                on_disk_plan = %state.plan_file,
+                "Recovery: stale loop state for different plan — removing before Fresh start",
+            );
+            append_event(
+                run_id,
+                "plan_mismatch",
+                &format!(
+                    "stale loop state plan={} expected={} — forcing Fresh",
+                    state.plan_file, plan_str
+                ),
+            );
+            if let Err(e) = std::fs::remove_file(&loop_file) {
+                warn!(error = %e, "Failed to remove stale loop state file (non-fatal)");
+            }
+        }
+    }
 
     let crash_count = {
         let reg = registry.lock().await;

@@ -970,6 +970,14 @@ impl DaemonRunMonitor {
                 );
                 append_event(&self.run_id, "phase_profile_applied", &event_msg);
             }
+            // Reset idle nudge budget on phase transition. `nudge_count`
+            // otherwise only resets on pane-content change (see line ~821),
+            // so a rapid agent-team handoff with no visible pane update
+            // could let phase N inherit phase N-1's burnt budget.
+            // Transition_/failed_nudge counts are already reset by the
+            // gap-state branches below — this line closes the gap for
+            // the normal idle-nudge counter.
+            self.nudge_count = 0;
             self.current_phase = new_phase;
         }
 
