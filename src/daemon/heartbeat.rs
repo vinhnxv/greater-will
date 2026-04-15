@@ -7,9 +7,10 @@
 //! phase-aware restart commands and per-error-class backoff.
 
 use crate::config::watchdog::WatchdogConfig;
+use crate::daemon::events::append_event;
+use crate::daemon::executor::drain_if_available;
 use crate::daemon::protocol::RunStatus;
 use crate::daemon::registry::{RunEntry, RunRegistry};
-use crate::daemon::server::drain_if_available;
 use crate::daemon::run_monitor::{DaemonRunMonitor, DaemonRunOutcome};
 use crate::daemon::state::gw_home;
 use crate::engine::crash_loop::{CrashLoopDecision, CrashLoopDetector};
@@ -737,52 +738,6 @@ fn compute_run_uptime_secs(entry: &RunEntry) -> u64 {
         .signed_duration_since(session_start)
         .num_seconds()
         .max(0) as u64
-}
-
-// ── Structured event logging ───────────────────────────────────────
-
-/// Append a structured event to the run's event log (events.jsonl).
-///
-/// Each line is a JSON object with timestamp, event type, and message.
-/// This is the primary data source for `gw logs <id>`.
-pub fn append_event(run_id: &str, event: &str, message: &str) {
-    let log_dir = gw_home().join("runs").join(run_id).join("logs");
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        debug!(error = %e, "failed to create log directory for events");
-        return;
-    }
-
-    let log_path = log_dir.join("events.jsonl");
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let line = serde_json::json!({
-        "ts": timestamp,
-        "event": event,
-        "msg": message,
-    });
-
-    use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{}", line);
-        }
-        Err(e) => {
-            debug!(error = %e, "failed to append event");
-        }
-    }
-}
-
-/// Log the initial "run started" event. Called from executor after spawn.
-pub fn log_run_started(run_id: &str, plan_path: &str) {
-    append_event(run_id, "started", &format!("plan: {plan_path}"));
-}
-
-/// Log a run stopped event.
-pub fn log_run_stopped(run_id: &str) {
-    append_event(run_id, "stopped", "stopped by user");
 }
 
 // ── Monitor outcome handling ──────────────────────────────────────

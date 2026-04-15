@@ -269,7 +269,7 @@ pub fn reconcile(registry: &mut RunRegistry) -> ReconciliationReport {
                     "tmux session '{}' lost with no checkpoint — marked failed by reconciler on daemon startup",
                     tmux_session.as_deref().unwrap_or("unknown"),
                 );
-                crate::daemon::heartbeat::append_event(run_id, "session_died", &reason);
+                crate::daemon::events::append_event(run_id, "session_died", &reason);
                 if let Err(e) = registry.update_status(
                     run_id,
                     RunStatus::Failed,
@@ -415,7 +415,7 @@ fn resolve_session_name_collisions(registry: &mut RunRegistry) -> u32 {
             let reason = format!(
                 "session_name '{session_name}' collision with canonical owner '{canonical_id}' — resolved by reconciler"
             );
-            crate::daemon::heartbeat::append_event(run_id, "collision_stopped", &reason);
+            crate::daemon::events::append_event(run_id, "collision_stopped", &reason);
             if let Err(e) = registry.update_status(
                 run_id,
                 RunStatus::Stopped,
@@ -547,7 +547,7 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
                     live = %live_plan,
                     "refusing to adopt orphan — plan mismatch between meta.json and live arc loop state"
                 );
-                crate::daemon::heartbeat::append_event(
+                crate::daemon::events::append_event(
                     run_id,
                     "adopt_refused_plan_mismatch",
                     &format!("recorded={}, live={}", recorded_plan, live_plan),
