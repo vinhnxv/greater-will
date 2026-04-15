@@ -285,16 +285,27 @@ impl HeartbeatMonitor {
                             run_id = %outcome_run_id,
                             "DaemonRunMonitor panicked: {:?}", e
                         );
-                        let mut reg = outcome_registry.lock().await;
-                        if let Err(e) = reg.update_status(
-                            &outcome_run_id,
-                            RunStatus::Failed,
-                            None,
-                            Some("Monitor panicked — marking failed".to_string()),
-                        ) {
-                            tracing::error!(run_id = %outcome_run_id, error = %e, "update_status failed: marking failed after monitor panic");
+                        // INV-19: stage under the lock, release, fsync outside.
+                        let staged = {
+                            let mut reg = outcome_registry.lock().await;
+                            reg.stage_status_locked(
+                                &outcome_run_id,
+                                RunStatus::Failed,
+                                None,
+                                Some("Monitor panicked — marking failed".to_string()),
+                            )
+                            .map_err(|se| color_eyre::eyre::eyre!("{se}"))
+                        }; // reg dropped — mutex released before fsync
+                        match staged {
+                            Ok(s) => {
+                                if let Err(fe) = RunRegistry::flush_status(&s) {
+                                    tracing::error!(run_id = %outcome_run_id, error = %fe, "flush_status failed: marking failed after monitor panic");
+                                }
+                            }
+                            Err(se) => {
+                                tracing::error!(run_id = %outcome_run_id, error = %se, "stage_status failed: marking failed after monitor panic");
+                            }
                         }
-                        drop(reg);
                         append_event(
                             &outcome_run_id,
                             "monitor_panic",
@@ -831,13 +842,27 @@ async fn handle_monitor_outcome(
         }
 
         DaemonRunOutcome::Failed { reason } => {
-            let mut reg = registry.lock().await;
-            if let Err(e) = reg.update_status(run_id, RunStatus::Failed, None, Some(reason.clone())) {
-                tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed");
+            // INV-19: stage under the lock, release, fsync outside.
+            let (staged, repo_dir) = {
+                let mut reg = registry.lock().await;
+                let staged = reg
+                    .stage_status_locked(run_id, RunStatus::Failed, None, Some(reason.clone()))
+                    .map_err(|se| color_eyre::eyre::eyre!("{se}"));
+                // Extract repo_dir before dropping lock to avoid re-acquisition race
+                let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
+                (staged, repo_dir)
+            }; // reg dropped — mutex released before fsync
+
+            match staged {
+                Ok(s) => {
+                    if let Err(fe) = RunRegistry::flush_status(&s) {
+                        tracing::error!(run_id = %run_id, error = %fe, "flush_status failed: marking failed");
+                    }
+                }
+                Err(se) => {
+                    tracing::error!(run_id = %run_id, error = %se, "stage_status failed: marking failed");
+                }
             }
-            // Extract repo_dir before dropping lock to avoid re-acquisition race
-            let repo_dir = reg.get(run_id).map(|e| e.repo_dir.clone());
-            drop(reg);
             append_event(run_id, "failed", &reason);
             // Drain next queued run for this repo (failure increments circuit breaker)
             if let Some(dir) = repo_dir {

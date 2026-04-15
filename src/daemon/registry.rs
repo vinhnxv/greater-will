@@ -328,8 +328,11 @@ impl RunRegistry {
         config_dir: Option<PathBuf>,
         schedule_id: Option<String>,
     ) -> Result<String> {
-        // Acquire per-repo lock first
+        // Acquire per-repo lock first, then wrap it in RAII so a write_meta
+        // failure below cannot leave a zombie lock in self.repo_locks (INV-7).
         self.acquire_repo_lock(&repo_dir)?;
+        let rh = repo_hash(&repo_dir);
+        let guard = RepoLockGuard::new(rh);
 
         let run_id = Self::generate_id();
         let session_name = session_name.unwrap_or_else(|| format!("gw-{}", &run_id));
@@ -354,8 +357,17 @@ impl RunRegistry {
             write_epoch: 0,
         };
 
-        // Persist to disk
-        self.write_meta(&entry)?;
+        // Persist to disk — release the lock on failure so the repo is not
+        // permanently blocked on ENOSPC/serde errors.
+        match Self::write_meta(&entry) {
+            Ok(()) => {
+                let _ = guard.commit();
+            }
+            Err(e) => {
+                guard.release_from(&mut self.repo_locks);
+                return Err(e);
+            }
+        }
         self.runs.insert(run_id.clone(), entry);
 
         tracing::info!(run_id = %run_id, "registered new run");
@@ -412,11 +424,17 @@ impl RunRegistry {
         Ok(staged)
     }
 
-    /// Flush a staged status change to disk. Runs fsync via write_meta.
-    /// INV-19: call this AFTER releasing the registry mutex.
-    /// Epoch-guarded: skips write if on-disk epoch is newer (idempotent under retry).
-    pub fn flush_status(&self, staged: &StagedStatus) -> Result<()> {
-        self.write_meta(&staged.entry)
+    /// Flush a staged status change to disk. Runs fsync via `write_meta`.
+    ///
+    /// INV-19: associated function (no `&self`) — MUST be called after the
+    /// registry mutex is released, so the 1–20ms fsync does not block other
+    /// registry operations.
+    ///
+    /// Note: `StagedStatus::epoch` is stamped for external correlation/debug
+    /// but is NOT used to skip writes in this release. Callers that need
+    /// idempotent retry guards should gate on run status before re-flushing.
+    pub fn flush_status(staged: &StagedStatus) -> Result<()> {
+        Self::write_meta(&staged.entry)
     }
 
     /// Update the status of a run (stage + flush in one call).
@@ -431,7 +449,7 @@ impl RunRegistry {
     ) -> Result<()> {
         let staged = self.stage_status_locked(run_id, status, phase, error)
             .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        self.flush_status(&staged)
+        Self::flush_status(&staged)
     }
 
     /// Remove a run from registry and disk.
@@ -541,7 +559,7 @@ impl RunRegistry {
     /// Unlike `register_run`, this does NOT generate a new ID or acquire repo locks.
     pub fn adopt(&mut self, entry: RunEntry) {
         let run_id = entry.run_id.clone();
-        if let Err(e) = self.write_meta(&entry) {
+        if let Err(e) = Self::write_meta(&entry) {
             tracing::warn!(run_id = %run_id, error = %e, "failed to persist adopted entry");
         }
         self.runs.insert(run_id, entry);
@@ -589,7 +607,7 @@ impl RunRegistry {
             last_recovery_at: None,
             write_epoch: 0,
         };
-        self.write_meta(&entry)?;
+        Self::write_meta(&entry)?;
         self.runs.insert(pending.run_id.clone(), entry);
 
         let queue = self.pending_queues.entry(hash).or_default();
@@ -686,7 +704,7 @@ impl RunRegistry {
         entry.restartable = true;
         let entry_clone = entry.clone();
 
-        match self.write_meta(&entry_clone) {
+        match Self::write_meta(&entry_clone) {
             Ok(()) => {
                 let _ = guard.commit();
                 tracing::info!(run_id = %run_id, "promoted queued run — repo lock acquired");
@@ -1016,7 +1034,10 @@ impl RunRegistry {
     }
 
     /// Atomically write run metadata to disk (write tmp + rename).
-    fn write_meta(&self, entry: &RunEntry) -> Result<()> {
+    ///
+    /// Associated function (not `&self`) so it can be called after the
+    /// registry mutex is released — see `flush_status` / INV-19.
+    fn write_meta(entry: &RunEntry) -> Result<()> {
         let run_dir = gw_home().join("runs").join(&entry.run_id);
         fs::create_dir_all(&run_dir)
             .wrap_err_with(|| format!("failed to create run dir: {}", run_dir.display()))?;
