@@ -526,9 +526,13 @@ async fn dispatch_request(
                             return Response::RunQueued { run_id, position };
                         }
                         Err(e) => {
-                            let code = if e.to_string().contains("queue full") {
+                            let msg = e.to_string();
+                            let code = if msg.contains("queue full") {
                                 ErrorCode::QueueFull
-                            } else if e.to_string().contains("already queued") {
+                            } else if msg.contains("plan already") {
+                                // Covers "plan already queued" and
+                                // "plan already running" — both are
+                                // user-submit duplicates, not server faults.
                                 ErrorCode::InvalidRequest
                             } else {
                                 ErrorCode::InternalError
