@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn circuit_breaker_persists() {
-        with_temp_gw_home(|tmp| {
+        with_temp_gw_home(|_tmp| {
             let mut reg = RunRegistry::new();
             let repo = PathBuf::from("/tmp/cb-persist-repo");
 

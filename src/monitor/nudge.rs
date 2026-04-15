@@ -532,7 +532,7 @@ mod tests {
         tracker.mark_nudged("session-A");
 
         // Same content should return Nudged state
-        let state = tracker.update(
+        let _state = tracker.update(
             "session-A",
             "content",
             Duration::from_secs(180),
