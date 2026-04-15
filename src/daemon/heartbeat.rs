@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -31,6 +31,9 @@ use crate::monitor::loop_state::{read_arc_loop_state, LoopStateRead};
 
 /// Interval between heartbeat checks.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent tmux `capture_pane` calls.
+const TMUX_CAPTURE_PARALLELISM: usize = 4;
 
 /// Handle for a spawned per-run monitor task.
 ///
@@ -351,12 +354,16 @@ impl HeartbeatMonitor {
         // results sequentially afterwards — `append_pane_log` and
         // `update_phase_from_pane` both touch shared state through `&self`,
         // so parallelizing them too would require finer-grained locking.
+        // EMB-005: Bounded tmux capture parallelism (max 4 concurrent)
+        let sem = Arc::new(Semaphore::new(TMUX_CAPTURE_PARALLELISM));
         let mut capture_set = tokio::task::JoinSet::new();
         for (run_id, tmux_session, _) in &running {
             if let Some(session) = tmux_session {
                 let session_owned = session.clone();
                 let run_id_owned = run_id.clone();
+                let permit = sem.clone().acquire_owned().await.unwrap();
                 capture_set.spawn_blocking(move || {
+                    let _permit = permit;
                     let capture = spawn::capture_pane(&session_owned);
                     (run_id_owned, capture)
                 });
@@ -387,44 +394,14 @@ impl HeartbeatMonitor {
     /// Rotates the log file to `pane.log.1` when it exceeds `PANE_LOG_ROTATE_BYTES`
     /// to bound disk usage — without rotation, a 12h run accumulates ~21 MB of
     /// pane captures, and `diagnose_session_death` would try to read all of it.
+    ///
+    /// INV-19: Blocking I/O hoisted off tokio reactor via spawn_blocking (fire-and-forget)
     fn append_pane_log(&self, run_id: &str, content: &str) {
-        /// Rotate pane.log when it grows past this size (10 MiB).
-        const PANE_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
-
-        let log_dir = gw_home().join("runs").join(run_id).join("logs");
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            debug!(error = %e, "failed to create log directory");
-            return;
-        }
-
-        let log_path = log_dir.join("pane.log");
-
-        // Rotate if the current log has grown past the threshold. Best-effort:
-        // metadata/rename failures degrade to "no rotation this tick" rather
-        // than aborting the append.
-        if let Ok(meta) = std::fs::metadata(&log_path) {
-            if meta.len() > PANE_LOG_ROTATE_BYTES {
-                let rotated = log_path.with_extension("log.1");
-                if let Err(e) = std::fs::rename(&log_path, &rotated) {
-                    debug!(error = %e, "failed to rotate pane.log");
-                }
-            }
-        }
-
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            Ok(mut f) => {
-                let _ = writeln!(f, "--- heartbeat capture ---");
-                let _ = write!(f, "{content}");
-            }
-            Err(e) => {
-                debug!(error = %e, "failed to append to pane log");
-            }
-        }
+        let run_id = run_id.to_owned();
+        let content = content.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            append_pane_log_sync(&run_id, &content);
+        });
     }
 
     /// Update the run's current phase from checkpoint.json (ground truth),
@@ -720,6 +697,52 @@ impl HeartbeatMonitor {
                 );
                 None
             }
+        }
+    }
+}
+
+// ── Pane log I/O (blocking) ─────────────────────────────────────
+
+/// Synchronous pane log append (runs on blocking thread pool).
+///
+/// Extracted from `HeartbeatMonitor::append_pane_log` so it can be
+/// called from `spawn_blocking` without requiring `&self`.
+fn append_pane_log_sync(run_id: &str, content: &str) {
+    /// Rotate pane.log when it grows past this size (10 MiB).
+    const PANE_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
+    let log_dir = gw_home().join("runs").join(run_id).join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        debug!(error = %e, "failed to create log directory");
+        return;
+    }
+
+    let log_path = log_dir.join("pane.log");
+
+    // Rotate if the current log has grown past the threshold. Best-effort:
+    // metadata/rename failures degrade to "no rotation this tick" rather
+    // than aborting the append.
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > PANE_LOG_ROTATE_BYTES {
+            let rotated = log_path.with_extension("log.1");
+            if let Err(e) = std::fs::rename(&log_path, &rotated) {
+                debug!(error = %e, "failed to rotate pane.log");
+            }
+        }
+    }
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "--- heartbeat capture ---");
+            let _ = write!(f, "{content}");
+        }
+        Err(e) => {
+            debug!(error = %e, "failed to append to pane log");
         }
     }
 }

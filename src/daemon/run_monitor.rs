@@ -335,7 +335,7 @@ impl DaemonRunMonitor {
                     self.poll_count += 1;
 
                     // 1. Signal file checks
-                    if let Some(outcome) = self.check_signals() {
+                    if let Some(outcome) = self.check_signals().await {
                         return outcome;
                     }
 
@@ -386,7 +386,7 @@ impl DaemonRunMonitor {
                     }
 
                     // 9. Artifact dir scan
-                    self.scan_artifacts();
+                    self.scan_artifacts().await;
 
                     // 12. Process liveness
                     if let Some(outcome) = self.check_process_liveness() {
@@ -614,7 +614,7 @@ impl DaemonRunMonitor {
 impl DaemonRunMonitor {
     /// Poll stop/completion/permission signal files from `repo_dir/.gw/signals/`.
     /// Uses the Shard 2 `*_from` helpers which accept a base directory.
-    fn check_signals(&mut self) -> Option<DaemonRunOutcome> {
+    async fn check_signals(&mut self) -> Option<DaemonRunOutcome> {
         // Stop signal (hook-based completion)
         if let Some(signal) =
             crate::commands::elden::read_stop_signal_from(&self.repo_dir).or_else(|| {
@@ -637,7 +637,11 @@ impl DaemonRunMonitor {
         {
             crate::commands::elden::clear_signals_from(&self.repo_dir);
             if self.pending_kill.is_none() {
-                let pane = spawn::capture_pane(&self.tmux_session).unwrap_or_default();
+                // INV-19: Hoist blocking tmux capture_pane off tokio reactor
+                let session_clone = self.tmux_session.clone();
+                let pane = tokio::task::spawn_blocking(move || {
+                    spawn::capture_pane(&session_clone).unwrap_or_default()
+                }).await.unwrap_or_default();
                 let class = ErrorClass::from_pane_output(&pane, false).unwrap_or(ErrorClass::Crash);
 
                 let summary = signal.get("error").and_then(|v| v.as_str())
@@ -1060,15 +1064,12 @@ impl DaemonRunMonitor {
             let warmup = self.watchdog.loop_state_warmup_secs;
             let screen_idle = self.last_activity.elapsed().as_secs();
 
-            // Re-read the loop state to distinguish Inactive (stale file from
-            // a prior run) vs Missing (never written). The outer match above
-            // consumed `current_opt` into `None`, but we need the categorical
-            // status to apply the 2× hard limit only to the Inactive case.
-            let loop_state_read = read_arc_loop_state(&self.repo_dir);
-            let stale_file_present = matches!(
-                loop_state_read,
-                crate::monitor::loop_state::LoopStateRead::Inactive,
-            );
+            // EMB-001 FIX: Derive stale status from the initial read at line 1021
+            // instead of re-reading. When current_opt is None (we're in this
+            // branch) and file_on_disk is true, the state is Inactive (stale
+            // file from a prior run). This eliminates one blocking fs read
+            // per warmup tick.
+            let stale_file_present = file_on_disk;
 
             // Path B (stale hard-limit — foreground parity with
             // monitor.rs:884-910): stale file (active=false from a previous
@@ -1175,7 +1176,8 @@ impl DaemonRunMonitor {
 // ──────────────────────────────────────────────────────────────────────
 
 impl DaemonRunMonitor {
-    fn scan_artifacts(&mut self) {
+    // INV-19: scan_artifact_dir is a blocking directory walker — hoist off reactor.
+    async fn scan_artifacts(&mut self) {
         let interval_secs = self.watchdog.artifact_scan_interval_secs;
         if self.last_artifact_scan.elapsed().as_secs() < interval_secs {
             return;
@@ -1186,7 +1188,11 @@ impl DaemonRunMonitor {
             Some(d) => d.to_path_buf(),
             None => return,
         };
-        if let Some(snapshot) = scan_artifact_dir(&scan_dir) {
+        let snapshot = tokio::task::spawn_blocking(move || scan_artifact_dir(&scan_dir))
+            .await
+            .ok()
+            .flatten();
+        if let Some(snapshot) = snapshot {
             let changed = match self.last_artifact_snapshot {
                 None => true,
                 Some(ref prev) => prev != &snapshot,
