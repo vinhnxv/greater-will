@@ -888,27 +888,59 @@ impl RunRegistry {
     /// Clear queued runs. If `repo_filter` is `Some`, only clear runs for
     /// that repo directory; otherwise clear all queues. Returns the count
     /// of removed entries.
+    ///
+    /// FLAW-003: For each cleared entry, the corresponding `RunEntry` is
+    /// transitioned to `Stopped` so `meta.json` and the in-memory registry
+    /// stay in sync with `pending_queues`. Without this, reloading from disk
+    /// after restart would resurrect the Queued entries as ghosts.
     pub fn clear_queue(&mut self, repo_filter: Option<&Path>) -> usize {
-        let mut removed = 0usize;
+        // Collect removed run_ids first, then transition each RunEntry to
+        // Stopped. Drained in two passes because `update_status` takes
+        // `&mut self` and we cannot iterate pending_queues mutably at the
+        // same time.
+        let mut removed_ids: Vec<String> = Vec::new();
 
         match repo_filter {
             Some(filter) => {
                 let canonical = filter.canonicalize().unwrap_or_else(|_| filter.to_path_buf());
                 for queue in self.pending_queues.values_mut() {
-                    let before = queue.len();
-                    queue.retain(|p| p.repo_dir != canonical && p.repo_dir != filter);
-                    removed += before - queue.len();
+                    let mut i = 0;
+                    while i < queue.len() {
+                        let p = &queue[i];
+                        if p.repo_dir == canonical || p.repo_dir == filter {
+                            let pending = queue.remove(i).expect("index verified");
+                            removed_ids.push(pending.run_id);
+                        } else {
+                            i += 1;
+                        }
+                    }
                 }
             }
             None => {
                 for queue in self.pending_queues.values_mut() {
-                    removed += queue.len();
-                    queue.clear();
+                    while let Some(p) = queue.pop_front() {
+                        removed_ids.push(p.run_id);
+                    }
                 }
             }
         }
 
-        removed
+        for run_id in &removed_ids {
+            if let Err(e) = self.update_status(
+                run_id,
+                RunStatus::Stopped,
+                None,
+                Some("cleared by user".into()),
+            ) {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "failed to update RunEntry to Stopped during clear_queue",
+                );
+            }
+        }
+
+        removed_ids.len()
     }
 
     /// Find a pending run by ID prefix across all queues.

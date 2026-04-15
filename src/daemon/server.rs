@@ -918,6 +918,22 @@ async fn dispatch_request(
             match reg.find_pending_by_prefix(&run_id) {
                 Some((full_id, _repo_hash)) => {
                     reg.remove_pending(&full_id);
+                    // FLAW-001: mirror dequeue_run — without this, the RunEntry
+                    // created by enqueue_run lingers with status=Queued in
+                    // self.runs (and meta.json on disk) and is reloaded as a
+                    // ghost entry on daemon restart. See registry.rs:dequeue_run.
+                    if let Err(e) = reg.update_status(
+                        &full_id,
+                        RunStatus::Stopped,
+                        None,
+                        Some("removed from queue by user".into()),
+                    ) {
+                        tracing::warn!(
+                            run_id = %full_id,
+                            error = %e,
+                            "failed to update RunEntry to Stopped after RemoveQueued",
+                        );
+                    }
                     if let Err(e) = reg.save_queue() {
                         tracing::warn!(error = %e, "failed to persist queue after remove");
                     }
