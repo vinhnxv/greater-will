@@ -1358,6 +1358,28 @@ async fn spawn_recovery_with_command(
 
     match spawn::spawn_claude_session(&spawn_config) {
         Ok(pid) => {
+            // FLAW-005: Wait for Claude TUI to finish initializing before sending
+            // the resume command — without this, send_keys arrives before stdin
+            // is ready and the command is silently dropped, leaving the session
+            // alive but never resuming. Matches executor::spawn_after_register.
+            append_event(
+                run_id,
+                "recovery_wait_init",
+                &format!("pid={} — waiting {}s for Claude TUI", pid, crate::daemon::executor::SPAWN_INIT_WAIT_SECS),
+            );
+            tokio::time::sleep(Duration::from_secs(crate::daemon::executor::SPAWN_INIT_WAIT_SECS)).await;
+
+            // FLAW-009: `spawn_claude_session` returned the tmux pane (shell)
+            // pid; resolve the real Claude process pid now that the TUI is up.
+            let session_for_pid = tmux_session.clone();
+            let real_pid = tokio::task::spawn_blocking(move || spawn::get_claude_pid(&session_for_pid))
+                .await
+                .ok()
+                .flatten();
+            if real_pid.is_none() {
+                warn!(run_id = %run_id, shell_pid = pid, "could not resolve Claude PID after TUI init — keeping shell pid");
+            }
+
             if let Err(e) = spawn::send_keys_with_workaround(&tmux_session, cmd) {
                 warn!(error = %e, "failed to send resume command");
                 let mut reg = registry.lock().await;
@@ -1372,7 +1394,7 @@ async fn spawn_recovery_with_command(
                 entry.tmux_session = Some(tmux_session.clone());
                 entry.current_phase = Some("resuming".to_string());
                 entry.crash_restarts = entry.crash_restarts.saturating_add(1);
-                entry.claude_pid = Some(pid);
+                entry.claude_pid = Some(real_pid.unwrap_or(pid));
                 entry.last_recovery_at = Some(chrono::Utc::now());
             }
             if let Err(e) = reg.update_status(run_id, RunStatus::Running, Some("resuming".to_string()), None) {
