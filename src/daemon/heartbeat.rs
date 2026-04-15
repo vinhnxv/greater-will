@@ -1025,29 +1025,15 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
+            // Attempt counter used only for per-class backoff curve
+            // (e.g. ApiOverload exponential 15→30→60→120 min). The
+            // retry ceiling itself is owned by CrashLoopDetector
+            // above — per-phase budget resets on phase advance, and
+            // global ceilings (window + total_restarts) still apply.
             let crash_count = {
                 let reg = registry.lock().await;
                 reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
             };
-            if crash_count >= error_class.max_retries() {
-                let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!(
-                        "Max retries ({}) for {:?}: {}",
-                        error_class.max_retries(), error_class, reason
-                    )),
-                ) {
-                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
-                }
-                drop(reg);
-                append_event(run_id, "max_retries", &format!("{:?}: {}", error_class, reason));
-                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
-                return;
-            }
 
             // Per-error-class exponential backoff (P1: cancellation-aware)
             let backoff = error_class.backoff_for_attempt(crash_count);
@@ -1073,8 +1059,9 @@ async fn handle_monitor_outcome(
             // implicit ErrorClass for per-class retry/backoff policy (GAP 1, 5).
             //
             // Note: Foreground treats Timeout as terminal (no retry).
-            // Daemon retries because headless runs benefit from automatic recovery.
-            // Per-class max_retries (3) still limits total attempts.
+            // Daemon retries because headless runs benefit from automatic
+            // recovery. CrashLoopDetector enforces phase-aware ceilings
+            // (per-phase budget + global window + total_restarts cap).
             let (implicit_class, outcome_kind, reason) = match outcome {
                 DaemonRunOutcome::Crashed { reason } => (ErrorClass::Crash, "crashed", reason),
                 DaemonRunOutcome::Stuck { reason } => (ErrorClass::Stuck, "stuck", reason),
@@ -1139,29 +1126,15 @@ async fn handle_monitor_outcome(
                 warn!(error = %e, "Failed to persist crash history");
             }
 
-            // GAP 1: Per-error-class retry limit (parity with foreground orchestrator)
+            // Attempt counter used only for per-class backoff curve
+            // (e.g. ApiOverload exponential 15→30→60→120 min). The
+            // retry ceiling itself is owned by CrashLoopDetector
+            // above — per-phase budget resets on phase advance, and
+            // global ceilings (window + total_restarts) still apply.
             let crash_count = {
                 let reg = registry.lock().await;
                 reg.get(run_id).map(|e| e.crash_restarts).unwrap_or(0)
             };
-            if crash_count >= implicit_class.max_retries() {
-                let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
-                    run_id,
-                    RunStatus::Failed,
-                    None,
-                    Some(format!(
-                        "Max retries ({}) for {:?}: {}",
-                        implicit_class.max_retries(), implicit_class, reason
-                    )),
-                ) {
-                    tracing::error!(run_id = %run_id, error = %e, "update_status failed: marking failed after max retries");
-                }
-                drop(reg);
-                append_event(run_id, "max_retries", &format!("{:?}: {}", implicit_class, reason));
-                drain_if_available(Arc::clone(&registry), &repo_dir, true).await;
-                return;
-            }
 
             // GAP 5: Per-class backoff instead of flat cooldown (parity with foreground)
             let backoff = implicit_class.backoff_for_attempt(crash_count);
