@@ -483,6 +483,25 @@ async fn dispatch_request(
                     };
                 }
             };
+            // SEC-004: validate config_dir on SubmitRun (parity with AddSchedule
+            // at server.rs:772). Without this, a client-supplied config_dir
+            // containing `..` components or non-existent paths reaches
+            // session::spawn::start_claude and is shell-interpolated into the
+            // tmux command line — shell_escape is the only defense, which is
+            // insufficient for path-traversal-style abuse.
+            let canonical_config = match config_dir
+                .as_ref()
+                .map(|p| validate_config_dir(p))
+                .transpose()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("invalid config_dir: {e}"),
+                    };
+                }
+            };
 
             // Check if repo already has an active run OR global capacity is
             // exhausted — enqueue if so (A6: max_concurrent_runs enforcement).
@@ -498,7 +517,7 @@ async fn dispatch_request(
                         plan_path: canonical_plan.clone(),
                         repo_dir: canonical_repo.clone(),
                         session_name: session_name.clone(),
-                        config_dir: config_dir.clone(),
+                        config_dir: canonical_config.clone(),
                         verbose,
                         queued_at: chrono::Utc::now(),
                     };
@@ -528,7 +547,7 @@ async fn dispatch_request(
                 &canonical_plan,
                 &canonical_repo,
                 session_name,
-                config_dir,
+                canonical_config,
                 verbose,
             )
             .await
