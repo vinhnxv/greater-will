@@ -697,19 +697,33 @@ async fn dispatch_request(
                 "detached by user — tmux session '{}' kept alive (gw no longer tracking)",
                 tmux.as_deref().unwrap_or("unknown"),
             ));
-            {
+            // PERF-002: stage under the lock, release, then fsync (INV-19).
+            // Holding the registry mutex across `flush_status` would serialise
+            // concurrent IPC for the full 1–20 ms fsync duration.
+            let staged = {
                 let mut reg = registry.lock().await;
-                if let Err(e) = reg.update_status(
+                reg.stage_status_locked(
                     &actual_id,
                     RunStatus::Stopped,
                     Some("detached".to_string()),
                     Some("detached by user — tmux session kept alive".to_string()),
-                ) {
+                )
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            };
+            let staged = match staged {
+                Ok(s) => s,
+                Err(e) => {
                     return Response::Error {
                         code: ErrorCode::InternalError,
                         message: e.to_string(),
                     };
                 }
+            };
+            if let Err(e) = RunRegistry::flush_status(&staged) {
+                return Response::Error {
+                    code: ErrorCode::InternalError,
+                    message: e.to_string(),
+                };
             }
 
             tracing::info!(

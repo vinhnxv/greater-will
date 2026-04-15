@@ -448,39 +448,58 @@ impl HeartbeatMonitor {
         };
 
         if let Some(phase_name) = phase {
-            let mut registry = self.registry.lock().await;
-            let phase_changed = if let Some(entry) = registry.get_mut(run_id) {
-                if entry.current_phase.as_deref() != Some(&phase_name) {
-                    debug!(run_id = %run_id, phase = %phase_name, "phase updated");
-                    entry.current_phase = Some(phase_name.clone());
-                    true
+            // PERF-002 / FLAW-004: stage under the lock, release, then fsync
+            // (INV-19). Holding the mutex across the 1–20ms flush serialised
+            // all concurrent IPC (SubmitRun, ListRuns, StopRun) per heartbeat
+            // tick — for N running sessions the tick blocked IPC for
+            // N × fsync_time on phase transitions.
+            let staged = {
+                let mut registry = self.registry.lock().await;
+                let phase_changed = if let Some(entry) = registry.get_mut(run_id) {
+                    if entry.current_phase.as_deref() != Some(&phase_name) {
+                        debug!(run_id = %run_id, phase = %phase_name, "phase updated");
+                        entry.current_phase = Some(phase_name.clone());
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
 
-            // Only persist and log when the phase actually changed
-            if phase_changed {
-                if let Err(e) = registry.update_status(
-                    run_id,
-                    RunStatus::Running,
-                    Some(phase_name.clone()),
-                    None,
-                ) {
-                    debug!(run_id = %run_id, error = %e, "failed to persist phase update");
+                if phase_changed {
+                    Some(
+                        registry
+                            .stage_status_locked(
+                                run_id,
+                                RunStatus::Running,
+                                Some(phase_name.clone()),
+                                None,
+                            )
+                            .map_err(|e| color_eyre::eyre::eyre!("{e}")),
+                    )
+                } else {
+                    None
                 }
+            }; // registry mutex released here
 
-                drop(registry);
+            if let Some(stage_res) = staged {
+                match stage_res {
+                    Ok(s) => {
+                        if let Err(e) = RunRegistry::flush_status(&s) {
+                            debug!(run_id = %run_id, error = %e, "failed to persist phase update");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(run_id = %run_id, error = %e, "failed to stage phase update");
+                    }
+                }
                 // Only emit phase_change from here when the phase came from
                 // pane heuristics. Checkpoint-sourced phases already emitted
                 // the enriched phase_change event inside read_phase_via_loop_state.
                 if !from_checkpoint {
                     append_event(run_id, "phase_change", &phase_name);
                 }
-            } else {
-                drop(registry);
             }
         }
 

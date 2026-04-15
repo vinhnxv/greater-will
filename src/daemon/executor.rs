@@ -346,18 +346,23 @@ async fn spawn_after_register(
     }
 
     // ── Update registry ─────────────────────────────────────────────
-    {
+    // PERF-002: stage under the lock, release, then fsync (INV-19). Holding
+    // the registry mutex across the flush would block all concurrent IPC
+    // (ListRuns, StopRun, other SubmitRuns) for 1–20 ms on every spawn.
+    let staged = {
         let mut reg = registry.lock().await;
         if let Some(entry) = reg.get_mut(&run_id) {
             entry.tmux_session = Some(tmux_session.clone());
         }
-        reg.update_status(
+        reg.stage_status_locked(
             &run_id,
             RunStatus::Running,
             Some("starting".to_string()),
             None,
-        )?;
-    }
+        )
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?
+    }; // mutex released before fsync
+    RunRegistry::flush_status(&staged)?;
 
     info!(
         run_id = %run_id,
