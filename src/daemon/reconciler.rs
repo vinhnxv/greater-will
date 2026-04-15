@@ -490,17 +490,25 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
         return Some(run_id.to_string());
     }
 
-    // Try to load from disk. Two failure modes are distinguished:
+    // Try to load from disk. Two failure modes are treated the same way —
+    // `None` so the caller kills the tmux session:
     //
     //   1. meta.json does not exist at all → truly orphaned tmux session
-    //      with no recoverable metadata. Return None so the caller kills it.
+    //      with no recoverable metadata.
     //
     //   2. meta.json exists but is not valid JSON → most likely a torn write
-    //      from disk-full or a crash mid-write. A running Claude session is
-    //      almost certainly still alive in the tmux session — killing it to
-    //      "clean up" would destroy live work. Return Some(run_id) so the
-    //      caller preserves the session (untracked, but alive). A future
-    //      reconcile pass can re-try adoption if meta.json is repaired.
+    //      from disk-full or a crash mid-write.
+    //
+    // FLAW-006: the previous implementation returned `Some(run_id)` on a
+    // parse error on the theory that a live Claude session should be
+    // preserved rather than killed. But the function also short-circuits
+    // BEFORE `registry.adopt(entry)`, so no entry ever enters the registry
+    // and no monitor is spawned. The caller treats `Some` as a successful
+    // adoption (`report.adopted += 1`) and moves on, leaving the tmux
+    // session running with no outcome tracking — it runs to completion and
+    // its result is silently lost. Returning `None` is strictly better:
+    // the caller kills the session, yielding a clean observable failure
+    // instead of a zombie running in the background.
     let meta_path = gw_home().join("runs").join(run_id).join("meta.json");
     let content = match std::fs::read_to_string(&meta_path) {
         Ok(c) => c,
@@ -519,9 +527,9 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
             warn!(
                 run_id = %run_id,
                 error = %e,
-                "meta.json corrupt — preserving live tmux session, skipping adopt"
+                "meta.json corrupt — declining adoption, caller will kill tmux session"
             );
-            return Some(run_id.to_string());
+            return None;
         }
     };
 
