@@ -138,8 +138,15 @@ pub(crate) async fn drain_if_available(
     // pattern uses `*_without_snapshot` helpers + a single trailing
     // `stage_queue_locked` so the queue.json fsync runs once outside the
     // lock, regardless of how many mutations the caller composed.
+    //
+    // The `registry_lock_held` debug event scopes the in-mutex window
+    // for the PERF-003 benchmark methodology (see `plans/benchmark.md`).
+    // Timed post-acquisition; explicit `Instant` is used because the
+    // tracing span guard is `!Send` and would forbid awaiting on
+    // `registry.lock()` while in scope.
     let (staged_batch, next, queue_snap) = {
         let mut reg = registry.lock().await;
+        let lock_held_start = std::time::Instant::now();
         let staged_batch = if failed {
             reg.record_queue_failure_without_snapshot(repo_dir)
         } else {
@@ -153,6 +160,11 @@ pub(crate) async fn drain_if_available(
             .or_else(|| reg.drain_any_ready_without_snapshot());
         // One snapshot, captured after every mutation has landed in memory.
         let queue_snap = reg.stage_queue_locked();
+        tracing::debug!(
+            site = "drain_if_available",
+            elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+            "registry_lock_held"
+        );
         (staged_batch, next, queue_snap)
     }; // `reg` dropped — mutex released before fsync loop below
 
@@ -198,6 +210,7 @@ pub(crate) async fn drain_if_available(
                     // release.
                     let (failed_staged, staged_batch, next, queue_snap) = {
                         let mut reg = registry.lock().await;
+                        let lock_held_start = std::time::Instant::now();
                         let failed_staged = reg
                             .stage_status_locked(
                                 &pending_run_id,
@@ -209,6 +222,11 @@ pub(crate) async fn drain_if_available(
                         let staged_batch = reg.record_queue_failure_without_snapshot(&repo_dir);
                         let next = reg.drain_next_without_snapshot(&repo_dir);
                         let queue_snap = reg.stage_queue_locked();
+                        tracing::debug!(
+                            site = "drain_if_available_retry",
+                            elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                            "registry_lock_held"
+                        );
                         (failed_staged, staged_batch, next, queue_snap)
                     }; // `reg` dropped — mutex released before fsyncs
 

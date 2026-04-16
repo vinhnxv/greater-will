@@ -509,11 +509,23 @@ async fn dispatch_request(
             // PERF-003: stage the enqueue inside the lock, drop the guard,
             // then fsync `queue.json` outside so concurrent IPC is not
             // serialised behind the 1–20 ms write.
+            //
+            // The `registry_lock_held` debug event isolates the in-mutex
+            // scope so the burst-enqueue benchmark in `plans/benchmark.md`
+            // can measure mutex-hold duration p99 directly from the
+            // structured log (see PERF-003 plan § T7). Timed post-
+            // acquisition so the value reflects held time only — wait
+            // time is excluded.
+            //
+            // We do not use `tracing::debug_span!(…).entered()` here: the
+            // `Entered` guard is `!Send` and would forbid awaiting on
+            // `registry.lock()` while in scope.
             let enqueue_outcome = {
                 let mut reg = registry.lock().await;
+                let lock_held_start = std::time::Instant::now();
                 let at_capacity = max_concurrent_runs > 0
                     && reg.count_running() >= max_concurrent_runs;
-                if reg.has_repo_lock(&canonical_repo) || at_capacity {
+                let result = if reg.has_repo_lock(&canonical_repo) || at_capacity {
                     let run_id = crate::daemon::registry::RunRegistry::generate_id();
                     let pending = crate::daemon::registry::PendingRun {
                         run_id: run_id.clone(),
@@ -527,7 +539,13 @@ async fn dispatch_request(
                     Some((run_id, reg.enqueue_run_staged(pending)))
                 } else {
                     None
-                }
+                };
+                tracing::debug!(
+                    site = "SubmitRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             }; // registry mutex released
 
             if let Some((run_id, staged_result)) = enqueue_outcome {

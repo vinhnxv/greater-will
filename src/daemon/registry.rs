@@ -60,6 +60,10 @@ pub struct QueueSnapshotWire {
 /// Runtime queue snapshot — wraps [`QueueSnapshotWire`] with a per-staging
 /// epoch and a must-flush invariant.
 ///
+/// The `queue.json` half of the INV-19 stage/flush split. See
+/// [`StagedStatus`] for the `meta.json` half; both are audited together
+/// via `rg 'stage_.*_locked' src/daemon/registry.rs`.
+///
 /// Construct via [`RunRegistry::stage_queue_locked`] (under the registry
 /// mutex) and flush via [`RunRegistry::flush_queue`] (after releasing the
 /// mutex). This mirrors the INV-19 pattern used by `stage_status_locked` /
@@ -258,6 +262,10 @@ pub enum UpdateStatusError {
 }
 
 /// Staged status change — result of in-memory mutation, ready for flush.
+///
+/// The `meta.json` half of the INV-19 stage/flush split. See
+/// [`QueueSnapshot`] for the `queue.json` half (PERF-003); both are
+/// audited together via `rg 'stage_.*_locked' src/daemon/registry.rs`.
 #[derive(Debug, Clone)]
 pub struct StagedStatus {
     pub entry: RunEntry,
