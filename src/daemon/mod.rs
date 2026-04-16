@@ -341,6 +341,13 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     // Lock ordering: registry → network_state → monitors.
     let network_state = Arc::new(RwLock::new(NetworkState::default()));
 
+    // 7b-pre. Initialize the drain handle registry BEFORE starting the
+    // heartbeat monitor or server — both can trigger drain_if_available,
+    // which pushes task handles into this registry.  The Arc is retained
+    // here for the shutdown path (BACK-001: tracked drain tasks are awaited
+    // before save_queue so in-flight queue mutations are durable).
+    let drain_join_set = executor::init_drain_join_set();
+
     // 7b. Start heartbeat monitor (captures pane logs, tracks phases, spawns per-run monitors)
     let heartbeat = HeartbeatMonitor::new(
         Arc::clone(&registry),
@@ -446,6 +453,49 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     info!("daemon shutting down — draining running sessions");
     let drained = drain::drain_running_sessions(Arc::clone(&registry)).await;
     info!(drained = drained, "drain complete");
+
+    // BACK-001: await all in-flight drain tasks before flushing queue state.
+    // Without this, a drain task whose queue snapshot has a NEWER epoch than
+    // the shutdown snapshot can clobber the clean shutdown state on disk.
+    //
+    // Pattern: drain Vec<JoinHandle> under a brief lock, then await each
+    // handle OUTSIDE the lock.  This prevents a deadlock where a completing
+    // task tries to push a retry handle into the Vec while the shutdown loop
+    // holds the Mutex awaiting a prior handle.
+    //
+    // Bounded to 30s total — warn and continue if tasks don't finish.
+    {
+        let shutdown_start = tokio::time::Instant::now();
+        let timeout_dur = std::time::Duration::from_secs(30);
+        loop {
+            // Drain current handles under a brief lock.
+            let handles: Vec<_> = drain_join_set.lock().await.drain(..).collect();
+            if handles.is_empty() {
+                info!("all drain tasks completed before shutdown flush");
+                break;
+            }
+            // Await each handle outside the lock so new tasks can be added.
+            for handle in handles {
+                let remaining = timeout_dur.saturating_sub(shutdown_start.elapsed());
+                if remaining.is_zero() {
+                    warn!("drain tasks did not finish within 30s shutdown window — proceeding with queue flush");
+                    break;
+                }
+                match tokio::time::timeout(remaining, handle).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(error = %e, "drain task panicked during shutdown"),
+                    Err(_) => {
+                        warn!("drain task timed out during shutdown");
+                        break;
+                    }
+                }
+            }
+            if shutdown_start.elapsed() >= timeout_dur {
+                warn!("drain tasks did not finish within 30s shutdown window — proceeding with queue flush");
+                break;
+            }
+        }
+    }
 
     // A5: Flush queue state to disk before shutdown so queued runs persist.
     {

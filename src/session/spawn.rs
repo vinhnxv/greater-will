@@ -157,12 +157,31 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
         "Spawning Claude Code session"
     );
 
-    // Check if session already exists
-    if has_session(&config.session_id) {
-        return Err(eyre!(
-            "Session '{}' already exists",
-            config.session_id
-        ));
+    // Check if session already exists. Use `probe_session` rather than
+    // `has_session` so a transient tmux Unreachable does not silently
+    // fall through to `new-session` (which then fails with a confusing
+    // "duplicate session name" error when tmux recovers). Recovery
+    // paths call this function immediately after a crash, which is
+    // exactly when tmux may still be recovering — so the distinction
+    // matters.
+    match probe_session(&config.session_id) {
+        SessionProbe::Present => {
+            return Err(eyre!(
+                "Session '{}' already exists",
+                config.session_id
+            ));
+        }
+        SessionProbe::Unreachable(reason) => {
+            return Err(eyre!(
+                "Cannot verify session '{}' state — tmux unreachable: {}. \
+                 Refusing to spawn to avoid duplicate-session race.",
+                config.session_id,
+                reason
+            ));
+        }
+        SessionProbe::Absent => {
+            // Safe to create
+        }
     }
 
     // Create tmux session
@@ -187,18 +206,50 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
     Ok(pid)
 }
 
-/// Check if a tmux session exists.
+/// Three-state probe result that distinguishes *why* a session isn't
+/// `Present`.
 ///
-/// Retries up to 3 times with a short delay to avoid false negatives
-/// when the tmux server is temporarily busy (e.g., during agent team spawning).
-/// A single transient failure must never trigger destructive recovery.
-pub fn has_session(session_id: &str) -> bool {
+/// The legacy `has_session` boolean conflated "tmux says the session does
+/// not exist" (Absent) with "tmux itself did not answer" (Unreachable).
+/// Crash detection paths need the distinction: a hung tmux server is NOT
+/// proof that the Claude Code session crashed. Non-crash callers can
+/// keep using the `has_session` wrapper below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionProbe {
+    /// `tmux has-session -t <id>` exited 0 on at least one attempt.
+    Present,
+    /// `tmux has-session` ran and exited non-zero — the session truly
+    /// does not exist.
+    Absent,
+    /// `tmux` could not be reached: every retry either failed to spawn
+    /// or exceeded `CMD_TIMEOUT` without ever producing an exit code.
+    /// Typically means the tmux server is hung, not that the session
+    /// died. Carries the last captured error for forensics.
+    Unreachable(String),
+}
+
+/// Probe a tmux session and report its state.
+///
+/// Retries up to 3 times with a short delay to smooth over transient
+/// tmux-server busyness (agent team spawning can briefly block). A
+/// single transient failure must never drive destructive recovery.
+///
+/// Semantics:
+///
+/// * Any attempt that exits 0 → [`SessionProbe::Present`].
+/// * At least one attempt exited non-zero (definitive "not found") and
+///   none exited 0 → [`SessionProbe::Absent`].
+/// * No attempt ever produced an exit code (all timed out or failed to
+///   spawn) → [`SessionProbe::Unreachable`].
+pub fn probe_session(session_id: &str) -> SessionProbe {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: Duration = Duration::from_millis(500);
     const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
+    let mut saw_definitive_absent = false;
+    let mut last_error: Option<String> = None;
+
     for attempt in 0..MAX_ATTEMPTS {
-        // Use timeout-protected spawn to avoid hanging on unresponsive tmux server
         let result = Command::new("tmux")
             .args(["has-session", "-t", session_id])
             .stdout(std::process::Stdio::null())
@@ -208,34 +259,62 @@ pub fn has_session(session_id: &str) -> bool {
         match result {
             Ok(mut child) => {
                 match child.try_wait() {
-                    // Already exited
                     Ok(Some(status)) => {
-                        if status.success() { return true; }
+                        if status.success() {
+                            return SessionProbe::Present;
+                        }
+                        // Non-zero exit = tmux definitively says "session
+                        // not found". Keep iterating in case a later
+                        // attempt sees a just-created session, but
+                        // remember that we got a real answer.
+                        saw_definitive_absent = true;
                     }
-                    // Still running — wait with timeout
                     Ok(None) => {
                         let start = std::time::Instant::now();
+                        let mut got_exit = false;
                         loop {
                             if start.elapsed() >= CMD_TIMEOUT {
-                                // Timeout — kill and treat as failure
                                 let _ = child.kill();
                                 let _ = child.wait();
+                                last_error = Some(format!(
+                                    "tmux has-session timed out after {}s (attempt {}/{})",
+                                    CMD_TIMEOUT.as_secs(),
+                                    attempt + 1,
+                                    MAX_ATTEMPTS
+                                ));
                                 break;
                             }
                             match child.try_wait() {
                                 Ok(Some(status)) => {
-                                    if status.success() { return true; }
+                                    got_exit = true;
+                                    if status.success() {
+                                        return SessionProbe::Present;
+                                    }
+                                    saw_definitive_absent = true;
                                     break;
                                 }
                                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                                Err(_) => break,
+                                Err(e) => {
+                                    last_error = Some(format!(
+                                        "tmux has-session wait error: {}",
+                                        e
+                                    ));
+                                    break;
+                                }
                             }
                         }
+                        // If we never got an exit code this iteration,
+                        // fall through to the retry delay below.
+                        let _ = got_exit;
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        last_error = Some(format!("tmux has-session wait error: {}", e));
+                    }
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                last_error = Some(format!("tmux has-session spawn error: {}", e));
+            }
         }
 
         if attempt < MAX_ATTEMPTS - 1 {
@@ -243,7 +322,24 @@ pub fn has_session(session_id: &str) -> bool {
         }
     }
 
-    false
+    if saw_definitive_absent {
+        SessionProbe::Absent
+    } else {
+        SessionProbe::Unreachable(
+            last_error.unwrap_or_else(|| "tmux unreachable for all attempts".to_string()),
+        )
+    }
+}
+
+/// Check if a tmux session exists.
+///
+/// Thin wrapper over [`probe_session`] that keeps the legacy boolean
+/// behavior: both `Absent` and `Unreachable` map to `false`. Only use
+/// this in non-crash-detection paths (pre-flight checks, cleanup). In
+/// crash-detection paths, call [`probe_session`] directly so a hung
+/// tmux server cannot false-positive as a crash.
+pub fn has_session(session_id: &str) -> bool {
+    matches!(probe_session(session_id), SessionProbe::Present)
 }
 
 /// Create a new detached tmux session.
@@ -726,5 +822,20 @@ mod tests {
     fn test_has_session_nonexistent() {
         // This session should not exist
         assert!(!has_session("gw-nonexistent-test-session-xyz-999"));
+    }
+
+    #[test]
+    fn test_probe_session_reports_absent_for_nonexistent() {
+        // A session that does not exist must yield `Absent` (not
+        // `Unreachable`). Crash detection depends on this distinction —
+        // an `Absent` result drives the vanish path, while `Unreachable`
+        // would skip the tick and defer escalation.
+        match probe_session("gw-nonexistent-test-session-xyz-999") {
+            SessionProbe::Absent => {}
+            other => panic!(
+                "expected SessionProbe::Absent for a nonexistent session, got {:?}",
+                other
+            ),
+        }
     }
 }

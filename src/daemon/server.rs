@@ -505,12 +505,27 @@ async fn dispatch_request(
 
             // Check if repo already has an active run OR global capacity is
             // exhausted — enqueue if so (A6: max_concurrent_runs enforcement).
-            {
+            //
+            // PERF-003: stage the enqueue inside the lock, drop the guard,
+            // then fsync `queue.json` outside so concurrent IPC is not
+            // serialised behind the 1–20 ms write.
+            //
+            // The `registry_lock_held` debug event isolates the in-mutex
+            // scope so the burst-enqueue benchmark in `plans/benchmark.md`
+            // can measure mutex-hold duration p99 directly from the
+            // structured log (see PERF-003 plan § T7). Timed post-
+            // acquisition so the value reflects held time only — wait
+            // time is excluded.
+            //
+            // We do not use `tracing::debug_span!(…).entered()` here: the
+            // `Entered` guard is `!Send` and would forbid awaiting on
+            // `registry.lock()` while in scope.
+            let enqueue_outcome = {
                 let mut reg = registry.lock().await;
+                let lock_held_start = std::time::Instant::now();
                 let at_capacity = max_concurrent_runs > 0
                     && reg.count_running() >= max_concurrent_runs;
-                if reg.has_repo_lock(&canonical_repo) || at_capacity {
-                    // Repo is busy — enqueue for later
+                let result = if reg.has_repo_lock(&canonical_repo) || at_capacity {
                     let run_id = crate::daemon::registry::RunRegistry::generate_id();
                     let pending = crate::daemon::registry::PendingRun {
                         run_id: run_id.clone(),
@@ -521,27 +536,49 @@ async fn dispatch_request(
                         verbose,
                         queued_at: chrono::Utc::now(),
                     };
-                    match reg.enqueue_run(pending) {
-                        Ok(position) => {
-                            return Response::RunQueued { run_id, position };
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let code = if msg.contains("queue full") {
-                                ErrorCode::QueueFull
-                            } else if msg.contains("plan already") {
-                                // Covers "plan already queued" and
-                                // "plan already running" — both are
-                                // user-submit duplicates, not server faults.
-                                ErrorCode::InvalidRequest
-                            } else {
-                                ErrorCode::InternalError
-                            };
+                    Some((run_id, reg.enqueue_run_staged(pending)))
+                } else {
+                    None
+                };
+                tracing::debug!(
+                    site = "SubmitRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
+            }; // registry mutex released
+
+            if let Some((run_id, staged_result)) = enqueue_outcome {
+                match staged_result {
+                    Ok((position, entry, snap)) => {
+                        if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
+                            tracing::warn!(error = %e, "failed to persist queue after SubmitRun enqueue — run not durably persisted");
                             return Response::Error {
-                                code,
-                                message: e.to_string(),
+                                code: ErrorCode::InternalError,
+                                message: "queue flush failed; run not durably persisted".to_string(),
                             };
                         }
+                        if let Err(e) = crate::daemon::registry::RunRegistry::write_meta_staged(&entry) {
+                            tracing::warn!(run_id = %run_id, error = %e, "write_meta_staged failed after SubmitRun enqueue — meta.json may lag queue.json (recoverable)");
+                        }
+                        return Response::RunQueued { run_id, position };
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let code = if msg.contains("queue full") {
+                            ErrorCode::QueueFull
+                        } else if msg.contains("plan already") {
+                            // Covers "plan already queued" and
+                            // "plan already running" — both are
+                            // user-submit duplicates, not server faults.
+                            ErrorCode::InvalidRequest
+                        } else {
+                            ErrorCode::InternalError
+                        };
+                        return Response::Error {
+                            code,
+                            message: e.to_string(),
+                        };
                     }
                 }
             }
@@ -635,18 +672,40 @@ async fn dispatch_request(
                 }
             };
 
-            // Check if run is queued (no tmux session to kill)
-            {
+            // Check if run is queued (no tmux session to kill).
+            //
+            // PERF-003: stage the dequeue inside the lock and flush
+            // `queue.json` outside so the StopRun handler does not block
+            // concurrent IPC on the 1–20 ms fsync.
+            let dequeue_snap = {
                 let mut reg = registry.lock().await;
-                if let Some(entry) = reg.get(&actual_id) {
-                    if entry.status == RunStatus::Queued {
-                        reg.dequeue_run(&actual_id);
-                        drop(reg);
-                        return Response::Ok {
-                            message: format!("removed from queue: {actual_id}"),
-                        };
-                    }
+                let lock_held_start = std::time::Instant::now();
+                let is_queued = reg
+                    .get(&actual_id)
+                    .map(|entry| entry.status == RunStatus::Queued)
+                    .unwrap_or(false);
+                let result = if is_queued {
+                    reg.dequeue_run_staged(&actual_id).map(|(pending, staged_status, snap)| (pending, staged_status, snap))
+                } else {
+                    None
+                };
+                tracing::debug!(
+                    site = "StopRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
+            }; // registry mutex released
+            if let Some((_pending, staged_status, snap)) = dequeue_snap {
+                if let Err(e) = crate::daemon::registry::RunRegistry::flush_status(&staged_status) {
+                    tracing::warn!(run_id = %actual_id, error = %e, "flush_status failed after StopRun dequeue");
                 }
+                if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
+                    tracing::warn!(error = %e, "failed to persist queue after StopRun dequeue");
+                }
+                return Response::Ok {
+                    message: format!("removed from queue: {actual_id}"),
+                };
             }
 
             // SEC-002: Delegate to `executor::stop_run`, which sends /exit
@@ -706,13 +765,20 @@ async fn dispatch_request(
             // concurrent IPC for the full 1–20 ms fsync duration.
             let staged = {
                 let mut reg = registry.lock().await;
-                reg.stage_status_locked(
+                let lock_held_start = std::time::Instant::now();
+                let result = reg.stage_status_locked(
                     &actual_id,
                     RunStatus::Stopped,
                     Some("detached".to_string()),
                     Some("detached by user — tmux session kept alive".to_string()),
                 )
-                .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"));
+                tracing::debug!(
+                    site = "DetachRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             };
             let staged = match staged {
                 Ok(s) => s,
@@ -724,10 +790,7 @@ async fn dispatch_request(
                 }
             };
             if let Err(e) = RunRegistry::flush_status(&staged) {
-                return Response::Error {
-                    code: ErrorCode::InternalError,
-                    message: e.to_string(),
-                };
+                tracing::warn!(run_id = %actual_id, error = %e, "flush_status failed after DetachRun");
             }
 
             tracing::info!(
@@ -951,27 +1014,61 @@ async fn dispatch_request(
         }
 
         Request::RemoveQueued { run_id } => {
-            let mut reg = registry.lock().await;
-            match reg.find_pending_by_prefix(&run_id) {
-                Some((full_id, _repo_hash)) => {
-                    reg.remove_pending(&full_id);
-                    // FLAW-001: mirror dequeue_run — without this, the RunEntry
-                    // created by enqueue_run lingers with status=Queued in
-                    // self.runs (and meta.json on disk) and is reloaded as a
-                    // ghost entry on daemon restart. See registry.rs:dequeue_run.
-                    if let Err(e) = reg.update_status(
-                        &full_id,
-                        RunStatus::Stopped,
-                        None,
-                        Some("removed from queue by user".into()),
-                    ) {
-                        tracing::warn!(
-                            run_id = %full_id,
-                            error = %e,
-                            "failed to update RunEntry to Stopped after RemoveQueued",
-                        );
+            // PERF-003: stage the removal + Stopped transition inside the
+            // lock, drop the guard, then flush both `meta.json` and
+            // `queue.json` outside so the handler does not serialise IPC
+            // behind two fsyncs.
+            let staged = {
+                let mut reg = registry.lock().await;
+                let lock_held_start = std::time::Instant::now();
+                let result = match reg.find_pending_by_prefix(&run_id) {
+                    Some((full_id, _repo_hash)) => {
+                        // FLAW-001: mirror dequeue_run — without the Stopped
+                        // transition, the RunEntry created by enqueue_run
+                        // lingers with status=Queued in self.runs (and
+                        // meta.json on disk) and is reloaded as a ghost
+                        // entry on daemon restart.
+                        let staged_status = match reg.stage_status_locked(
+                            &full_id,
+                            RunStatus::Stopped,
+                            None,
+                            Some("removed from queue by user".into()),
+                        ) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                tracing::warn!(
+                                    run_id = %full_id,
+                                    error = %e,
+                                    "stage_status_locked failed during RemoveQueued",
+                                );
+                                None
+                            }
+                        };
+                        let snap = reg.remove_pending_staged(&full_id);
+                        Some((full_id, staged_status, snap))
                     }
-                    if let Err(e) = reg.save_queue() {
+                    None => None,
+                };
+                tracing::debug!(
+                    site = "RemoveQueued",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
+            }; // registry mutex released
+
+            match staged {
+                Some((full_id, staged_status, snap)) => {
+                    if let Some(s) = staged_status {
+                        if let Err(e) = crate::daemon::registry::RunRegistry::flush_status(&s) {
+                            tracing::warn!(
+                                run_id = %full_id,
+                                error = %e,
+                                "flush_status failed after RemoveQueued",
+                            );
+                        }
+                    }
+                    if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
                         tracing::warn!(error = %e, "failed to persist queue after remove");
                     }
                     Response::Ok {
@@ -986,9 +1083,32 @@ async fn dispatch_request(
         }
 
         Request::ClearQueue { repo_dir } => {
-            let mut reg = registry.lock().await;
-            let count = reg.clear_queue(repo_dir.as_deref());
-            if let Err(e) = reg.save_queue() {
+            // PERF-003: stage all per-entry meta.json transitions plus the
+            // queue snapshot inside the lock; flush both outside so a clear
+            // of N entries serialises N+1 fsyncs after lock release rather
+            // than during.
+            let (count, staged_batch, snap) = {
+                let mut reg = registry.lock().await;
+                let lock_held_start = std::time::Instant::now();
+                let result = reg.clear_queue_staged(repo_dir.as_deref());
+                tracing::debug!(
+                    site = "ClearQueue",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
+            }; // registry mutex released
+
+            for staged in &staged_batch {
+                if let Err(e) = crate::daemon::registry::RunRegistry::flush_status(staged) {
+                    tracing::warn!(
+                        run_id = %staged.entry.run_id,
+                        error = %e,
+                        "flush_status failed during ClearQueue",
+                    );
+                }
+            }
+            if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
                 tracing::warn!(error = %e, "failed to persist queue after clear");
             }
             Response::Ok {

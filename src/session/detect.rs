@@ -296,26 +296,36 @@ pub fn save_crash_dump(session_id: &str, working_dir: &std::path::Path, reason: 
         }
     }
 
-    // Capture full scrollback
-    let scrollback = match capture_full_scrollback(session_id) {
-        Ok(content) => content,
+    // Capture full scrollback. If the tmux session is already gone (the
+    // common daemon vanish case) or the pane is unreadable, record that in
+    // the dump header instead of bailing — a metadata-only report is still
+    // strictly better than silently dropping the crash evidence.
+    let (scrollback, scrollback_note) = match capture_full_scrollback(session_id) {
+        Ok(content) if content.trim().is_empty() => (
+            String::new(),
+            Some("(scrollback empty — tmux pane produced no output)".to_string()),
+        ),
+        Ok(content) => (content, None),
         Err(e) => {
-            tracing::warn!(error = %e, session_id = %session_id, "Failed to capture scrollback for crash dump");
-            return None;
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "Failed to capture scrollback for crash dump — writing metadata-only report"
+            );
+            (
+                String::new(),
+                Some(format!("(scrollback unavailable: {})", e)),
+            )
         }
     };
-
-    if scrollback.trim().is_empty() {
-        tracing::debug!(session_id = %session_id, "Scrollback empty — skipping crash dump");
-        return None;
-    }
 
     // Build dump filename: <session_id>-<timestamp>.txt
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("{}-{}.txt", session_id, timestamp);
     let dump_path = dump_dir.join(&filename);
 
-    // Build dump content with metadata header
+    // Build dump content with metadata header. When scrollback is missing
+    // (session already vanished), the header IS the report.
     let header = format!(
         "=== GW CRASH DUMP ===\n\
          Session:   {}\n\
@@ -327,7 +337,10 @@ pub fn save_crash_dump(session_id: &str, working_dir: &std::path::Path, reason: 
         reason,
     );
 
-    let content = format!("{}{}", header, scrollback);
+    let content = match scrollback_note {
+        Some(note) => format!("{}{}\n", header, note),
+        None => format!("{}{}", header, scrollback),
+    };
 
     match std::fs::write(&dump_path, &content) {
         Ok(()) => {
@@ -594,11 +607,26 @@ mod tests {
     #[test]
     fn test_save_crash_dump_creates_file() {
         let dir = tempfile::tempdir().unwrap();
-        // save_crash_dump will fail to capture pane (no tmux session), returning None
+        // save_crash_dump now writes a metadata-only report even when the
+        // tmux session cannot be contacted — otherwise the daemon vanish
+        // path leaves no forensic trail. The returned path must exist
+        // and the file must contain the reason string.
         let result = save_crash_dump("gw-nonexistent-test", dir.path(), "test reason");
-        // Should return None gracefully (no tmux session to capture from)
-        assert!(result.is_none());
-        // But the crash-dumps dir should have been created
+        let dump_path = result.expect("metadata-only crash dump should be written");
+        assert!(dump_path.exists());
         assert!(dir.path().join(".gw").join("crash-dumps").exists());
+
+        let contents = std::fs::read_to_string(&dump_path).unwrap();
+        assert!(
+            contents.contains("test reason"),
+            "dump must include the crash reason; got: {}",
+            contents
+        );
+        assert!(
+            contents.contains("scrollback unavailable")
+                || contents.contains("scrollback empty"),
+            "dump must record why the scrollback was missing; got: {}",
+            contents
+        );
     }
 }
