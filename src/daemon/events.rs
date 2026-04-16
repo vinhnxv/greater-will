@@ -48,6 +48,16 @@ fn append_event_sync(run_id: &str, event: &str, message: &str) {
         return;
     }
 
+    // P2 fix: hold a per-run advisory flock for the write window so
+    // concurrent O_APPEND writes from multiple threads/processes (CLI
+    // foreground + daemon) cannot interleave beyond PIPE_BUF (4KB on
+    // Linux). The lock is released when `_lock` drops at function end.
+    // Best-effort: if the lock cannot be acquired (e.g. disk full, perms
+    // race), we still attempt the write to preserve the original
+    // contract that events are not silently dropped on lock-layer
+    // failures — only on the write itself.
+    let _lock = lock_events_file(&log_dir);
+
     let log_path = log_dir.join("events.jsonl");
     let timestamp = chrono::Utc::now().to_rfc3339();
     let line = serde_json::json!({
@@ -69,6 +79,41 @@ fn append_event_sync(run_id: &str, event: &str, message: &str) {
             debug!(error = %e, "failed to append event");
         }
     }
+}
+
+/// Open and exclusively flock the per-run `events.jsonl.lock` sidecar.
+///
+/// Returns the locked file handle; the kernel releases the advisory
+/// lock when the handle drops, so callers MUST keep the returned value
+/// alive for the entire write window. Returning `Option` rather than
+/// `Result` matches the best-effort contract of `append_event_sync`:
+/// lock failures degrade to unsynchronized writes (same risk as
+/// pre-fix), but never panic and never lose events.
+///
+/// `lock_exclusive` is blocking; on a hot run with many concurrent
+/// writers this serializes them in kernel queue order. Each writer
+/// holds the lock only for the duration of one `writeln!`, which is
+/// bounded by the JSON line size — typically a few hundred bytes.
+fn lock_events_file(log_dir: &std::path::Path) -> Option<std::fs::File> {
+    use fs2::FileExt;
+    let lock_path = log_dir.join("events.jsonl.lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(error = %e, path = ?lock_path, "failed to open events lock file");
+            return None;
+        }
+    };
+    if let Err(e) = lock_file.lock_exclusive() {
+        debug!(error = %e, path = ?lock_path, "failed to flock events lock file");
+        return None;
+    }
+    Some(lock_file)
 }
 
 /// Log the initial "run started" event. Called from executor after spawn.
