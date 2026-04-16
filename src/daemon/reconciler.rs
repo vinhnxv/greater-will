@@ -552,7 +552,15 @@ fn try_adopt_orphan(registry: &mut RunRegistry, tmux_name: &str) -> Option<Strin
                     "adopt_refused_plan_mismatch",
                     &format!("recorded={}, live={}", recorded_plan, live_plan),
                 );
-                return Some(run_id.to_string());
+                // P0-3: Return None so the caller's else-branch (see
+                // `step 3` in `reconcile`) kills the un-registered tmux
+                // session and logs ORPHAN. Returning Some previously
+                // caused `report.adopted` to increment for a session
+                // that was never inserted into the registry — leaving
+                // the tmux process running while the daemon had no
+                // record of it. The `adopt_refused_plan_mismatch`
+                // event above preserves observability of the refusal.
+                return None;
             }
         }
         // No loop state file → proceed with adoption (pre-init window)
