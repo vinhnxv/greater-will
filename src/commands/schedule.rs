@@ -20,7 +20,7 @@ pub fn execute(action: ScheduleAction) -> Result<()> {
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
         println!("  Start with: gw daemon start");
-        return Ok(());
+        color_eyre::eyre::bail!("daemon not running");
     }
 
     match action {

@@ -24,7 +24,7 @@ pub fn execute(run_id: String, follow: bool, tail: Option<usize>, pane: bool) ->
     if !DaemonClient::is_daemon_running() {
         println!("{} Daemon is not running.", tag("WARN"));
         println!("  Start with: gw daemon start");
-        return Ok(());
+        color_eyre::eyre::bail!("daemon not running");
     }
 
     let request = Request::GetLogs {
