@@ -714,7 +714,10 @@ impl DaemonRunMonitor {
                 let pane = tokio::task::spawn_blocking(move || {
                     spawn::capture_pane(&session_clone).unwrap_or_default()
                 }).await.unwrap_or_default();
-                let class = ErrorClass::from_pane_output(&pane, false).unwrap_or(ErrorClass::Crash);
+                // T9/P0-6: runtime=true mirrors foreground classifier (single_session/monitor.rs:340);
+                // bootstrap-only patterns produced false Crash verdicts mid-run. Default to
+                // ApiOverload when classification is inconclusive — safer than Crash for retry logic.
+                let class = ErrorClass::from_pane_output(&pane, true).unwrap_or(ErrorClass::ApiOverload);
 
                 let summary = signal.get("error").and_then(|v| v.as_str())
                     .or_else(|| signal.get("reason").and_then(|v| v.as_str()))
