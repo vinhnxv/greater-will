@@ -674,49 +674,17 @@ fn find_stale_runs(
         .collect()
 }
 
-/// Check if a checkpoint exists for a repo.
+/// Check if an authoritative checkpoint exists for a repo.
 ///
-/// Returns `true` if any `.rune/arc/*/checkpoint.json` file exists under
-/// `repo_dir`. Shared with the heartbeat monitor to avoid duplication.
+/// Delegates to [`util::read_cached_checkpoint`], which reads only from
+/// `.rune/arc-phase-loop.local.md` (the active-run pointer) — never from
+/// raw directory scans. This prevents the reconciler from picking up
+/// stale `checkpoint.json` files left behind by prior arc runs in the
+/// same repo (P1-10). Shared with the heartbeat monitor to avoid
+/// duplication.
 pub(crate) fn check_checkpoint(repo_dir: &std::path::Path) -> bool {
-    let rune_dir = repo_dir.join(".rune").join("arc");
-    if !rune_dir.is_dir() {
-        return false;
-    }
-    std::fs::read_dir(&rune_dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| {
-                    let cp = e.path().join("checkpoint.json");
-                    if !cp.exists() {
-                        return false;
-                    }
-                    // Validate that the checkpoint is actually valid JSON,
-                    // not a zero-byte or corrupt file from a partial write
-                    match std::fs::read_to_string(&cp) {
-                        Ok(content) => {
-                            if content.trim().is_empty() {
-                                warn!(path = ?cp, "checkpoint.json is empty — ignoring");
-                                return false;
-                            }
-                            match serde_json::from_str::<serde_json::Value>(&content) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    warn!(path = ?cp, error = %e, "checkpoint.json is invalid JSON — ignoring");
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(path = ?cp, error = %e, "failed to read checkpoint.json");
-                            false
-                        }
-                    }
-                })
-        })
-        .unwrap_or(false)
+    let mut cache_slot: Option<std::path::PathBuf> = None;
+    crate::engine::single_session::util::read_cached_checkpoint(repo_dir, &mut cache_slot).is_some()
 }
 
 /// Kill a tmux session by name, logging any errors.
