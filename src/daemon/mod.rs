@@ -15,7 +15,9 @@ use color_eyre::{eyre::WrapErr, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as UnixFileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -239,16 +241,41 @@ pub async fn start_daemon(verbosity: u8) -> Result<()> {
     // 3. Lock acquired — write our PID atomically into the locked file.
     //    `pid_file` must remain in scope for the full daemon lifetime so
     //    the OS keeps the lock held.
+    //
+    // T16/P2 invariant: the PID file is NEVER observed empty by a concurrent
+    // reader (AC14). The prior sequence `set_len(0) → seek(0) → write_all`
+    // opened a window where a crash between `set_len` and `write_all`
+    // left a zero-byte file, breaking `gw daemon status` and crash-loop
+    // detection.
+    //
+    // Fix: overwrite in place at offset 0 via pwrite (same inode preserves
+    // the fs2 flock), THEN shrink length. Atomic rename is NOT viable under
+    // the flock model — renaming would leave the lock attached to the old
+    // inode, and the new file at the path would be unlocked.
+    //
+    // Crash window trade-off: a crash between `write_at` and `set_len` may
+    // leave trailing bytes from a longer prior PID (e.g., old "12345" + new
+    // "999" → file contents "99945"). Readers use `.trim().parse::<u32>()`
+    // which fails noisily on malformed input — recoverable, unlike an empty
+    // file which silently reads as `PID ""`.
     let our_pid = std::process::id();
+    let pid_bytes = our_pid.to_string().into_bytes();
+    #[cfg(unix)]
+    UnixFileExt::write_at(&pid_file, &pid_bytes, 0)
+        .wrap_err("failed to pwrite daemon PID file at offset 0")?;
+    #[cfg(not(unix))]
+    {
+        use std::io::{Seek, SeekFrom};
+        pid_file
+            .seek(SeekFrom::Start(0))
+            .wrap_err("failed to seek daemon PID file")?;
+        pid_file
+            .write_all(&pid_bytes)
+            .wrap_err("failed to write daemon PID file")?;
+    }
     pid_file
-        .set_len(0)
-        .wrap_err("failed to truncate daemon PID file")?;
-    pid_file
-        .seek(SeekFrom::Start(0))
-        .wrap_err("failed to seek daemon PID file")?;
-    pid_file
-        .write_all(our_pid.to_string().as_bytes())
-        .wrap_err("failed to write daemon PID file")?;
+        .set_len(pid_bytes.len() as u64)
+        .wrap_err("failed to truncate daemon PID file after write")?;
     pid_file
         .flush()
         .wrap_err("failed to flush daemon PID file")?;
