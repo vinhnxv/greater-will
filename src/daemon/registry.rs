@@ -633,7 +633,41 @@ impl RunRegistry {
     // ── Queue operations ────────────────────────────────────────────
 
     /// Enqueue a pending run for a repo. Returns queue position (1-indexed).
+    ///
+    /// **Synchronous wrapper** — fsyncs `queue.json` while holding `&mut self`.
+    /// Production paths under an async lock should call
+    /// [`enqueue_run_staged`](Self::enqueue_run_staged) instead and flush
+    /// outside the registry mutex (INV-19 for queues).
     pub fn enqueue_run(&mut self, pending: PendingRun) -> Result<usize> {
+        let (position, snap) = self.enqueue_run_staged(pending)?;
+        Self::flush_queue(&snap)?;
+        Ok(position)
+    }
+
+    /// Staged variant of [`enqueue_run`](Self::enqueue_run) — performs the
+    /// in-memory mutation and returns a [`QueueSnapshot`] for the caller to
+    /// flush after releasing the registry mutex.
+    ///
+    /// Production callers under an `Arc<Mutex<RunRegistry>>` should prefer
+    /// this form so the 1–20 ms `queue.json` fsync does not block other IPC
+    /// requests behind the lock.
+    pub fn enqueue_run_staged(
+        &mut self,
+        pending: PendingRun,
+    ) -> Result<(usize, QueueSnapshot)> {
+        let position = self.enqueue_run_without_snapshot(pending)?;
+        let snap = self.stage_queue_locked();
+        Ok((position, snap))
+    }
+
+    /// Mutation-only helper for the multi-mutation canonical pattern. Used by
+    /// `executor::drain_if_available` to compose `record_queue_failure` +
+    /// `drain_next` + a single trailing `stage_queue_locked` (one snapshot,
+    /// not two).
+    pub(crate) fn enqueue_run_without_snapshot(
+        &mut self,
+        pending: PendingRun,
+    ) -> Result<usize> {
         // Global queue cap
         let total: usize = self.pending_queues.values().map(|q| q.len()).sum();
         if total >= MAX_QUEUE_SIZE {
@@ -705,12 +739,43 @@ impl RunRegistry {
         let queue = self.pending_queues.entry(hash).or_default();
         queue.push_back(pending);
         let position = queue.len();
-        self.save_queue()?;
         Ok(position)
     }
 
     /// Remove a queued run by ID. Returns the PendingRun if found.
+    ///
+    /// **Synchronous wrapper** — see [`dequeue_run_staged`](Self::dequeue_run_staged)
+    /// for the lock-release-before-fsync form.
     pub fn dequeue_run(&mut self, run_id: &str) -> Option<PendingRun> {
+        let (pending, snap) = self.dequeue_run_staged(run_id)?;
+        if let Err(e) = Self::flush_queue(&snap) {
+            tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
+        }
+        Some(pending)
+    }
+
+    /// Staged variant of [`dequeue_run`](Self::dequeue_run).
+    ///
+    /// The internal `update_status(Stopped)` still fsyncs `meta.json` while
+    /// holding the registry mutex; only the `queue.json` fsync is deferred to
+    /// the caller. This is the dominant cost in burst paths — `dequeue_run`
+    /// is invoked once per StopRun, not in bursts, so the meta.json fsync is
+    /// acceptable inside the lock.
+    pub fn dequeue_run_staged(
+        &mut self,
+        run_id: &str,
+    ) -> Option<(PendingRun, QueueSnapshot)> {
+        let pending = self.dequeue_run_without_snapshot(run_id)?;
+        let snap = self.stage_queue_locked();
+        Some((pending, snap))
+    }
+
+    /// Mutation-only helper — pops the pending entry and flips meta.json to
+    /// `Stopped` without fsyncing `queue.json`.
+    pub(crate) fn dequeue_run_without_snapshot(
+        &mut self,
+        run_id: &str,
+    ) -> Option<PendingRun> {
         // Collect pending entry first without holding a mutable borrow of
         // self.pending_queues while we call &mut self methods below.
         let pending = {
@@ -739,9 +804,6 @@ impl RunRegistry {
                 error = %e,
                 "failed to flip meta.json status to Stopped after dequeue — meta may drift from queue.json"
             );
-        }
-        if let Err(e) = self.save_queue() {
-            tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
         }
         Some(pending)
     }
@@ -810,7 +872,32 @@ impl RunRegistry {
     }
 
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
+    ///
+    /// **Synchronous wrapper** — see [`drain_next_staged`](Self::drain_next_staged).
     pub fn drain_next(&mut self, repo_dir: &Path) -> Option<PendingRun> {
+        let (pending, snap) = self.drain_next_staged(repo_dir)?;
+        if let Err(e) = Self::flush_queue(&snap) {
+            tracing::warn!(error = %e, "failed to persist queue after drain_next");
+        }
+        Some(pending)
+    }
+
+    /// Staged variant of [`drain_next`](Self::drain_next). Returns `None` for
+    /// empty queues / tripped breakers without bumping the queue epoch.
+    pub fn drain_next_staged(
+        &mut self,
+        repo_dir: &Path,
+    ) -> Option<(PendingRun, QueueSnapshot)> {
+        let pending = self.drain_next_without_snapshot(repo_dir)?;
+        let snap = self.stage_queue_locked();
+        Some((pending, snap))
+    }
+
+    /// Mutation-only helper — circuit-breaker check + pop_front, no fsync.
+    pub(crate) fn drain_next_without_snapshot(
+        &mut self,
+        repo_dir: &Path,
+    ) -> Option<PendingRun> {
         let hash = repo_hash(repo_dir);
         if self
             .consecutive_failures
@@ -821,19 +908,43 @@ impl RunRegistry {
         {
             return None;
         }
-        let result = self.pending_queues.get_mut(&hash).and_then(|q| q.pop_front());
-        if result.is_some() {
-            if let Err(e) = self.save_queue() {
-                tracing::warn!(error = %e, "failed to persist queue after drain_next");
-            }
-        }
-        result
+        self.pending_queues.get_mut(&hash).and_then(|q| q.pop_front())
     }
 
     /// Record a queue spawn failure for the circuit breaker.
     /// Returns staged statuses that the caller should flush after releasing the mutex.
     /// INV-19 / BACK-007: avoids N sequential fsyncs while holding the registry lock.
+    ///
+    /// **Synchronous wrapper** — see
+    /// [`record_queue_failure_staged`](Self::record_queue_failure_staged).
     pub fn record_queue_failure(&mut self, repo_dir: &Path) -> Vec<StagedStatus> {
+        let (staged_batch, snap) = self.record_queue_failure_staged(repo_dir);
+        if let Err(e) = Self::flush_queue(&snap) {
+            tracing::warn!(error = %e, "failed to persist queue after record_queue_failure");
+        }
+        staged_batch
+    }
+
+    /// Staged variant of [`record_queue_failure`](Self::record_queue_failure).
+    /// Returns the staged status batch (already flushable via
+    /// [`flush_status`](Self::flush_status)) **and** the queue snapshot in one
+    /// call so the caller can flush both outside the registry mutex.
+    pub fn record_queue_failure_staged(
+        &mut self,
+        repo_dir: &Path,
+    ) -> (Vec<StagedStatus>, QueueSnapshot) {
+        let staged_batch = self.record_queue_failure_without_snapshot(repo_dir);
+        let snap = self.stage_queue_locked();
+        (staged_batch, snap)
+    }
+
+    /// Mutation-only helper — bumps the consecutive-failure counter, drains
+    /// the per-repo queue when the circuit breaker trips, and stages
+    /// `RunStatus::Stopped` for each drained entry. Does **not** fsync.
+    pub(crate) fn record_queue_failure_without_snapshot(
+        &mut self,
+        repo_dir: &Path,
+    ) -> Vec<StagedStatus> {
         let hash = repo_hash(repo_dir);
         let count = self.consecutive_failures.entry(hash.clone()).or_insert(0);
         *count += 1;
@@ -860,19 +971,31 @@ impl RunRegistry {
             }
             self.consecutive_failures.remove(&hash);
         }
-        if let Err(e) = self.save_queue() {
-            tracing::warn!(error = %e, "failed to persist queue after record_queue_failure");
-        }
         staged_batch
     }
 
     /// Record a successful queue spawn, resetting the circuit breaker.
+    ///
+    /// **Synchronous wrapper** — see
+    /// [`record_queue_success_staged`](Self::record_queue_success_staged).
     pub fn record_queue_success(&mut self, repo_dir: &Path) {
-        let hash = repo_hash(repo_dir);
-        self.consecutive_failures.remove(&hash);
-        if let Err(e) = self.save_queue() {
+        let snap = self.record_queue_success_staged(repo_dir);
+        if let Err(e) = Self::flush_queue(&snap) {
             tracing::warn!(error = %e, "failed to persist queue after record_queue_success");
         }
+    }
+
+    /// Staged variant of [`record_queue_success`](Self::record_queue_success).
+    pub fn record_queue_success_staged(&mut self, repo_dir: &Path) -> QueueSnapshot {
+        self.record_queue_success_without_snapshot(repo_dir);
+        self.stage_queue_locked()
+    }
+
+    /// Mutation-only helper — clears the consecutive-failure counter for
+    /// `repo_dir` without fsyncing.
+    pub(crate) fn record_queue_success_without_snapshot(&mut self, repo_dir: &Path) {
+        let hash = repo_hash(repo_dir);
+        self.consecutive_failures.remove(&hash);
     }
 
     /// Check whether a repo lock is currently held.
@@ -910,16 +1033,51 @@ impl RunRegistry {
     }
 
     /// Remove a pending entry by run ID from whichever queue contains it.
+    ///
+    /// Does **not** fsync `queue.json`. Callers are expected to either pair
+    /// this with a subsequent [`save_queue`](Self::save_queue) (sync wrapper
+    /// path, e.g. tests) or to use [`remove_pending_staged`](Self::remove_pending_staged)
+    /// which returns a [`QueueSnapshot`] for outside-lock flush.
     pub fn remove_pending(&mut self, run_id: &str) {
         for queue in self.pending_queues.values_mut() {
             queue.retain(|p| p.run_id != run_id);
         }
     }
 
+    /// Staged variant of [`remove_pending`](Self::remove_pending). The
+    /// returned [`QueueSnapshot`] must be flushed via
+    /// [`flush_queue`](Self::flush_queue) after the registry mutex is released.
+    pub fn remove_pending_staged(&mut self, run_id: &str) -> QueueSnapshot {
+        self.remove_pending(run_id);
+        self.stage_queue_locked()
+    }
+
     /// Pop the next pending run from any repo queue whose circuit breaker
     /// has not tripped. Used to fill global capacity when the completing
     /// repo's own queue is empty.
+    ///
+    /// **Synchronous wrapper** — see
+    /// [`drain_any_ready_staged`](Self::drain_any_ready_staged).
     pub fn drain_any_ready(&mut self) -> Option<PendingRun> {
+        let (pending, snap) = self.drain_any_ready_staged()?;
+        if let Err(e) = Self::flush_queue(&snap) {
+            tracing::warn!(error = %e, "failed to persist queue after drain_any_ready");
+        }
+        Some(pending)
+    }
+
+    /// Staged variant of [`drain_any_ready`](Self::drain_any_ready). Returns
+    /// `None` (without bumping the queue epoch) when no eligible repo has a
+    /// pending entry.
+    pub fn drain_any_ready_staged(&mut self) -> Option<(PendingRun, QueueSnapshot)> {
+        let pending = self.drain_any_ready_without_snapshot()?;
+        let snap = self.stage_queue_locked();
+        Some((pending, snap))
+    }
+
+    /// Mutation-only helper — pops the first pending entry from any
+    /// non-broken queue without fsyncing.
+    pub(crate) fn drain_any_ready_without_snapshot(&mut self) -> Option<PendingRun> {
         let ready_hash = self
             .pending_queues
             .iter()
@@ -933,13 +1091,7 @@ impl RunRegistry {
             })
             .map(|(hash, _)| hash.clone())
             .next()?;
-        let result = self.pending_queues.get_mut(&ready_hash)?.pop_front();
-        if result.is_some() {
-            if let Err(e) = self.save_queue() {
-                tracing::warn!(error = %e, "failed to persist queue after drain_any_ready");
-            }
-        }
-        result
+        self.pending_queues.get_mut(&ready_hash)?.pop_front()
     }
 
     /// List queued runs, optionally filtered by repo directory.
@@ -985,11 +1137,39 @@ impl RunRegistry {
     /// transitioned to `Stopped` so `meta.json` and the in-memory registry
     /// stay in sync with `pending_queues`. Without this, reloading from disk
     /// after restart would resurrect the Queued entries as ghosts.
+    ///
+    /// **Synchronous wrapper** — fsyncs `meta.json` for each removed entry
+    /// while holding `&mut self`. Production callers should prefer
+    /// [`clear_queue_staged`](Self::clear_queue_staged) so the N×meta + 1×queue
+    /// fsyncs run outside the registry mutex.
     pub fn clear_queue(&mut self, repo_filter: Option<&Path>) -> usize {
-        // Collect removed run_ids first, then transition each RunEntry to
-        // Stopped. Drained in two passes because `update_status` takes
-        // `&mut self` and we cannot iterate pending_queues mutably at the
-        // same time.
+        let (count, staged_batch, snap) = self.clear_queue_staged(repo_filter);
+        for staged in &staged_batch {
+            if let Err(e) = Self::flush_status(staged) {
+                tracing::warn!(
+                    run_id = %staged.entry.run_id,
+                    error = %e,
+                    "flush_status failed during clear_queue (sync wrapper)",
+                );
+            }
+        }
+        if let Err(e) = Self::flush_queue(&snap) {
+            tracing::warn!(error = %e, "failed to persist queue after clear_queue");
+        }
+        count
+    }
+
+    /// Staged variant of [`clear_queue`](Self::clear_queue). Returns the
+    /// removed-entry count, the staged `RunStatus::Stopped` batch (one per
+    /// removed entry, ready for [`flush_status`](Self::flush_status)), and a
+    /// [`QueueSnapshot`] for outside-lock flush.
+    pub fn clear_queue_staged(
+        &mut self,
+        repo_filter: Option<&Path>,
+    ) -> (usize, Vec<StagedStatus>, QueueSnapshot) {
+        // Collect removed run_ids first, then stage each RunEntry transition.
+        // Drained in two passes because `stage_status_locked` takes `&mut self`
+        // and we cannot iterate `pending_queues` mutably at the same time.
         let mut removed_ids: Vec<String> = Vec::new();
 
         match repo_filter {
@@ -1017,22 +1197,27 @@ impl RunRegistry {
             }
         }
 
+        let mut staged_batch = Vec::with_capacity(removed_ids.len());
         for run_id in &removed_ids {
-            if let Err(e) = self.update_status(
+            match self.stage_status_locked(
                 run_id,
                 RunStatus::Stopped,
                 None,
                 Some("cleared by user".into()),
             ) {
-                tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "failed to update RunEntry to Stopped during clear_queue",
-                );
+                Ok(staged) => staged_batch.push(staged),
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "stage_status_locked failed during clear_queue",
+                    );
+                }
             }
         }
 
-        removed_ids.len()
+        let snap = self.stage_queue_locked();
+        (removed_ids.len(), staged_batch, snap)
     }
 
     /// Find a pending run by ID prefix across all queues.
