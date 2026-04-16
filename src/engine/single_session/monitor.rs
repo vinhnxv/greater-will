@@ -21,13 +21,41 @@ use crate::engine::monitor_constants::{
 use crate::engine::retry::{ErrorClass, ErrorEvidence};
 use crate::session::detect::{capture_pane, save_crash_dump};
 use crate::session::spawn::{
-    has_session, kill_session, send_keys_with_workaround, SpawnConfig,
-    spawn_claude_session,
+    has_session, kill_session, probe_session, send_keys_with_workaround, SessionProbe,
+    SpawnConfig, spawn_claude_session,
 };
 use color_eyre::Result;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Diagnostic suffix for crash reason strings — exposes the three clocks
+/// that matter for understanding *why* a crash was declared:
+///
+/// * `dispatch_age` — session wall-clock since `dispatch_time` (monotonic
+///   across the whole foreground attempt; not reset on phase change).
+/// * `phase_age`    — time in the current phase (`0` when unknown).
+/// * `silence`      — seconds since the pane last changed.
+///
+/// Without these, a log like `"after 1761s"` is ambiguous — readers
+/// cannot tell whether `1761s` was the phase duration, silence gap, or
+/// cumulative session lifetime.
+fn crash_clock_suffix(
+    dispatch_age: Duration,
+    phase_started_at: Option<Instant>,
+    last_activity: Instant,
+) -> String {
+    let phase_age = phase_started_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let silence = last_activity.elapsed().as_secs();
+    format!(
+        "dispatch_age={}s phase_age={}s silence={}s",
+        dispatch_age.as_secs(),
+        phase_age,
+        silence
+    )
+}
 
 /// Run one session attempt: spawn → dispatch → monitor → cleanup.
 pub(crate) fn run_session_attempt(
@@ -115,6 +143,12 @@ pub(crate) fn monitor_session(
     let mut poll_count: u64 = 0;
     let mut last_checkpoint_poll = Instant::now();
     let mut last_checkpoint_activity = Instant::now();
+    // Session-probe grace counter. `probe_session` reports `Unreachable`
+    // when the tmux server is hung (vs `Absent` when the session truly
+    // does not exist). Short bursts of unreachability are transient;
+    // only persistent unreachability escalates to the crash path.
+    let mut consecutive_unreachable: u32 = 0;
+    const UNREACHABLE_GRACE_TICKS: u32 = 3;
     let mut last_checkpoint_hash: Option<u64> = None;
     // Cache the resolved checkpoint path from loop state for O(1) reads each poll.
     let mut cached_checkpoint_path: Option<PathBuf> = None;
@@ -346,8 +380,45 @@ pub(crate) fn monitor_session(
             });
         }
 
-        // Check if session is still alive
-        if !has_session(session_name) {
+        // Check if session is still alive. Use `probe_session` instead
+        // of the `has_session` boolean so a momentarily hung tmux
+        // server doesn't false-positive as a session crash. Only
+        // `Absent`, or `Unreachable` that persists past the grace
+        // window, drives the vanish path below.
+        let probe = probe_session(session_name);
+        let session_vanished = match probe {
+            SessionProbe::Present => {
+                consecutive_unreachable = 0;
+                false
+            }
+            SessionProbe::Absent => {
+                consecutive_unreachable = 0;
+                true
+            }
+            SessionProbe::Unreachable(ref reason) => {
+                consecutive_unreachable += 1;
+                if consecutive_unreachable >= UNREACHABLE_GRACE_TICKS {
+                    warn!(
+                        session = %session_name,
+                        consecutive = consecutive_unreachable,
+                        last_error = %reason,
+                        "tmux unreachable for {} consecutive probes — escalating to crash path",
+                        consecutive_unreachable
+                    );
+                    true
+                } else {
+                    debug!(
+                        session = %session_name,
+                        consecutive = consecutive_unreachable,
+                        grace = UNREACHABLE_GRACE_TICKS,
+                        last_error = %reason,
+                        "tmux unreachable — skipping tick (within grace window)"
+                    );
+                    continue;
+                }
+            }
+        };
+        if session_vanished {
             let session_age = dispatch_time.elapsed();
             info!(
                 age_secs = session_age.as_secs(),
@@ -359,8 +430,9 @@ pub(crate) fn monitor_session(
             if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
                 return Ok(SessionOutcome::Crashed {
                     reason: format!(
-                        "Session exited after only {}s — Claude Code likely failed to start",
-                        session_age.as_secs()
+                        "Session exited after only {}s — Claude Code likely failed to start ({})",
+                        session_age.as_secs(),
+                        crash_clock_suffix(session_age, phase_started_at, last_activity)
                     ),
                 });
             }
@@ -385,8 +457,9 @@ pub(crate) fn monitor_session(
                     warn!(current_phase = current, "Session ended with incomplete checkpoint");
                     return Ok(SessionOutcome::Crashed {
                         reason: format!(
-                            "Session ended during phase '{}' after {}s",
-                            current, session_age.as_secs(),
+                            "Session ended during phase '{}' ({})",
+                            current,
+                            crash_clock_suffix(session_age, phase_started_at, last_activity)
                         ),
                     });
                 }
@@ -401,8 +474,9 @@ pub(crate) fn monitor_session(
                     );
                     return Ok(SessionOutcome::Crashed {
                         reason: format!(
-                            "Session ran {}m but produced no checkpoint — cannot confirm completion",
+                            "Session ran {}m but produced no checkpoint — cannot confirm completion ({})",
                             session_age.as_secs() / 60,
+                            crash_clock_suffix(session_age, phase_started_at, last_activity)
                         ),
                     });
                 }
@@ -413,15 +487,19 @@ pub(crate) fn monitor_session(
                 );
                 return Ok(SessionOutcome::Crashed {
                     reason: format!(
-                        "Session ended after {}s with no checkpoint (too short for completion)",
+                        "Session ended after {}s with no checkpoint (too short for completion; {})",
                         session_age.as_secs(),
+                        crash_clock_suffix(session_age, phase_started_at, last_activity)
                     ),
                 });
             }
 
             // Session gone but process alive? Unusual — treat as crash.
             return Ok(SessionOutcome::Crashed {
-                reason: "Tmux session disappeared but process still alive".to_string(),
+                reason: format!(
+                    "Tmux session disappeared but process still alive ({})",
+                    crash_clock_suffix(session_age, phase_started_at, last_activity)
+                ),
             });
         }
 
@@ -797,8 +875,9 @@ pub(crate) fn monitor_session(
                             } else {
                                 warn!(current_phase = current, "Loop state gone but checkpoint incomplete");
                                 let reason = format!(
-                                    "arc-phase-loop.local.md deleted during phase '{}' after {}s",
-                                    current, session_age.as_secs(),
+                                    "arc-phase-loop.local.md deleted during phase '{}' ({})",
+                                    current,
+                                    crash_clock_suffix(session_age, phase_started_at, last_activity)
                                 );
                                 save_crash_dump(session_name, &config.working_dir, &reason);
                                 let _ = kill_session(session_name);
@@ -832,8 +911,9 @@ pub(crate) fn monitor_session(
                             session_age.as_secs(),
                         );
                         let reason = format!(
-                            "arc-phase-loop.local.md gone after only {}s with no checkpoint",
+                            "arc-phase-loop.local.md gone after only {}s with no checkpoint ({})",
                             session_age.as_secs(),
+                            crash_clock_suffix(session_age, phase_started_at, last_activity)
                         );
                         save_crash_dump(session_name, &config.working_dir, &reason);
                         let _ = kill_session(session_name);
@@ -1186,7 +1266,11 @@ pub(crate) fn monitor_session(
 
             if session_age < Duration::from_secs(MIN_SESSION_DURATION_SECS) {
                 return Ok(SessionOutcome::Crashed {
-                    reason: format!("Claude process died after only {}s", session_age.as_secs()),
+                    reason: format!(
+                        "Claude process died after only {}s ({})",
+                        session_age.as_secs(),
+                        crash_clock_suffix(session_age, phase_started_at, last_activity)
+                    ),
                 });
             }
 
@@ -1205,8 +1289,9 @@ pub(crate) fn monitor_session(
                 warn!(current_phase = current, "Process died with incomplete checkpoint");
                 return Ok(SessionOutcome::Crashed {
                     reason: format!(
-                        "Claude process died during phase '{}' after {}s",
-                        current, session_age.as_secs(),
+                        "Claude process died during phase '{}' ({})",
+                        current,
+                        crash_clock_suffix(session_age, phase_started_at, last_activity)
                     ),
                 });
             }
@@ -1229,8 +1314,9 @@ pub(crate) fn monitor_session(
             );
             return Ok(SessionOutcome::Crashed {
                 reason: format!(
-                    "Claude process died after {}s with no checkpoint (too short for completion)",
+                    "Claude process died after {}s with no checkpoint (too short for completion; {})",
                     session_age.as_secs(),
+                    crash_clock_suffix(session_age, phase_started_at, last_activity)
                 ),
             });
         }

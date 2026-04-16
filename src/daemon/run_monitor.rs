@@ -204,6 +204,13 @@ pub struct DaemonRunMonitor {
     claude_pid: Option<u32>,
     last_process_gone_at: Option<Instant>,
 
+    // Session-probe grace counter. `probe_session` can report
+    // `Unreachable` when the tmux server is hung (not when the
+    // session has died). We tolerate a short run of Unreachable
+    // results before escalating — a persistently unreachable tmux
+    // eventually must be treated as a crash so the run can recover.
+    consecutive_unreachable: u32,
+
     // Swarm activity
     /// Cached swarm activity state (refreshed every 15s).
     cached_swarm_active: bool,
@@ -299,6 +306,7 @@ impl DaemonRunMonitor {
             failed_nudge_count: 0,
             claude_pid: entry.claude_pid,
             last_process_gone_at: None,
+            consecutive_unreachable: 0,
             cached_swarm_active: false,
             last_swarm_check: now,
             prompt_acceptor,
@@ -389,7 +397,7 @@ impl DaemonRunMonitor {
                     self.scan_artifacts().await;
 
                     // 12. Process liveness
-                    if let Some(outcome) = self.check_process_liveness() {
+                    if let Some(outcome) = self.check_process_liveness().await {
                         return outcome;
                     }
 
@@ -533,12 +541,67 @@ impl DaemonRunMonitor {
         }
     }
 
-    /// Observational — treats JoinError as `false` (assume session gone).
-    async fn has_session(&self) -> bool {
+    /// Three-state probe. Use this in crash-detection paths so a hung
+    /// tmux server (`Unreachable`) is distinguishable from a truly
+    /// vanished session (`Absent`). A `JoinError` still collapses to
+    /// `Unreachable` — the monitor tick should skip rather than
+    /// false-positive as a crash.
+    async fn probe_session(&self) -> crate::session::spawn::SessionProbe {
         let session = self.tmux_session.clone();
-        tokio::task::spawn_blocking(move || crate::session::spawn::has_session(&session))
+        tokio::task::spawn_blocking(move || crate::session::spawn::probe_session(&session))
             .await
-            .unwrap_or(false)
+            .unwrap_or_else(|e| {
+                crate::session::spawn::SessionProbe::Unreachable(format!(
+                    "probe_session task joined with error: {}",
+                    e
+                ))
+            })
+    }
+
+    /// Fire-and-forget crash dump for the daemon vanish path.
+    ///
+    /// Foreground paths call `save_crash_dump` before killing tmux so the
+    /// pane scrollback is captured. In the daemon `check_session_alive`
+    /// path, tmux has *already* disappeared — so scrollback capture will
+    /// fail. We still record a metadata-only dump (reason + clocks)
+    /// because otherwise operators have no forensic evidence of the
+    /// crash and conclude "crash detector is broken" when in fact the
+    /// detector was correct but left no audit trail.
+    ///
+    /// Must not block the monitor loop: wraps the blocking fs+tmux calls
+    /// in `spawn_blocking`. Failures are logged inside `save_crash_dump`
+    /// and do not propagate.
+    async fn save_crash_report(&self, reason: &str) {
+        let session = self.tmux_session.clone();
+        let repo_dir = self.repo_dir.clone();
+        let reason_owned = reason.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session::detect::save_crash_dump(&session, &repo_dir, &reason_owned);
+        })
+        .await;
+    }
+
+    /// Diagnostic suffix for crash reason strings — exposes the three clocks
+    /// that matter for understanding *why* a crash was declared:
+    ///
+    /// * `monitor_age` — per-recovery monitor clock (resets each recovery).
+    /// * `phase_age`   — time in the current phase (`0` if unknown).
+    /// * `silence`     — seconds since the pane last changed.
+    ///
+    /// Without these, a log like `"after 1761s"` is ambiguous — readers
+    /// can't tell whether `1761s` was the phase duration, silence gap, or
+    /// cumulative session lifetime. Keep this cheap (no I/O).
+    fn crash_clock_suffix(&self) -> String {
+        let monitor_age = self.monitor_started_at.elapsed().as_secs();
+        let phase_age = self
+            .phase_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let silence = self.last_activity.elapsed().as_secs();
+        format!(
+            "monitor_age={}s phase_age={}s silence={}s",
+            monitor_age, phase_age, silence
+        )
     }
 
     /// Read checkpoint via spawn_blocking (same async pattern as has_session).
@@ -734,8 +797,59 @@ impl DaemonRunMonitor {
     /// 2. Checkpoint complete → Completed (definitive)
     /// 3. Checkpoint has in-progress phase → Crashed with phase context
     /// 4. No checkpoint + completion_detected_at → Completed; else Crashed
+    ///
+    /// Uses [`probe_session`](SessionProbe) instead of the boolean
+    /// `has_session` so a hung tmux server (`Unreachable`) does not
+    /// false-positive as a crash. We tolerate up to
+    /// `UNREACHABLE_GRACE_TICKS` consecutive Unreachable results before
+    /// treating persistent tmux unreachability as `Absent` — at that
+    /// point the run cannot be recovered by waiting any longer.
     async fn check_session_alive(&mut self) -> Option<DaemonRunOutcome> {
-        if !self.has_session().await {
+        /// Max consecutive `Unreachable` probes tolerated before
+        /// escalating to the crash path. With a 30s poll interval this
+        /// gives ~90s of tmux-server-hang tolerance.
+        const UNREACHABLE_GRACE_TICKS: u32 = 3;
+
+        use crate::session::spawn::SessionProbe;
+        let probe = self.probe_session().await;
+        let treat_as_absent = match probe {
+            SessionProbe::Present => {
+                self.consecutive_unreachable = 0;
+                false
+            }
+            SessionProbe::Absent => {
+                self.consecutive_unreachable = 0;
+                true
+            }
+            SessionProbe::Unreachable(reason) => {
+                self.consecutive_unreachable += 1;
+                if self.consecutive_unreachable >= UNREACHABLE_GRACE_TICKS {
+                    warn!(
+                        run_id = %self.run_id,
+                        tmux_session = %self.tmux_session,
+                        consecutive = self.consecutive_unreachable,
+                        last_error = %reason,
+                        "tmux unreachable for {} consecutive probes — escalating to crash path",
+                        self.consecutive_unreachable
+                    );
+                    true
+                } else {
+                    debug!(
+                        run_id = %self.run_id,
+                        tmux_session = %self.tmux_session,
+                        consecutive = self.consecutive_unreachable,
+                        grace = UNREACHABLE_GRACE_TICKS,
+                        last_error = %reason,
+                        "tmux unreachable — skipping tick (within grace window)"
+                    );
+                    // Skip this tick. The session may still be alive —
+                    // returning None lets the monitor loop retry on the
+                    // next poll.
+                    return None;
+                }
+            }
+        };
+        if treat_as_absent {
             // Per-recovery clock — see field doc on `monitor_started_at`.
             // Using `run_started_at` here would inherit the cumulative
             // wall-clock from previous recovery cycles, defeating the
@@ -746,9 +860,13 @@ impl DaemonRunMonitor {
 
             // Step 1: Too young — can't have legitimately finished yet.
             if age < MIN_COMPLETION_AGE_SECS {
-                return Some(DaemonRunOutcome::Crashed {
-                    reason: format!("tmux session vanished at age {}s (below min)", age),
-                });
+                let reason = format!(
+                    "tmux session vanished at age {}s (below min; {})",
+                    age,
+                    self.crash_clock_suffix()
+                );
+                self.save_crash_report(&reason).await;
+                return Some(DaemonRunOutcome::Crashed { reason });
             }
 
             // Step 2: Check checkpoint for definitive answer.
@@ -768,12 +886,13 @@ impl DaemonRunMonitor {
                     .inferred_phase_name()
                     .or_else(|| checkpoint.current_phase())
                     .unwrap_or("unknown");
-                return Some(DaemonRunOutcome::Crashed {
-                    reason: format!(
-                        "session ended during phase '{}' after {}s",
-                        phase, age
-                    ),
-                });
+                let reason = format!(
+                    "session ended during phase '{}' ({})",
+                    phase,
+                    self.crash_clock_suffix()
+                );
+                self.save_crash_report(&reason).await;
+                return Some(DaemonRunOutcome::Crashed { reason });
             }
 
             // Step 3: No checkpoint — fall back to pane completion signal.
@@ -782,23 +901,35 @@ impl DaemonRunMonitor {
             }
 
             // Step 4: No evidence of completion.
-            return Some(DaemonRunOutcome::Crashed {
-                reason: "tmux session vanished without completion evidence".to_string(),
-            });
+            let reason = format!(
+                "tmux session vanished without completion evidence ({})",
+                self.crash_clock_suffix()
+            );
+            self.save_crash_report(&reason).await;
+            return Some(DaemonRunOutcome::Crashed { reason });
         }
         None
     }
 
-    fn check_process_liveness(&mut self) -> Option<DaemonRunOutcome> {
+    /// Detects process death independently of tmux. When the pid is gone
+    /// but tmux session might still exist, this is where we can still
+    /// capture a meaningful pane snapshot — so `save_crash_report` is
+    /// called before returning the `Crashed` outcome.
+    async fn check_process_liveness(&mut self) -> Option<DaemonRunOutcome> {
         let pid = self.claude_pid?;
         if !crate::cleanup::process::is_pid_alive(pid) {
             let now = Instant::now();
             let first_gone = *self.last_process_gone_at.get_or_insert(now);
             let gone_for = first_gone.elapsed().as_secs();
             if gone_for >= COMPLETION_GRACE_SECS {
-                return Some(DaemonRunOutcome::Crashed {
-                    reason: format!("claude pid {} gone for {}s", pid, gone_for),
-                });
+                let reason = format!(
+                    "claude pid {} gone for {}s ({})",
+                    pid,
+                    gone_for,
+                    self.crash_clock_suffix()
+                );
+                self.save_crash_report(&reason).await;
+                return Some(DaemonRunOutcome::Crashed { reason });
             }
         } else {
             self.last_process_gone_at = None;
@@ -1188,9 +1319,12 @@ impl DaemonRunMonitor {
                         return Some(DaemonRunOutcome::Completed);
                     }
                 }
-                return Some(DaemonRunOutcome::Crashed {
-                    reason: "arc-phase-loop state file deleted".to_string(),
-                });
+                let reason = format!(
+                    "arc-phase-loop state file deleted ({})",
+                    self.crash_clock_suffix()
+                );
+                self.save_crash_report(&reason).await;
+                return Some(DaemonRunOutcome::Crashed { reason });
             }
         }
         None
