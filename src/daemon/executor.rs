@@ -443,10 +443,16 @@ async fn spawn_after_register(
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(&run_id) {
                 entry.claude_pid = Some(pid);
+                // T10/P1-7 — LOAD-BEARING ORDERING INVARIANT: do not move this
+                // write below the 12s Ink-warmup sleep.
+                // Record FIRST so crash-loop detector's 12s Ink-warmup window
+                // observes a concrete timestamp, not daemon-uptime fallback.
                 // See heartbeat.rs:697 — `run_uptime = now - session_start`
                 // where `session_start = last_recovery_at.unwrap_or(started_at)`.
-                // Without this, a first-attempt crash produces a run_uptime
-                // measured from daemon boot, inflating `record_healthy_runtime`.
+                // Without this ordering, a first-attempt crash during Ink
+                // warmup produces a run_uptime measured from daemon boot,
+                // spuriously inflating `record_healthy_runtime` and clearing
+                // crash history.
                 entry.last_recovery_at = Some(chrono::Utc::now());
             }
             drop(reg);
