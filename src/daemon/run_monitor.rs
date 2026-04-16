@@ -581,26 +581,35 @@ impl DaemonRunMonitor {
         .await;
     }
 
-    /// Diagnostic suffix for crash reason strings — exposes the three clocks
+    /// Diagnostic suffix for crash reason strings — exposes the clocks
     /// that matter for understanding *why* a crash was declared:
     ///
-    /// * `monitor_age` — per-recovery monitor clock (resets each recovery).
-    /// * `phase_age`   — time in the current phase (`0` if unknown).
-    /// * `silence`     — seconds since the pane last changed.
+    /// * `monitor_age`       — per-recovery monitor clock (resets each recovery).
+    /// * `phase_age`         — time in the current phase (`0` if unknown).
+    /// * `silence_pane`      — seconds since the tmux pane hash last changed.
+    /// * `silence_checkpoint`— seconds since checkpoint.json last advanced.
     ///
-    /// Without these, a log like `"after 1761s"` is ambiguous — readers
-    /// can't tell whether `1761s` was the phase duration, silence gap, or
-    /// cumulative session lifetime. Keep this cheap (no I/O).
+    /// Two silence metrics are exposed intentionally. `silence_pane` can
+    /// be misleading — the Claude Code TUI continuously redraws (cursor,
+    /// status bar, auto-compaction) so the pane hash rarely stays stable
+    /// for long, and a low `silence_pane` does NOT mean the pipeline is
+    /// making progress. `silence_checkpoint` is the semantic metric:
+    /// high values mean Rune has stopped writing state, which is the
+    /// reliable stuck-signal. Post-mortem readers should prefer
+    /// `silence_checkpoint` for "is the run actually stuck?".
+    ///
+    /// Keep this cheap (no I/O).
     fn crash_clock_suffix(&self) -> String {
         let monitor_age = self.monitor_started_at.elapsed().as_secs();
         let phase_age = self
             .phase_started_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        let silence = self.last_activity.elapsed().as_secs();
+        let silence_pane = self.last_activity.elapsed().as_secs();
+        let silence_checkpoint = self.last_checkpoint_activity.elapsed().as_secs();
         format!(
-            "monitor_age={}s phase_age={}s silence={}s",
-            monitor_age, phase_age, silence
+            "monitor_age={}s phase_age={}s silence_pane={}s silence_checkpoint={}s",
+            monitor_age, phase_age, silence_pane, silence_checkpoint
         )
     }
 

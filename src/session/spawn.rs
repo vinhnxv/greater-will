@@ -157,12 +157,31 @@ pub fn spawn_claude_session(config: &SpawnConfig) -> Result<u32> {
         "Spawning Claude Code session"
     );
 
-    // Check if session already exists
-    if has_session(&config.session_id) {
-        return Err(eyre!(
-            "Session '{}' already exists",
-            config.session_id
-        ));
+    // Check if session already exists. Use `probe_session` rather than
+    // `has_session` so a transient tmux Unreachable does not silently
+    // fall through to `new-session` (which then fails with a confusing
+    // "duplicate session name" error when tmux recovers). Recovery
+    // paths call this function immediately after a crash, which is
+    // exactly when tmux may still be recovering — so the distinction
+    // matters.
+    match probe_session(&config.session_id) {
+        SessionProbe::Present => {
+            return Err(eyre!(
+                "Session '{}' already exists",
+                config.session_id
+            ));
+        }
+        SessionProbe::Unreachable(reason) => {
+            return Err(eyre!(
+                "Cannot verify session '{}' state — tmux unreachable: {}. \
+                 Refusing to spawn to avoid duplicate-session race.",
+                config.session_id,
+                reason
+            ));
+        }
+        SessionProbe::Absent => {
+            // Safe to create
+        }
     }
 
     // Create tmux session
