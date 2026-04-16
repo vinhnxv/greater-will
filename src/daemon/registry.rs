@@ -346,6 +346,13 @@ pub struct RunRegistry {
     repo_locks: HashMap<String, fs::File>,
     /// Per-repo pending run queues (keyed by repo hash).
     pending_queues: HashMap<String, VecDeque<PendingRun>>,
+    /// FIFO log of repo hashes in the order they first received a pending
+    /// run. Used by [`Self::drain_any_ready_without_snapshot`] to honor
+    /// cross-repo FIFO instead of non-deterministic HashMap iteration order
+    /// (P1-9). Each hash appears at most once; entries are not removed when
+    /// a queue drains, so the drain helper skips stale entries whose queue
+    /// is empty. O(n) scan cost, bounded by the number of concurrent repos.
+    repo_insertion_order: VecDeque<String>,
     /// Consecutive spawn failure count per repo (for circuit breaker).
     consecutive_failures: HashMap<String, u32>,
     /// Monotonic counter bumped by `stage_queue_locked` so each runtime
@@ -365,6 +372,7 @@ impl RunRegistry {
             runs: HashMap::new(),
             repo_locks: HashMap::new(),
             pending_queues: HashMap::new(),
+            repo_insertion_order: VecDeque::new(),
             consecutive_failures: HashMap::new(),
             queue_epoch: AtomicU64::new(0),
             queue_last_flushed_epoch: Arc::new(AtomicU64::new(0)),
@@ -847,6 +855,12 @@ impl RunRegistry {
         };
         self.runs.insert(pending.run_id.clone(), entry.clone());
 
+        // P1-9: record first-enqueue order so cross-repo drain is FIFO.
+        // Each hash appears at most once; presence in the deque is the
+        // authoritative source of cross-repo ordering.
+        if !self.repo_insertion_order.contains(&hash) {
+            self.repo_insertion_order.push_back(hash.clone());
+        }
         let queue = self.pending_queues.entry(hash).or_default();
         queue.push_back(pending);
         let position = queue.len();
@@ -1258,20 +1272,29 @@ impl RunRegistry {
 
     /// Mutation-only helper — pops the first pending entry from any
     /// non-broken queue without fsyncing.
+    ///
+    /// P1-9: iterates `repo_insertion_order` (first-enqueue FIFO) instead of
+    /// `pending_queues` (HashMap, non-deterministic). Stale entries whose
+    /// queue is empty or whose circuit breaker has tripped are skipped.
     pub(crate) fn drain_any_ready_without_snapshot(&mut self) -> Option<PendingRun> {
         let ready_hash = self
-            .pending_queues
+            .repo_insertion_order
             .iter()
-            .filter(|(_, q)| !q.is_empty())
-            .filter(|(hash, _)| {
-                self.consecutive_failures
+            .find(|hash| {
+                let eligible = self
+                    .consecutive_failures
                     .get(*hash)
                     .copied()
                     .unwrap_or(0)
-                    < MAX_CONSECUTIVE_FAILURES
+                    < MAX_CONSECUTIVE_FAILURES;
+                let non_empty = self
+                    .pending_queues
+                    .get(*hash)
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false);
+                eligible && non_empty
             })
-            .map(|(hash, _)| hash.clone())
-            .next()?;
+            .cloned()?;
         self.pending_queues.get_mut(&ready_hash)?.pop_front()
     }
 
@@ -1565,8 +1588,17 @@ impl RunRegistry {
 
     /// Populate in-memory pending queues and circuit-breaker state from a
     /// previously loaded [`QueueSnapshotWire`].
+    ///
+    /// P1-9: also seeds `repo_insertion_order` with hashes that have pending
+    /// entries on restart so cross-repo FIFO drain is preserved across
+    /// daemon restarts. The on-disk HashMap order is not guaranteed FIFO
+    /// (limitation of `QueueSnapshotWire`), but subsequent new enqueues
+    /// extend the log in true insertion order.
     pub fn restore_queue(&mut self, snapshot: QueueSnapshotWire) {
         for (hash, entries) in snapshot.queues {
+            if !entries.is_empty() && !self.repo_insertion_order.contains(&hash) {
+                self.repo_insertion_order.push_back(hash.clone());
+            }
             self.pending_queues
                 .insert(hash, VecDeque::from(entries));
         }
