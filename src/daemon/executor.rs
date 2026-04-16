@@ -133,27 +133,36 @@ pub(crate) async fn drain_if_available(
     repo_dir: &Path,
     failed: bool,
 ) {
-    // INV-19: stage all mutations inside the mutex scope, then release before
-    // fsync'ing. Holding `reg` across `flush_status` would serialise up to 50
-    // fsyncs under the registry lock on circuit-breaker trip.
-    let (staged_batch, next) = {
+    // INV-19 / PERF-003: stage all mutations inside the mutex scope, then
+    // release the guard before fsync'ing. The canonical multi-mutation
+    // pattern uses `*_without_snapshot` helpers + a single trailing
+    // `stage_queue_locked` so the queue.json fsync runs once outside the
+    // lock, regardless of how many mutations the caller composed.
+    let (staged_batch, next, queue_snap) = {
         let mut reg = registry.lock().await;
         let staged_batch = if failed {
-            reg.record_queue_failure(repo_dir)
+            reg.record_queue_failure_without_snapshot(repo_dir)
         } else {
-            reg.record_queue_success(repo_dir);
+            reg.record_queue_success_without_snapshot(repo_dir);
             Vec::new()
         };
         // Try the completing repo's queue first, then any other queue
         // with available capacity (handles runs queued by A6 global cap).
-        let next = reg.drain_next(repo_dir).or_else(|| reg.drain_any_ready());
-        (staged_batch, next)
+        let next = reg
+            .drain_next_without_snapshot(repo_dir)
+            .or_else(|| reg.drain_any_ready_without_snapshot());
+        // One snapshot, captured after every mutation has landed in memory.
+        let queue_snap = reg.stage_queue_locked();
+        (staged_batch, next, queue_snap)
     }; // `reg` dropped — mutex released before fsync loop below
 
     for staged in &staged_batch {
         if let Err(e) = RunRegistry::flush_status(staged) {
             error!(run_id = %staged.entry.run_id, error = %e, "flush_status failed: circuit breaker drain");
         }
+    }
+    if let Err(e) = RunRegistry::flush_queue(&queue_snap) {
+        error!(error = %e, "flush_queue failed after drain_if_available");
     }
 
     if let Some(pending) = next {
@@ -182,7 +191,12 @@ pub(crate) async fn drain_if_available(
                     //      releases the lock via its Failed branch.
                     // Without this, `drain_next` already popped the PendingRun
                     // so the entry would ghost as "queued" forever.
-                    let (failed_staged, staged_batch, next) = {
+                    //
+                    // PERF-003: same canonical pattern as the outer scope —
+                    // `*_without_snapshot` for each mutation plus a single
+                    // trailing `stage_queue_locked`, all flushed after lock
+                    // release.
+                    let (failed_staged, staged_batch, next, queue_snap) = {
                         let mut reg = registry.lock().await;
                         let failed_staged = reg
                             .stage_status_locked(
@@ -192,9 +206,10 @@ pub(crate) async fn drain_if_available(
                                 Some(format!("drain spawn failed: {e}")),
                             )
                             .map_err(|se| color_eyre::eyre::eyre!("{se}"));
-                        let staged_batch = reg.record_queue_failure(&repo_dir);
-                        let next = reg.drain_next(&repo_dir);
-                        (failed_staged, staged_batch, next)
+                        let staged_batch = reg.record_queue_failure_without_snapshot(&repo_dir);
+                        let next = reg.drain_next_without_snapshot(&repo_dir);
+                        let queue_snap = reg.stage_queue_locked();
+                        (failed_staged, staged_batch, next, queue_snap)
                     }; // `reg` dropped — mutex released before fsyncs
 
                     match failed_staged {
@@ -211,6 +226,9 @@ pub(crate) async fn drain_if_available(
                         if let Err(fe) = RunRegistry::flush_status(staged) {
                             error!(run_id = %staged.entry.run_id, error = %fe, "flush_status failed: circuit breaker drain");
                         }
+                    }
+                    if let Err(fe) = RunRegistry::flush_queue(&queue_snap) {
+                        error!(error = %fe, "flush_queue failed after drain spawn error recovery");
                     }
                     if let Some(retry) = next {
                         info!("retrying with next queued run after spawn failure");
