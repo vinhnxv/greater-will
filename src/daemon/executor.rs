@@ -443,10 +443,16 @@ async fn spawn_after_register(
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(&run_id) {
                 entry.claude_pid = Some(pid);
+                // T10/P1-7 — LOAD-BEARING ORDERING INVARIANT: do not move this
+                // write below the 12s Ink-warmup sleep.
+                // Record FIRST so crash-loop detector's 12s Ink-warmup window
+                // observes a concrete timestamp, not daemon-uptime fallback.
                 // See heartbeat.rs:697 — `run_uptime = now - session_start`
                 // where `session_start = last_recovery_at.unwrap_or(started_at)`.
-                // Without this, a first-attempt crash produces a run_uptime
-                // measured from daemon boot, inflating `record_healthy_runtime`.
+                // Without this ordering, a first-attempt crash during Ink
+                // warmup produces a run_uptime measured from daemon boot,
+                // spuriously inflating `record_healthy_runtime` and clearing
+                // crash history.
                 entry.last_recovery_at = Some(chrono::Utc::now());
             }
             drop(reg);
@@ -585,6 +591,14 @@ pub async fn stop_run(
     monitors: Arc<tokio::sync::Mutex<HashMap<String, MonitorHandle>>>,
     run_id: &str,
 ) -> Result<()> {
+    // T14/P1-11: mirror spawn-path pre-flight (executor.rs:378) so stale claude
+    // processes and signal files from the run being stopped are cleared before
+    // teardown. Unlike spawn — which propagates to abort a corrupt startup —
+    // stop MUST proceed even if cleanup is imperfect, so we warn-and-continue.
+    if let Err(e) = crate::cleanup::pre_phase_cleanup("daemon-stop", "0") {
+        warn!(run_id = %run_id, error = %e, "pre_phase_cleanup failed during stop; continuing with teardown");
+    }
+
     // Step 0: Cancel the monitor BEFORE sending /exit to prevent race
     // where the monitor fires its kill gate between cancel and stop.
     {

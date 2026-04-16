@@ -372,10 +372,41 @@ fn restart() -> Result<()> {
     println!("Restarting daemon...");
     if DaemonClient::is_daemon_running() {
         stop()?;
-        // Brief pause to allow socket cleanup
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        wait_for_daemon_down(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(100),
+        );
     }
     start(false, 0)
+}
+
+/// Poll until the daemon process and its UDS socket file are both absent,
+/// up to `timeout`, sleeping `tick` between probes.
+///
+/// Replaces a fixed 500ms sleep at this site that raced against
+/// `server::cleanup_stale_socket`: on slow shutdowns the next `start` would
+/// hit a still-bound socket and fail; on fast shutdowns the 500ms was wasted
+/// latency. The poll returns as soon as both probes agree the daemon is down,
+/// typically within ~100ms.
+///
+/// Returns silently on timeout — the subsequent `start` surfaces any
+/// remaining bind failure with a clearer, actionable error than this
+/// helper could.
+fn wait_for_daemon_down(timeout: std::time::Duration, tick: std::time::Duration) {
+    let socket_path = GlobalConfig::load().ok().map(|c| c.socket_path());
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let process_gone = !DaemonClient::is_daemon_running();
+        let socket_gone = socket_path.as_ref().map(|p| !p.exists()).unwrap_or(true);
+        if process_gone && socket_gone {
+            return;
+        }
+        std::thread::sleep(tick);
+    }
+    warn!(
+        "daemon shutdown poll timed out after {:?}; continuing with start (may fail to bind)",
+        timeout
+    );
 }
 
 /// Install the daemon as a macOS launchd service.

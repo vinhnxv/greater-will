@@ -27,7 +27,7 @@ pub fn execute(run_id: String, force: bool, detach: bool) -> Result<()> {
         // downgrades any tmux error (missing session, tmux not installed)
         // to a tracing warning and returns Ok, so a missing session is never
         // surfaced as a command failure.
-        let _ = crate::session::kill_session(&run_id);
+        let _ = crate::session::kill_session(&format!("gw-{}", run_id));
         println!(
             "{} Attempted direct tmux kill for session {}.",
             tag("OK"),
