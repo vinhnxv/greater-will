@@ -1,0 +1,53 @@
+// Daemon module dependency graph (post-refactor)
+// Generated via grep-based analysis — 2026-04-16
+// Targeted cycles (server<->heartbeat, heartbeat<->run_monitor via append_event,
+// executor<->server via drain_if_available) are confirmed absent.
+//
+// Render: dot -Tsvg module-graph.dot -o module-graph.svg
+
+digraph daemon {
+    rankdir = LR;
+    node [shape=box, style=filled, fillcolor="#e8e8e8", fontname="monospace"];
+
+    // Leaf modules (no intra-daemon dependencies except state/protocol)
+    events   [fillcolor="#c8e6c9", label="events\n(leaf)"];
+    network  [fillcolor="#c8e6c9", label="network\n(leaf)"];
+    drain    [fillcolor="#c8e6c9"];
+
+    // Core modules
+    state    [fillcolor="#bbdefb"];
+    protocol [fillcolor="#bbdefb"];
+
+    // Higher-level modules
+    executor;
+    heartbeat;
+    run_monitor;
+    reconciler;
+    registry;
+    schedule;
+    server;
+
+    // --- Edges (use crate::daemon::X imports) ---
+
+    // Leaf → core
+    events      -> state;
+    network     -> state;
+    drain       -> { protocol registry state };
+
+    // Core cross-references
+    state       -> protocol;
+    protocol    -> schedule;
+
+    // Registry cluster
+    registry    -> { protocol reconciler state };
+    reconciler  -> { drain events protocol registry state };
+
+    // Executor / heartbeat / server cluster (formerly cyclic)
+    executor    -> { events heartbeat network protocol registry state };
+    heartbeat   -> { drain events executor network protocol reconciler registry run_monitor state };
+    run_monitor -> { events network protocol registry };
+    // NOTE: run_monitor does NOT import from heartbeat (line 25 is a doc comment only)
+
+    server      -> { drain events executor heartbeat protocol registry schedule state };
+    schedule    -> { executor registry server };
+}
