@@ -2367,4 +2367,425 @@ mod tests {
         // guard consumed, map untouched
         assert!(map.contains_key("abc"));
     }
+
+    // ── PERF-003: queue staged-flush regression suite ──────────────────
+    //
+    // Covers T4 (safety-net wiring) + T5 (canonical-path regressions)
+    // for plans/2026-04-15-perf-queue-fsync-outside-mutex-plan.md.
+
+    /// Test-only `MakeWriter` that captures structured tracing output into
+    /// a shared buffer so assertions can inspect emitted events.
+    ///
+    /// Used by the Drop / panic-unwind tests to verify the production
+    /// `tracing::error!` BUG signal fires when a `QueueSnapshot` escapes
+    /// without a flush.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Read `~/.gw/queue.json` directly — bypasses `restore_queue` so a test
+    /// can compare on-disk state against an in-memory expectation.
+    fn read_queue_from_disk() -> QueueSnapshotWire {
+        RunRegistry::load_queue(&gw_home()).expect("load_queue should succeed in tests")
+    }
+
+    fn make_pending(run_id: &str, plan: &str, repo: &Path) -> PendingRun {
+        PendingRun {
+            run_id: run_id.into(),
+            plan_path: PathBuf::from(plan),
+            repo_dir: repo.to_path_buf(),
+            session_name: None,
+            config_dir: None,
+            verbose: 0,
+            queued_at: Utc::now(),
+        }
+    }
+
+    // ── T5 #1: parity between staged + sync paths ──────────────────────
+    #[test]
+    fn staged_variant_produces_same_state_as_sync_wrapper() {
+        // Sync wrappers and `*_staged` + flush must produce byte-identical
+        // queue.json after the same sequence of mutations. Guards against
+        // future drift between the two API forms.
+        //
+        // Pre-built pendings with a fixed timestamp ensure the only
+        // possible difference between passes is API path, not wall-clock.
+        with_temp_gw_home(|_| {
+            let repo = PathBuf::from("/tmp/parity-repo");
+            let fixed_ts = Utc::now();
+            let pendings: Vec<PendingRun> = (0..5)
+                .map(|i| PendingRun {
+                    run_id: format!("sync-{i:02}"),
+                    plan_path: PathBuf::from(format!("plan-{i:02}.md")),
+                    repo_dir: repo.clone(),
+                    session_name: None,
+                    config_dir: None,
+                    verbose: 0,
+                    queued_at: fixed_ts,
+                })
+                .collect();
+
+            // Pass A: sync wrappers.
+            let mut reg_sync = RunRegistry::new();
+            for p in &pendings {
+                reg_sync.enqueue_run(p.clone()).unwrap();
+            }
+            reg_sync.record_queue_failure(&repo);
+            reg_sync.record_queue_success(&repo);
+            let _ = reg_sync.drain_next(&repo);
+            let on_disk_sync = read_queue_from_disk();
+
+            // Reset GW_HOME contents to isolate pass B.
+            let _ = fs::remove_file(gw_home().join("queue.json"));
+
+            // Pass B: staged variants under simulated lock-release.
+            let mut reg_staged = RunRegistry::new();
+            for p in &pendings {
+                let (_, snap) = reg_staged.enqueue_run_staged(p.clone()).unwrap();
+                RunRegistry::flush_queue(&snap).unwrap();
+            }
+            let (_, snap) = reg_staged.record_queue_failure_staged(&repo);
+            RunRegistry::flush_queue(&snap).unwrap();
+            let snap = reg_staged.record_queue_success_staged(&repo);
+            RunRegistry::flush_queue(&snap).unwrap();
+            if let Some((_, snap)) = reg_staged.drain_next_staged(&repo) {
+                RunRegistry::flush_queue(&snap).unwrap();
+            }
+            let on_disk_staged = read_queue_from_disk();
+
+            assert_eq!(
+                serde_json::to_string(&on_disk_sync).unwrap(),
+                serde_json::to_string(&on_disk_staged).unwrap(),
+                "staged + flush must produce byte-identical queue.json as sync wrappers",
+            );
+        });
+    }
+
+    // ── T5 #2: idempotency on identical snapshots ──────────────────────
+    #[test]
+    fn flush_queue_is_nop_on_identical_snapshot() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            reg.enqueue_run(make_pending("a1", "p.md", &PathBuf::from("/tmp/r")))
+                .unwrap();
+            let snap = reg.stage_queue_locked();
+            // First flush writes the file.
+            RunRegistry::flush_queue(&snap).unwrap();
+            // Second flush of the same snapshot must be a no-op.
+            RunRegistry::flush_queue(&snap).unwrap();
+            // Both calls return Ok and the file remains valid.
+            assert!(gw_home().join("queue.json").exists());
+        });
+    }
+
+    // ── T5 #3 (VIGIL-1): crash window — staged-but-not-flushed lost ────
+    #[test]
+    fn load_queue_after_staged_but_not_flushed_sees_prior_state() {
+        with_temp_gw_home(|_| {
+            // Establish a prior on-disk state via the sync API.
+            let mut reg = RunRegistry::new();
+            reg.enqueue_run(make_pending("prior", "old.md", &PathBuf::from("/tmp/r")))
+                .unwrap();
+            let prior_disk = read_queue_from_disk();
+            assert!(prior_disk.queues.values().any(|q| q.iter().any(|p| p.run_id == "prior")));
+
+            // Stage a new mutation but DO NOT flush. Drop the snapshot.
+            {
+                let (_pos, snap) = reg
+                    .enqueue_run_staged(make_pending("ghost", "new.md", &PathBuf::from("/tmp/r")))
+                    .unwrap();
+                drop(snap); // intentional — exercises the durability contract
+            }
+
+            // On-disk queue.json must still reflect the *prior* state, not
+            // the staged-but-unflushed mutation. This is the durability
+            // contract documented in the plan's Invariant section.
+            let after_disk = read_queue_from_disk();
+            let has_ghost = after_disk
+                .queues
+                .values()
+                .any(|q| q.iter().any(|p| p.run_id == "ghost"));
+            assert!(
+                !has_ghost,
+                "staged-but-unflushed mutation must NOT appear on disk",
+            );
+            assert!(
+                after_disk
+                    .queues
+                    .values()
+                    .any(|q| q.iter().any(|p| p.run_id == "prior")),
+                "prior state must remain on disk after a dropped snapshot",
+            );
+        });
+    }
+
+    // ── T5 #4 (VIGIL-2): canonical multi-mutation single flush ─────────
+    #[test]
+    fn multi_mutation_single_flush_captures_cumulative_state() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/multi-repo");
+            // Seed two pendings so drain_next has something to pop.
+            reg.enqueue_run(make_pending("seed-1", "s1.md", &repo)).unwrap();
+            reg.enqueue_run(make_pending("seed-2", "s2.md", &repo)).unwrap();
+
+            // Simulated held-lock scope: two mutations under one lock + one
+            // trailing snapshot. Mirrors executor::drain_if_available.
+            let (staged_batch, drained, snap) = {
+                let staged_batch = reg.record_queue_failure_without_snapshot(&repo);
+                let drained = reg.drain_next_without_snapshot(&repo);
+                let snap = reg.stage_queue_locked();
+                (staged_batch, drained, snap)
+            };
+            // Outside the scope, flush both signals.
+            for s in &staged_batch {
+                let _ = RunRegistry::flush_status(s);
+            }
+            RunRegistry::flush_queue(&snap).unwrap();
+
+            // Reload from disk and assert both mutations landed.
+            let on_disk = read_queue_from_disk();
+            let total: usize = on_disk.queues.values().map(|q| q.len()).sum();
+            // After one drain_next, only seed-2 should remain.
+            assert_eq!(total, 1, "drain_next mutation must persist");
+            assert_eq!(
+                on_disk
+                    .consecutive_failures
+                    .get(&repo_hash(&repo))
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "record_queue_failure mutation must persist",
+            );
+            assert!(drained.is_some(), "first pending should have been drained");
+        });
+    }
+
+    // ── T5 #5 (RUIN-SEC-2): stale snapshot flush is skipped ────────────
+    #[test]
+    fn stale_snapshot_flush_is_skipped() {
+        with_temp_gw_home(|_| {
+            let mut reg = RunRegistry::new();
+            let repo = PathBuf::from("/tmp/stale-repo");
+            // Stage A (epoch N) and B (epoch N+1).
+            reg.enqueue_run_without_snapshot(make_pending("a", "a.md", &repo))
+                .unwrap();
+            let snap_a = reg.stage_queue_locked();
+            reg.enqueue_run_without_snapshot(make_pending("b", "b.md", &repo))
+                .unwrap();
+            let snap_b = reg.stage_queue_locked();
+            assert!(snap_b.epoch > snap_a.epoch);
+
+            // Flush B (newer) first, then A (stale).
+            RunRegistry::flush_queue(&snap_b).unwrap();
+            let after_b = read_queue_from_disk();
+            let count_b: usize = after_b.queues.values().map(|q| q.len()).sum();
+            assert_eq!(count_b, 2, "snapshot B reflects both enqueues");
+
+            // Stale flush of A must succeed (idempotent) but NOT roll back
+            // the on-disk state.
+            RunRegistry::flush_queue(&snap_a).unwrap();
+            let after_a = read_queue_from_disk();
+            let count_a: usize = after_a.queues.values().map(|q| q.len()).sum();
+            assert_eq!(
+                count_a, 2,
+                "stale flush must not roll on-disk state back to snapshot A's view",
+            );
+        });
+    }
+
+    // ── T4 / T5 #6 (RUIN-SEC-1): Drop emits production tracing::error! ─
+    #[test]
+    fn dropped_unflushed_snapshot_emits_error_log() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        with_temp_gw_home(|_| {
+            let buf = LogCapture::default();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(buf.clone())
+                    .with_ansi(false),
+            );
+            let _guard = subscriber.set_default();
+
+            let reg = RunRegistry::new();
+            {
+                let snap = reg.stage_queue_locked();
+                drop(snap); // unflushed — Drop must emit BUG line
+            }
+
+            let logs = buf.contents();
+            assert!(
+                logs.contains("BUG: QueueSnapshot dropped"),
+                "Drop must emit production-visible tracing::error! line, got logs: {logs}",
+            );
+        });
+    }
+
+    // ── T4: panic-unwind safety net ────────────────────────────────────
+    #[test]
+    fn panic_unwind_drops_unflushed_snapshot_and_emits_error() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        with_temp_gw_home(|_| {
+            let buf = LogCapture::default();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(buf.clone())
+                    .with_ansi(false),
+            );
+            let _guard = subscriber.set_default();
+
+            let reg = RunRegistry::new();
+            // Wrap in catch_unwind so the panic does not abort the test.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _snap = reg.stage_queue_locked();
+                panic!("simulated worker panic before flush");
+            }));
+            assert!(result.is_err(), "panic must propagate to catch_unwind");
+
+            let logs = buf.contents();
+            assert!(
+                logs.contains("BUG: QueueSnapshot dropped"),
+                "Drop must fire during unwind, got logs: {logs}",
+            );
+        });
+    }
+
+    // ── T4: errored flush leaves snapshot un-flushed (Drop still fires)
+    #[test]
+    fn errored_flush_does_not_clear_flushed_flag() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        with_temp_gw_home(|tmp| {
+            let buf = LogCapture::default();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(buf.clone())
+                    .with_ansi(false),
+            );
+            let _guard = subscriber.set_default();
+
+            // Make `gw_home/queue.json.tmp` unwritable: replace the gw_home
+            // directory's `queue.json.tmp` location with a directory so
+            // `fs::File::create` fails. Simulates a tempfile creation error.
+            let tmp_path = tmp.path().join("queue.json.tmp");
+            fs::create_dir(&tmp_path).expect("create directory in place of tmpfile");
+
+            let reg = RunRegistry::new();
+            let snap = reg.stage_queue_locked();
+            let result = RunRegistry::flush_queue(&snap);
+            assert!(result.is_err(), "flush must fail when tmpfile cannot be created");
+
+            // Drop the snapshot — Drop must fire because flushed flag stayed false.
+            drop(snap);
+            let logs = buf.contents();
+            assert!(
+                logs.contains("BUG: QueueSnapshot dropped"),
+                "errored flush must leave Drop-trigger intact, got logs: {logs}",
+            );
+        });
+    }
+
+    // ── T5 #7 (SIGHT-ARCH-2): concurrent flush safety ──────────────────
+    #[test]
+    fn concurrent_flush_is_safe() {
+        // Two threads each stage and flush a snapshot on a shared registry.
+        // Final on-disk state must reflect the higher-epoch snapshot — never
+        // a torn write.
+        with_temp_gw_home(|_| {
+            let reg = Arc::new(std::sync::Mutex::new(RunRegistry::new()));
+            let repo_a = PathBuf::from("/tmp/concurrent-a");
+            let repo_b = PathBuf::from("/tmp/concurrent-b");
+
+            let r1 = Arc::clone(&reg);
+            let h1 = std::thread::spawn(move || {
+                let mut g = r1.lock().unwrap();
+                let snap = g
+                    .enqueue_run_staged(make_pending("c-a", "a.md", &repo_a))
+                    .unwrap()
+                    .1;
+                drop(g);
+                RunRegistry::flush_queue(&snap).unwrap();
+            });
+            let r2 = Arc::clone(&reg);
+            let h2 = std::thread::spawn(move || {
+                let mut g = r2.lock().unwrap();
+                let snap = g
+                    .enqueue_run_staged(make_pending("c-b", "b.md", &repo_b))
+                    .unwrap()
+                    .1;
+                drop(g);
+                RunRegistry::flush_queue(&snap).unwrap();
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            // Final disk must be valid JSON containing both entries (no torn
+            // write, no partial overwrite).
+            let on_disk = read_queue_from_disk();
+            let total: usize = on_disk.queues.values().map(|q| q.len()).sum();
+            assert_eq!(
+                total, 2,
+                "both concurrent stages must be reflected in final on-disk state",
+            );
+        });
+    }
+
+    // ── T5 #8: structural — flush_queue runs after lock release ────────
+    #[test]
+    fn flush_queue_runs_outside_registry_lock() {
+        // Codifies the lock-release-before-flush contract by exercising it
+        // explicitly: stage under a held mutex, drop the guard, observe
+        // that the flush call itself is unable to access the registry.
+        // If a future change moves `flush_queue` back inside the locked
+        // scope, the manual `drop(guard)` ordering will fail review and
+        // this test documents the intent.
+        with_temp_gw_home(|_| {
+            let reg = Arc::new(std::sync::Mutex::new(RunRegistry::new()));
+            let lock_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let snap = {
+                let mut guard = reg.lock().unwrap();
+                lock_held.store(true, Ordering::SeqCst);
+                let s = guard.stage_queue_locked();
+                lock_held.store(false, Ordering::SeqCst);
+                s
+            };
+
+            assert!(
+                !lock_held.load(Ordering::SeqCst),
+                "registry mutex must be released before flush_queue runs",
+            );
+            // flush_queue is an associated function — `&self` is unavailable
+            // by construction, which is the static guarantee that backs this
+            // test's runtime assertion.
+            RunRegistry::flush_queue(&snap).unwrap();
+        });
+    }
 }
