@@ -550,9 +550,16 @@ async fn dispatch_request(
 
             if let Some((run_id, staged_result)) = enqueue_outcome {
                 match staged_result {
-                    Ok((position, snap)) => {
+                    Ok((position, entry, snap)) => {
                         if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
-                            tracing::warn!(error = %e, "failed to persist queue after SubmitRun enqueue");
+                            tracing::warn!(error = %e, "failed to persist queue after SubmitRun enqueue — run not durably persisted");
+                            return Response::Error {
+                                code: ErrorCode::InternalError,
+                                message: "queue flush failed; run not durably persisted".to_string(),
+                            };
+                        }
+                        if let Err(e) = crate::daemon::registry::RunRegistry::write_meta_staged(&entry) {
+                            tracing::warn!(run_id = %run_id, error = %e, "write_meta_staged failed after SubmitRun enqueue — meta.json may lag queue.json (recoverable)");
                         }
                         return Response::RunQueued { run_id, position };
                     }
@@ -672,17 +679,27 @@ async fn dispatch_request(
             // concurrent IPC on the 1–20 ms fsync.
             let dequeue_snap = {
                 let mut reg = registry.lock().await;
+                let lock_held_start = std::time::Instant::now();
                 let is_queued = reg
                     .get(&actual_id)
                     .map(|entry| entry.status == RunStatus::Queued)
                     .unwrap_or(false);
-                if is_queued {
-                    reg.dequeue_run_staged(&actual_id).map(|(_pending, snap)| snap)
+                let result = if is_queued {
+                    reg.dequeue_run_staged(&actual_id).map(|(pending, staged_status, snap)| (pending, staged_status, snap))
                 } else {
                     None
-                }
+                };
+                tracing::debug!(
+                    site = "StopRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             }; // registry mutex released
-            if let Some(snap) = dequeue_snap {
+            if let Some((_pending, staged_status, snap)) = dequeue_snap {
+                if let Err(e) = crate::daemon::registry::RunRegistry::flush_status(&staged_status) {
+                    tracing::warn!(run_id = %actual_id, error = %e, "flush_status failed after StopRun dequeue");
+                }
                 if let Err(e) = crate::daemon::registry::RunRegistry::flush_queue(&snap) {
                     tracing::warn!(error = %e, "failed to persist queue after StopRun dequeue");
                 }
@@ -748,13 +765,20 @@ async fn dispatch_request(
             // concurrent IPC for the full 1–20 ms fsync duration.
             let staged = {
                 let mut reg = registry.lock().await;
-                reg.stage_status_locked(
+                let lock_held_start = std::time::Instant::now();
+                let result = reg.stage_status_locked(
                     &actual_id,
                     RunStatus::Stopped,
                     Some("detached".to_string()),
                     Some("detached by user — tmux session kept alive".to_string()),
                 )
-                .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"));
+                tracing::debug!(
+                    site = "DetachRun",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             };
             let staged = match staged {
                 Ok(s) => s,
@@ -766,10 +790,7 @@ async fn dispatch_request(
                 }
             };
             if let Err(e) = RunRegistry::flush_status(&staged) {
-                return Response::Error {
-                    code: ErrorCode::InternalError,
-                    message: e.to_string(),
-                };
+                tracing::warn!(run_id = %actual_id, error = %e, "flush_status failed after DetachRun");
             }
 
             tracing::info!(
@@ -999,7 +1020,8 @@ async fn dispatch_request(
             // behind two fsyncs.
             let staged = {
                 let mut reg = registry.lock().await;
-                match reg.find_pending_by_prefix(&run_id) {
+                let lock_held_start = std::time::Instant::now();
+                let result = match reg.find_pending_by_prefix(&run_id) {
                     Some((full_id, _repo_hash)) => {
                         // FLAW-001: mirror dequeue_run — without the Stopped
                         // transition, the RunEntry created by enqueue_run
@@ -1026,7 +1048,13 @@ async fn dispatch_request(
                         Some((full_id, staged_status, snap))
                     }
                     None => None,
-                }
+                };
+                tracing::debug!(
+                    site = "RemoveQueued",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             }; // registry mutex released
 
             match staged {
@@ -1061,7 +1089,14 @@ async fn dispatch_request(
             // than during.
             let (count, staged_batch, snap) = {
                 let mut reg = registry.lock().await;
-                reg.clear_queue_staged(repo_dir.as_deref())
+                let lock_held_start = std::time::Instant::now();
+                let result = reg.clear_queue_staged(repo_dir.as_deref());
+                tracing::debug!(
+                    site = "ClearQueue",
+                    elapsed_us = lock_held_start.elapsed().as_micros() as u64,
+                    "registry_lock_held"
+                );
+                result
             }; // registry mutex released
 
             for staged in &staged_batch {

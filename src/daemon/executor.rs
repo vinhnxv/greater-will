@@ -12,10 +12,31 @@ use crate::session::spawn::{self, SpawnConfig};
 use color_eyre::{eyre::eyre, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+// ── Drain task tracker (BACK-001) ────────────────────────────────────
+//
+// All fire-and-forget drain spawns are registered here so the shutdown
+// path can await them before flushing queue state.
+//
+// Design: `Vec<JoinHandle<()>>` under a Mutex rather than `JoinSet<()>`.
+// This lets the shutdown path drain the Vec under a brief lock, then await
+// each handle OUTSIDE the lock.  If we used `JoinSet` and held the Mutex
+// during `join_next`, a completing task that tries to add a retry would
+// deadlock trying to re-acquire the same Mutex.
+static DRAIN_HANDLES: OnceLock<Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>> = OnceLock::new();
+
+/// Initialize the process-wide drain handle registry and return a clone of the Arc.
+///
+/// Must be called once from `start_daemon` before the heartbeat monitor or
+/// server start — both paths may trigger `drain_if_available`.  Subsequent
+/// calls return a clone of the already-initialized Arc (idempotent).
+pub(crate) fn init_drain_join_set() -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
+    Arc::clone(DRAIN_HANDLES.get_or_init(|| Arc::new(Mutex::new(Vec::new()))))
+}
 
 /// Grace period after sending /exit before force-killing.
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -186,7 +207,10 @@ pub(crate) async fn drain_if_available(
         let repo_dir = pending.repo_dir.clone();
         let verbose = pending.verbose;
 
-        tokio::spawn(async move {
+        // BACK-001: register the task in the process-wide drain JoinSet so
+        // shutdown can await completion before flushing queue state.  Fall
+        // back to bare tokio::spawn if init was not called (test paths).
+        let task = async move {
             match spawn_queued_run(Arc::clone(&registry), pending, verbose).await {
                 Ok(run_id) => {
                     info!(run_id = %run_id, "drained queued run — now running");
@@ -249,13 +273,32 @@ pub(crate) async fn drain_if_available(
                         error!(error = %fe, "flush_queue failed after drain spawn error recovery");
                     }
                     if let Some(retry) = next {
+                        // BACK-004/FLAW-003: spawn retry in its own task so the
+                        // 12s SPAWN_INIT_WAIT_SECS does not block this task
+                        // (which would extend the shutdown race window).  The
+                        // new task is also registered so shutdown awaits it
+                        // before flushing queue state.
                         info!("retrying with next queued run after spawn failure");
                         let retry_verbose = retry.verbose;
-                        let _ = spawn_queued_run(registry, retry, retry_verbose).await;
+                        let retry_task = async move {
+                            if let Err(re) = spawn_queued_run(registry, retry, retry_verbose).await {
+                                error!(error = %re, "retry drain spawn failed");
+                            }
+                        };
+                        let handle = tokio::spawn(retry_task);
+                        if let Some(dh) = DRAIN_HANDLES.get() {
+                            dh.lock().await.push(handle);
+                        }
+                        // If DRAIN_HANDLES not initialized (test paths), handle
+                        // is simply dropped (task still runs detached).
                     }
                 }
             }
-        });
+        };
+        let handle = tokio::spawn(task);
+        if let Some(dh) = DRAIN_HANDLES.get() {
+            dh.lock().await.push(handle);
+        }
     }
 }
 
@@ -340,14 +383,23 @@ async fn spawn_after_register(
         warn!(run_id = %run_id, error = %e, "pre_phase_cleanup failed");
         let reason = format!("pre_phase_cleanup failed: {e}");
         crate::daemon::events::append_event(&run_id, "spawn_failed", &reason);
-        let mut reg = registry.lock().await;
-        if let Err(ue) = reg.update_status(
-            &run_id,
-            RunStatus::Failed,
-            None,
-            Some(reason),
-        ) {
-            tracing::error!(run_id = %run_id, error = %ue, "update_status failed: marking failed after pre_phase_cleanup error");
+        // BACK-007: stage under lock, release, then fsync outside (INV-19).
+        let staged = {
+            let mut reg = registry.lock().await;
+            reg.stage_status_locked(&run_id, RunStatus::Failed, None, Some(reason))
+                .map_err(|se| color_eyre::eyre::eyre!("{se}"))
+        };
+        match staged {
+            Ok(s) => {
+                if let Err(fe) = RunRegistry::flush_status(&s) {
+                    tracing::error!(run_id = %run_id, error = %fe, "flush_status failed: marking failed after pre_phase_cleanup error");
+                    // Silence spurious Drop BUG log: flush was attempted. Matches update_status convention.
+                    s.mark_flushed();
+                }
+            }
+            Err(ue) => {
+                tracing::error!(run_id = %run_id, error = %ue, "stage_status failed: marking failed after pre_phase_cleanup error");
+            }
         }
         return Err(e);
     }
@@ -468,14 +520,23 @@ async fn spawn_after_register(
             tmux_session, reason,
         ));
         let _ = spawn::kill_session(&tmux_session);
-        let mut reg = registry.lock().await;
-        if let Err(ue) = reg.update_status(
-            &run_id,
-            RunStatus::Failed,
-            None,
-            Some(reason),
-        ) {
-            tracing::error!(run_id = %run_id, error = %ue, "update_status failed: marking failed after send_keys error");
+        // BACK-007: stage under lock, release, then fsync outside (INV-19).
+        let staged = {
+            let mut reg = registry.lock().await;
+            reg.stage_status_locked(&run_id, RunStatus::Failed, None, Some(reason))
+                .map_err(|se| color_eyre::eyre::eyre!("{se}"))
+        };
+        match staged {
+            Ok(s) => {
+                if let Err(fe) = RunRegistry::flush_status(&s) {
+                    tracing::error!(run_id = %run_id, error = %fe, "flush_status failed: marking failed after send_keys error");
+                    // Silence spurious Drop BUG log: flush was attempted. Matches update_status convention.
+                    s.mark_flushed();
+                }
+            }
+            Err(ue) => {
+                tracing::error!(run_id = %run_id, error = %ue, "stage_status failed: marking failed after send_keys error");
+            }
         }
         return Err(e);
     }

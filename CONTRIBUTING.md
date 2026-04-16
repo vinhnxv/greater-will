@@ -65,7 +65,8 @@ Should match both `stage_status_locked` and `stage_queue_locked`.
 
 #### History
 
-- `meta.json` side: landed via `fix-daemon-registry-lock-and-fsync-plan.md`
+- `meta.json` side: landed via
+  [`fix-daemon-registry-lock-and-fsync-plan.md`](plans/archived/2026-04-15-fix-daemon-registry-lock-and-fsync-plan.md)
   (commit `5a732ca`).
 - `queue.json` side: landed via
   `plans/2026-04-15-perf-queue-fsync-outside-mutex-plan.md`.
