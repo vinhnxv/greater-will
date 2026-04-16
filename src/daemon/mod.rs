@@ -1,15 +1,15 @@
-pub mod drain;
-pub mod events;
-pub mod executor;
-pub mod heartbeat;
-pub mod network;
-pub mod protocol;
-pub mod reconciler;
-pub mod registry;
-pub mod run_monitor;
-pub mod schedule;
-pub mod server;
-pub mod state;
+pub(crate) mod drain;
+pub(crate) mod events;
+pub(crate) mod executor;
+pub(crate) mod heartbeat;
+pub(crate) mod network;
+pub(crate) mod protocol;
+pub(crate) mod reconciler;
+pub(crate) mod registry;
+pub(crate) mod run_monitor;
+pub(crate) mod schedule;
+pub(crate) mod server;
+pub(crate) mod state;
 
 use color_eyre::{eyre::WrapErr, Result};
 use fs2::FileExt;

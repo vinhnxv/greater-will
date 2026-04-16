@@ -106,6 +106,30 @@ a module dependency cycle (`heartbeat → server → heartbeat` via
 executor, reconciler, run_monitor, and heartbeat all depend on `events`
 without depending on each other.
 
+### Post-Refactor DAG Measurement (AC6 / ARCH-008)
+
+Cross-module qualified calls in the **heartbeat/server/executor cluster**
+after the cycle-breaking refactor:
+
+| Direction | Import | Count |
+|-----------|--------|-------|
+| executor → heartbeat | `MonitorHandle` | 1 |
+| heartbeat → executor | `drain_if_available` | 1 |
+| server → heartbeat | `MonitorHandle` | 1 |
+
+**Total: 3 directed pairs** (target was <30, stretch goal <3 per pair).
+
+The former cycle-forming edges are eliminated:
+- ~~server → heartbeat via `drain_if_available`~~ → now `executor::drain_if_available`
+- ~~heartbeat → server via `drain_if_available`~~ → heartbeat imports from executor
+- ~~heartbeat ↔ run_monitor via `append_event`~~ → both import from `events`
+
+Module visibility narrowed in `mod.rs`: all submodules are `pub(crate) mod`
+(commit after `1159dac`). No external crate consumers exist (binary crate).
+
+See [`module-graph.dot`](module-graph.dot) for the full dependency graph
+(`dot -Tsvg module-graph.dot -o module-graph.svg` to render).
+
 ## References
 
 - Source audit: `src/daemon/heartbeat.rs` (PERF-001, EMB-005)
