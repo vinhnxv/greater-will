@@ -9,9 +9,12 @@ use color_eyre::{eyre::WrapErr, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::daemon::protocol::{RunInfo, RunStatus};
 use crate::daemon::reconciler::plans_match;
@@ -37,14 +40,66 @@ pub struct PendingRun {
     pub queued_at: DateTime<Utc>,
 }
 
-/// Snapshot of all pending queues and circuit-breaker state, persisted to
-/// `~/.gw/queue.json` so queued runs survive daemon restarts.
+/// On-disk wire format for `~/.gw/queue.json` — pure serde DTO with no
+/// runtime state.
+///
+/// Used by [`RunRegistry::load_queue`], [`RunRegistry::flush_queue`], and
+/// [`RunRegistry::restore_queue`] for persistence I/O. Decoupled from the
+/// runtime [`QueueSnapshot`] wrapper so the on-disk schema is independent
+/// of the in-memory must-flush invariant. The `{queues, consecutive_failures}`
+/// field shape is preserved exactly so existing `queue.json` files continue
+/// to deserialize without migration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct QueueSnapshot {
+pub struct QueueSnapshotWire {
     #[serde(default)]
     pub queues: HashMap<String, Vec<PendingRun>>,
     #[serde(default)]
     pub consecutive_failures: HashMap<String, u32>,
+}
+
+/// Runtime queue snapshot — wraps [`QueueSnapshotWire`] with a per-staging
+/// epoch and a must-flush invariant.
+///
+/// Construct via [`RunRegistry::stage_queue_locked`] (under the registry
+/// mutex) and flush via [`RunRegistry::flush_queue`] (after releasing the
+/// mutex). This mirrors the INV-19 pattern used by `stage_status_locked` /
+/// `flush_status` so the 1–20 ms fsync runs outside the registry lock.
+///
+/// Dropping a `QueueSnapshot` without flushing is an invariant violation:
+/// the in-memory queue mutation is lost on daemon restart because no
+/// on-disk write happened. The `Drop` impl emits a `tracing::error!` so
+/// such bugs are detectable in production logs.
+#[must_use = "QueueSnapshot must be flushed via RunRegistry::flush_queue \
+              before it is dropped, otherwise the in-memory queue mutation \
+              is lost on daemon restart"]
+#[derive(Debug)]
+pub struct QueueSnapshot {
+    /// On-disk wire format — what gets serialized to `queue.json`.
+    pub wire: QueueSnapshotWire,
+    /// Monotonic epoch assigned by `stage_queue_locked`. Used by `flush_queue`
+    /// to detect stale snapshots (a newer staging already flushed).
+    epoch: u64,
+    /// Shared handle into [`RunRegistry::queue_last_flushed_epoch`] — every
+    /// snapshot derived from the same registry observes the same advancing
+    /// counter, enabling stale-snapshot suppression.
+    flushed_tracker: Arc<AtomicU64>,
+    /// Set to `true` by `flush_queue` on success; checked by `Drop`.
+    flushed: Cell<bool>,
+}
+
+impl Drop for QueueSnapshot {
+    fn drop(&mut self) {
+        if !self.flushed.get() {
+            tracing::error!(
+                epoch = self.epoch,
+                "BUG: QueueSnapshot dropped without flush — queue mutation at \
+                 epoch {} exists only in memory. Durability requires daemon \
+                 restart (which re-reads the prior on-disk queue.json). This \
+                 is an invariant violation; investigate the caller site.",
+                self.epoch,
+            );
+        }
+    }
 }
 
 // ── Shared repo hash ────────────────────────────────────────────────
@@ -222,6 +277,14 @@ pub struct RunRegistry {
     pending_queues: HashMap<String, VecDeque<PendingRun>>,
     /// Consecutive spawn failure count per repo (for circuit breaker).
     consecutive_failures: HashMap<String, u32>,
+    /// Monotonic counter bumped by `stage_queue_locked` so each runtime
+    /// `QueueSnapshot` carries a unique epoch. Used by `flush_queue` for
+    /// stale-snapshot detection and by the `Drop` log for correlation.
+    queue_epoch: AtomicU64,
+    /// Most-recently-flushed queue epoch. Shared with every `QueueSnapshot`
+    /// (via `Arc::clone`) so out-of-order flushes can early-return without
+    /// rolling back the on-disk state.
+    queue_last_flushed_epoch: Arc<AtomicU64>,
 }
 
 impl RunRegistry {
@@ -232,6 +295,8 @@ impl RunRegistry {
             repo_locks: HashMap::new(),
             pending_queues: HashMap::new(),
             consecutive_failures: HashMap::new(),
+            queue_epoch: AtomicU64::new(0),
+            queue_last_flushed_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -990,12 +1055,26 @@ impl RunRegistry {
 
     // ── Queue persistence ──────────────────────────────────────────
 
-    /// Persist pending queues and circuit-breaker state to `~/.gw/queue.json`.
+    /// Stage an in-memory snapshot of all pending queues and circuit-breaker
+    /// state without touching disk.
     ///
-    /// Uses the same atomic write pattern as [`write_meta`]: write to a
-    /// sibling tempfile, fsync, then rename into place.
-    pub fn save_queue(&self) -> Result<()> {
-        let snapshot = QueueSnapshot {
+    /// INV-19 mirror for queues: callers drop the registry mutex *before*
+    /// invoking [`flush_queue`](Self::flush_queue) so the 1–20 ms fsync runs
+    /// outside the lock and does not block other registry operations.
+    ///
+    /// Bumps `queue_epoch` so the returned `QueueSnapshot` is uniquely
+    /// identifiable. Takes `&self` (not `&mut self`) — `AtomicU64::fetch_add`
+    /// is interior-mutable, and the `pending_queues` / `consecutive_failures`
+    /// maps are read-only here.
+    pub fn stage_queue_locked(&self) -> QueueSnapshot {
+        // fetch_add returns the prior value; bump by one for the new epoch
+        // so the very first staging carries epoch=1 and is strictly greater
+        // than the initial `queue_last_flushed_epoch` value of 0.
+        let epoch = self
+            .queue_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let wire = QueueSnapshotWire {
             queues: self
                 .pending_queues
                 .iter()
@@ -1003,7 +1082,35 @@ impl RunRegistry {
                 .collect(),
             consecutive_failures: self.consecutive_failures.clone(),
         };
-        let json = serde_json::to_string_pretty(&snapshot)
+        QueueSnapshot {
+            wire,
+            epoch,
+            flushed_tracker: Arc::clone(&self.queue_last_flushed_epoch),
+            flushed: Cell::new(false),
+        }
+    }
+
+    /// Atomically write `snapshot.wire` to `~/.gw/queue.json`.
+    ///
+    /// Associated function (no `&self`) so the caller's registry mutex is
+    /// already released — this is the INV-19 mirror for queues.
+    ///
+    /// Uses the same atomic write pattern as [`write_meta`]: write to a
+    /// sibling tempfile, `fsync`, then `rename` into place.
+    ///
+    /// Epoch idempotency: if a newer epoch has already been flushed, this
+    /// snapshot is stale and writing it would roll the on-disk state back.
+    /// The early-return treats stale flushes as success because the on-disk
+    /// state already supersedes this snapshot.
+    pub fn flush_queue(snapshot: &QueueSnapshot) -> Result<()> {
+        // Stale-snapshot guard: a newer flush already happened, skip the I/O.
+        let last = snapshot.flushed_tracker.load(Ordering::Acquire);
+        if snapshot.epoch <= last {
+            snapshot.flushed.set(true);
+            return Ok(());
+        }
+
+        let json = serde_json::to_string_pretty(&snapshot.wire)
             .wrap_err("failed to serialize queue snapshot")?;
 
         let queue_path = gw_home().join("queue.json");
@@ -1019,32 +1126,64 @@ impl RunRegistry {
         }
         fs::rename(&tmp_path, &queue_path)
             .wrap_err("failed to atomically rename queue.json")?;
+
+        // Advance `flushed_tracker` to this epoch via CAS — never regress.
+        // If a concurrent flush bumped it past `snapshot.epoch`, leave it.
+        let mut current = snapshot.flushed_tracker.load(Ordering::Relaxed);
+        while snapshot.epoch > current {
+            match snapshot.flushed_tracker.compare_exchange_weak(
+                current,
+                snapshot.epoch,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+
+        snapshot.flushed.set(true);
         Ok(())
+    }
+
+    /// Persist pending queues and circuit-breaker state to `~/.gw/queue.json`.
+    ///
+    /// Convenience wrapper around [`stage_queue_locked`](Self::stage_queue_locked)
+    /// followed by [`flush_queue`](Self::flush_queue). Use the two-step form
+    /// directly when you need to release the registry mutex between mutation
+    /// and fsync (the INV-19 pattern).
+    pub fn save_queue(&self) -> Result<()> {
+        let s = self.stage_queue_locked();
+        Self::flush_queue(&s)
     }
 
     /// Load queue snapshot from `~/.gw/queue.json`.
     ///
+    /// Returns the on-disk wire format; runtime callers that need a stage/
+    /// flush invariant should construct a [`QueueSnapshot`] via
+    /// [`stage_queue_locked`](Self::stage_queue_locked) instead.
+    ///
     /// Returns an empty default on missing or corrupt files so the daemon
     /// always starts cleanly.
-    pub fn load_queue(home: &Path) -> Result<QueueSnapshot> {
+    pub fn load_queue(home: &Path) -> Result<QueueSnapshotWire> {
         let path = home.join("queue.json");
         match fs::read_to_string(&path) {
             Ok(content) => Ok(serde_json::from_str(&content).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "corrupt queue.json — using empty defaults");
-                QueueSnapshot::default()
+                QueueSnapshotWire::default()
             })),
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(error = %e, "failed to read queue.json — using empty defaults");
                 }
-                Ok(QueueSnapshot::default())
+                Ok(QueueSnapshotWire::default())
             }
         }
     }
 
     /// Populate in-memory pending queues and circuit-breaker state from a
-    /// previously loaded [`QueueSnapshot`].
-    pub fn restore_queue(&mut self, snapshot: QueueSnapshot) {
+    /// previously loaded [`QueueSnapshotWire`].
+    pub fn restore_queue(&mut self, snapshot: QueueSnapshotWire) {
         for (hash, entries) in snapshot.queues {
             self.pending_queues
                 .insert(hash, VecDeque::from(entries));
