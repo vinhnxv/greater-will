@@ -26,7 +26,7 @@ The same shape, applied to the global pending-queue file:
 
 | API form | When to use | Example |
 |----------|-------------|---------|
-| Sync wrapper (`enqueue_run`, `dequeue_run`, …) | Tests, daemon shutdown path, single-threaded contexts | `reg.enqueue_run(p)?` |
+| Sync wrapper (`enqueue_run`, `drain_next`, `record_queue_failure`, `record_queue_success`, `clear_queue`) | Tests, daemon shutdown path, single-threaded contexts. Gated behind `#[cfg_attr(not(test), allow(dead_code))]` because production paths take the staged form. | `reg.enqueue_run(p)?` |
 | `*_staged` (`enqueue_run_staged`, …) | Single-mutation production paths under an async lock | `let (pos, snap) = reg.enqueue_run_staged(p)?; drop(reg); RunRegistry::flush_queue(&snap)?` |
 | `*_without_snapshot` (`pub(crate)`) + trailing `stage_queue_locked` | Multi-mutation production paths (the **canonical** form) | `executor::drain_if_available` |
 

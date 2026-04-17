@@ -731,7 +731,9 @@ impl RunRegistry {
     /// **Synchronous wrapper** — fsyncs `queue.json` while holding `&mut self`.
     /// Production paths under an async lock should call
     /// [`enqueue_run_staged`](Self::enqueue_run_staged) instead and flush
-    /// outside the registry mutex (INV-19 for queues).
+    /// outside the registry mutex (INV-19 for queues). Retained as a
+    /// single-threaded / test-only ergonomic path per CONTRIBUTING.md.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn enqueue_run(&mut self, pending: PendingRun) -> Result<usize> {
         let (position, entry, snap) = self.enqueue_run_staged(pending)?;
         Self::write_meta_staged(&entry)?;
@@ -867,33 +869,17 @@ impl RunRegistry {
         Ok((position, entry))
     }
 
-    /// Remove a queued run by ID. Returns the PendingRun if found.
-    ///
-    /// **Synchronous wrapper** — see [`dequeue_run_staged`](Self::dequeue_run_staged)
-    /// for the lock-release-before-fsync form.
-    pub fn dequeue_run(&mut self, run_id: &str) -> Option<PendingRun> {
-        let (pending, staged_status, snap) = self.dequeue_run_staged(run_id)?;
-        if let Err(e) = Self::flush_status(&staged_status) {
-            tracing::warn!(run_id = %run_id, error = %e,
-                "failed to persist meta.json status after dequeue_run");
-        }
-        if let Err(e) = Self::flush_queue(&snap) {
-            tracing::warn!(error = %e, "failed to persist queue after dequeue_run");
-        }
-        Some(pending)
-    }
-
-    /// Staged variant of [`dequeue_run`](Self::dequeue_run).
+    /// Remove a queued run by ID.
     ///
     /// Returns `(PendingRun, StagedStatus, QueueSnapshot)` so the caller can
     /// flush both `meta.json` (via `flush_status`) and `queue.json` (via
     /// `flush_queue`) after releasing the registry mutex (INV-19).
     ///
-    /// **New signature (BACK-006 fix)**: caller receives a `StagedStatus` for
-    /// `Stopped` in addition to the `QueueSnapshot`. Both must be flushed
-    /// after the mutex is released. Sync callers use `dequeue_run` instead.
+    /// **BACK-006 fix**: caller receives a `StagedStatus` for `Stopped` in
+    /// addition to the `QueueSnapshot`. Both must be flushed after the
+    /// mutex is released.
     ///
-    /// CAUTION: callers in server.rs were updated to match this new signature
+    /// CAUTION: callers in server.rs were updated to match this signature
     /// as part of the BACK-006 / PERF-003 fix. If you are updating a caller,
     /// flush `StagedStatus` via `RunRegistry::flush_status(&staged_status)` and
     /// `QueueSnapshot` via `RunRegistry::flush_queue(&snap)` outside the lock.
@@ -949,35 +935,6 @@ impl RunRegistry {
     /// `meta.json` and `queue.json` fsyncs can run outside the mutex (BACK-006).
     fn dequeue_run_without_snapshot_no_flush(&mut self, run_id: &str) -> Option<PendingRun> {
         self.pop_from_pending_queues(run_id)
-    }
-
-    /// Mutation-only helper — pops the pending entry and fsyncs meta.json to
-    /// `Stopped` inline (sync path). Does NOT fsync `queue.json`.
-    ///
-    /// This variant is used by the sync `dequeue_run` wrapper (via
-    /// `dequeue_run_staged` → `flush_status` + `flush_queue`). For the async
-    /// path with outside-lock fsyncs use `dequeue_run_staged` directly.
-    pub(crate) fn dequeue_run_without_snapshot(
-        &mut self,
-        run_id: &str,
-    ) -> Option<PendingRun> {
-        let pending = self.pop_from_pending_queues(run_id)?;
-        // Update the RunEntry to Stopped. Warn loudly on failure so the
-        // disk meta.json doesn't drift from queue.json (which would leave a
-        // ghost Queued entry that causes repo_lock leaks after daemon restart).
-        if let Err(e) = self.update_status(
-            run_id,
-            RunStatus::Stopped,
-            None,
-            Some("removed from queue".into()),
-        ) {
-            tracing::warn!(
-                run_id = %run_id,
-                error = %e,
-                "failed to flip meta.json status to Stopped after dequeue — meta may drift from queue.json"
-            );
-        }
-        Some(pending)
     }
 
     /// Promote a queued run to the running spawn path.
@@ -1046,6 +1003,8 @@ impl RunRegistry {
     /// Pop the next pending run for a repo. Returns None if empty or circuit breaker tripped.
     ///
     /// **Synchronous wrapper** — see [`drain_next_staged`](Self::drain_next_staged).
+    /// Retained as a single-threaded / test-only path per CONTRIBUTING.md.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn drain_next(&mut self, repo_dir: &Path) -> Option<PendingRun> {
         let (pending, snap) = self.drain_next_staged(repo_dir)?;
         if let Err(e) = Self::flush_queue(&snap) {
@@ -1056,8 +1015,11 @@ impl RunRegistry {
 
     /// Staged variant of [`drain_next`](Self::drain_next). Returns `None` for
     /// empty queues / tripped breakers without bumping the queue epoch.
+    /// Retained as a test-only path; production composes `*_without_snapshot`
+    /// + a single trailing `stage_queue_locked` (see `executor::drain_if_available`).
     #[must_use = "QueueSnapshot must be flushed via RunRegistry::flush_queue; \
                   do not bind the snapshot with _ or _name prefix"]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn drain_next_staged(
         &mut self,
         repo_dir: &Path,
@@ -1091,6 +1053,8 @@ impl RunRegistry {
     ///
     /// **Synchronous wrapper** — see
     /// [`record_queue_failure_staged`](Self::record_queue_failure_staged).
+    /// Retained as a single-threaded / test-only path per CONTRIBUTING.md.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_queue_failure(&mut self, repo_dir: &Path) -> Vec<StagedStatus> {
         let (staged_batch, snap) = self.record_queue_failure_staged(repo_dir);
         if let Err(e) = Self::flush_queue(&snap) {
@@ -1103,8 +1067,11 @@ impl RunRegistry {
     /// Returns the staged status batch (already flushable via
     /// [`flush_status`](Self::flush_status)) **and** the queue snapshot in one
     /// call so the caller can flush both outside the registry mutex.
+    /// Retained as a test-only path; production composes `*_without_snapshot`
+    /// + a single trailing `stage_queue_locked`.
     #[must_use = "QueueSnapshot must be flushed via RunRegistry::flush_queue; \
                   do not bind the snapshot with _ or _name prefix"]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_queue_failure_staged(
         &mut self,
         repo_dir: &Path,
@@ -1154,6 +1121,8 @@ impl RunRegistry {
     ///
     /// **Synchronous wrapper** — see
     /// [`record_queue_success_staged`](Self::record_queue_success_staged).
+    /// Retained as a single-threaded / test-only path per CONTRIBUTING.md.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_queue_success(&mut self, repo_dir: &Path) {
         let snap = self.record_queue_success_staged(repo_dir);
         if let Err(e) = Self::flush_queue(&snap) {
@@ -1162,8 +1131,11 @@ impl RunRegistry {
     }
 
     /// Staged variant of [`record_queue_success`](Self::record_queue_success).
+    /// Retained as a test-only path; production composes `*_without_snapshot`
+    /// + a single trailing `stage_queue_locked`.
     #[must_use = "QueueSnapshot must be flushed via RunRegistry::flush_queue; \
                   do not bind the snapshot with _ or _name prefix"]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_queue_success_staged(&mut self, repo_dir: &Path) -> QueueSnapshot {
         self.record_queue_success_without_snapshot(repo_dir);
         self.stage_queue_locked()
@@ -1245,33 +1217,11 @@ impl RunRegistry {
         self.stage_queue_locked()
     }
 
-    /// Pop the next pending run from any repo queue whose circuit breaker
-    /// has not tripped. Used to fill global capacity when the completing
-    /// repo's own queue is empty.
-    ///
-    /// **Synchronous wrapper** — see
-    /// [`drain_any_ready_staged`](Self::drain_any_ready_staged).
-    pub fn drain_any_ready(&mut self) -> Option<PendingRun> {
-        let (pending, snap) = self.drain_any_ready_staged()?;
-        if let Err(e) = Self::flush_queue(&snap) {
-            tracing::warn!(error = %e, "failed to persist queue after drain_any_ready");
-        }
-        Some(pending)
-    }
-
-    /// Staged variant of [`drain_any_ready`](Self::drain_any_ready). Returns
-    /// `None` (without bumping the queue epoch) when no eligible repo has a
-    /// pending entry.
-    #[must_use = "QueueSnapshot must be flushed via RunRegistry::flush_queue; \
-                  do not bind the snapshot with _ or _name prefix"]
-    pub fn drain_any_ready_staged(&mut self) -> Option<(PendingRun, QueueSnapshot)> {
-        let pending = self.drain_any_ready_without_snapshot()?;
-        let snap = self.stage_queue_locked();
-        Some((pending, snap))
-    }
-
     /// Mutation-only helper — pops the first pending entry from any
-    /// non-broken queue without fsyncing.
+    /// non-broken queue without fsyncing. Used by
+    /// `executor::drain_if_available` to fill global capacity when the
+    /// completing repo's own queue is empty, composed with a trailing
+    /// `stage_queue_locked` for the single-flush canonical pattern.
     ///
     /// P1-9: iterates `repo_insertion_order` (first-enqueue FIFO) instead of
     /// `pending_queues` (HashMap, non-deterministic). Stale entries whose
@@ -1345,7 +1295,9 @@ impl RunRegistry {
     /// **Synchronous wrapper** — fsyncs `meta.json` for each removed entry
     /// while holding `&mut self`. Production callers should prefer
     /// [`clear_queue_staged`](Self::clear_queue_staged) so the N×meta + 1×queue
-    /// fsyncs run outside the registry mutex.
+    /// fsyncs run outside the registry mutex. Retained as a single-threaded /
+    /// test-only path per CONTRIBUTING.md.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_queue(&mut self, repo_filter: Option<&Path>) -> usize {
         let (count, staged_batch, snap) = self.clear_queue_staged(repo_filter);
         for staged in &staged_batch {
