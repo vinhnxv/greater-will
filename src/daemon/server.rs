@@ -1023,11 +1023,11 @@ async fn dispatch_request(
                 let lock_held_start = std::time::Instant::now();
                 let result = match reg.find_pending_by_prefix(&run_id) {
                     Some((full_id, _repo_hash)) => {
-                        // FLAW-001: mirror dequeue_run — without the Stopped
-                        // transition, the RunEntry created by enqueue_run
-                        // lingers with status=Queued in self.runs (and
-                        // meta.json on disk) and is reloaded as a ghost
-                        // entry on daemon restart.
+                        // FLAW-001: mirror dequeue_run_staged — without the
+                        // Stopped transition, the RunEntry created by
+                        // enqueue_run_staged lingers with status=Queued in
+                        // self.runs (and meta.json on disk) and is reloaded
+                        // as a ghost entry on daemon restart.
                         let staged_status = match reg.stage_status_locked(
                             &full_id,
                             RunStatus::Stopped,
