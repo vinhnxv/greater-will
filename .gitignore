@@ -30,3 +30,4 @@ tmp/
 .rune/talisman.integrations.yml
 .gw/
 .rune/arc-integrity-failure.txt
+.rune/arc-integrity-log.jsonl
